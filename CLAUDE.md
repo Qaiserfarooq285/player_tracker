@@ -59,12 +59,27 @@ crops are used only where small-object detail matters (ball via SAHI, and Phase-
 The clips are **Veo** exports (Veo Technologies AI camera; "veo" watermark bottom-right). Youth/amateur matches,
 elevated wide sideline camera, digital pan/zoom cropped out of a stitched panoramic.
 
-**Measured:**
-- **Cuts** (ffmpeg `scdet` @0.35, 640px): clip1/2/3/5 → **0 cuts** (single take each). **clip4 → 1 cut at
-  t=60.07 s** — it is a *compilation of two different matches* (kits change blue-vs-white → black-vs-white,
-  different venue). So **clip4 = 2 takes.**
-- **Camera motion** (`vidstabdetect`): global motion ≈ ±1 px/frame — **near-static with slow drift**, not true
-  panning. Expect profile `single-static` (borderline `single-panning`); the profiler decides per clip.
+**Measured** *(corrected 2026-08-24 after Stage 0.5 shipped — see the two ⚠️ corrections below)*:
+- **Cuts** — clip1/2/3/5 → **0 cuts** (single take each). **clip4 → 3 cuts at 60.13 s / 73.63 s / 87.30 s
+  ⇒ 4 takes.** clip4 is a **4-venue compilation** of player #77's highlights across different matches
+  (grass → turf-with-running-track → cold-weather grass with cones → bright grass).
+  > ⚠️ **Correction.** An earlier ffmpeg `scdet @0.35` pass recorded here found only **1** cut and concluded
+  > "2 takes". That threshold was too strict and **missed two real cuts**. PySceneDetect found them;
+  > frame contact-sheets at 72.5/74.5/86.0/88.5 s confirm four visually distinct venues, and a re-run of
+  > `scdet` at 0.15 reproduces all three. **Lesson: a single detector at one threshold is not ground truth.**
+  > `configs/shots.yaml` threshold is now **38.0**, set from the *measured* content-value gap on this data
+  > (real cuts ≥ 45.6, false positives ≤ 32.0) — not tuned to match a prediction. The rejected spikes at
+  > 14.4 / 47.0 / 99.6 s are fast pans and foreground crossings, verified same-venue either side.
+- **Camera motion**: sparse KLT + `estimateAffinePartial2D` (RANSAC) on consecutive native frames,
+  median-aggregated. Scores (px/frame): clip1 **12.70**, clip2 **3.79**, clip3 **1.95**, clip4 **3.14**,
+  clip5 **3.12**.
+  > ⚠️ **Correction.** An earlier `vidstabdetect` eyeball recorded "≈ ±1 px/frame, near-static". That was
+  > read off raw local-motion vectors and was **wrong**. Dense Farneback was also tried and rejected: its
+  > score proved wildly resolution-dependent (0.07 at 4K vs 6.1 at 240 px on the same clip) — textureless
+  > grass gives it nothing to lock onto.
+- **⚠️ Every clip opens with a genuine ~3–5 s camera-settling pan** before going steady. Undocumented until
+  Stage 0.5 measured it. Median aggregation absorbs it on long clips, but on an 11 s clip it is ~36% of the
+  runtime, which is why **clip1 reads `single-panning`**.
 - **Player scale** varies hugely within a frame: near players ≈ 450 px tall at 4K, far players ≈ 60 px.
 - **Jersey numbers are legible at 4K** for mid/near players (#77, #22, #34, #13, #8 all readable even at 1280 px).
 
@@ -123,6 +138,7 @@ Anything here overrides the brief's default suggestion. Add a row whenever a rec
 | ADR-2 | **Roboflow's soccer player/pitch checkpoints are YOLOv8 → AGPL → cannot ship** | `roboflow/sports` is MIT *code*, but the released player-detection and field-keypoint **weights are Ultralytics YOLOv8**, which is AGPL-3.0. Using them violates Golden Rule 6. Resolution ladder: (a) an **Apache-2.0 RF-DETR** soccer checkpoint; (b) **RF-DETR COCO-pretrained** (`person` + `sports ball`); (c) optional overnight fine-tune. **No training in Phase 1 either way.** | ✅ **resolved → see ADR-8** |
 | ADR-8 | **Phase-1 detector = `julianzu9612/RFDETR-Soccernet` (Apache-2.0), with RF-DETR-COCO as fallback** | Investigated 2026-08-24 with the validated Roboflow key. **(1)** The three canonical Roboflow soccer projects (`football-players-detection-3zvbc`, `football-field-detection-f07vi`, `football-ball-detection-rejhg`) return `model: None` on **every** version — Roboflow hosts **no trained weights** for them, only data. Their *datasets* are **CC BY 4.0** (commercially usable with attribution) — so they are excellent **eval + future fine-tune** material, which is how we use them. **(2)** On HF, `julianzu9612/RFDETR-Soccernet` is **Apache-2.0**, RF-DETR-Large (128 M, DINOv2 backbone, 1280², 1.46 GB) with exactly the classes we need — `ball, player, referee, goalkeeper` — reporting mAP@50 **0.857** / mAP **0.498** on SoccerNet. **(3)** The alternative `OrbitalLab/mova-rfdetr-soccernet-v1` (MIT) is **gated** (needs an access request) → skipped. | ✅ adopted for P1 |
 | ADR-9 | **⚠️ SoccerNet-derived weights are dev-only until licensing is cleared** | ADR-8's checkpoint is *declared* Apache-2.0 by its uploader, but it was **trained on SoccerNet-Tracking-2023**, and §7 lists SoccerNet data as **research/education only**. Whether an uploader can relicense a model trained on restricted data is legally unsettled — so this is a Golden-Rule-6 "flag before adding", not a silent adoption. **Use it for Phase-1 development and evaluation** (internal R&D, not distribution). **Before any commercial ship**, take one of: (i) obtain SoccerNet commercial terms, (ii) fine-tune RF-DETR on the **CC BY 4.0** Roboflow soccer dataset, or (iii) fall back to RF-DETR-COCO. Do not ship (i)-unresolved. | ⚠️ open — revisit before ship |
+| ADR-11 | **Downstream stages must consume the *motion score*, not the static/panning *label*** | Stage 0.5 put **4 of 5 clips inside the ambiguous band** (1.5–6.0 px/frame). clip2 scores **3.79 → `single-panning`** while clip4 scores **3.14 → `single-static`**, purely because the band's midpoint is 3.75 — essentially identical footage landing on opposite sides of a knife-edge. Worse, the label is contaminated by the ~3–5 s settling pan every clip opens with (§3.2), which is a startup transient, not a camera regime. Acting on the label would mean "calibrate homography once" vs "re-estimate continuously" flipping on noise. **Resolution:** the label stays in `RunProfile` for reporting, but **ADR-3's homography cadence reads `motion_score` directly** — recalibration interval scales continuously with measured motion, with the settling window excluded. For Veo footage the honest answer is that the camera digitally pans to follow play, so homography needs periodic re-estimation *regardless* of which label it got. | ✅ adopted — implement at Stage 2/pitch |
 | ADR-10 | **Expect a real domain gap; do not trust the published 0.857 mAP on this footage** | ADR-8's checkpoint was trained on SoccerNet = **professional broadcast** footage. §3.2 footage is **youth/amateur Veo** — higher/wider fixed camera, smaller players, different kits, painted-over American-football lines. Published mAP does **not** transfer. This is precisely why §9's eval harness is built before tuning: measure mAP on *our* labeled slice, and treat the Roboflow CC BY 4.0 set as a second eval set. | ✅ adopted |
 | ADR-3 | **Phase-1 homography = assisted 4-point manual calibration for single-camera profiles** | The usual auto pitch-keypoint model is also YOLOv8-pose (AGPL, same problem as ADR-2). For a *static* camera one calibration serves the whole clip, it is more accurate than a per-frame keypoint model, it costs no VRAM, and it is consistent with the human-in-the-loop principle (Golden Rule 4). Auto keypoints (PnLCalib / TVCalib / an Apache RF-DETR-pose) get evaluated for the broadcast branch. | ✅ adopted for P1 |
 | ADR-4 | **Repo root = the existing working directory**, not a new `soccer-highlight-analyzer/` subdir | `input/` already exists here and holds the owner's clips; nesting would orphan them. | ✅ adopted |
@@ -196,6 +212,21 @@ Secrets in `.env` (`HF_TOKEN`, `ROBOFLOW_API_KEY`, `SOCCERNET_PASSWORD`, optiona
 - **Actions (Phase 2+):** **mAP@1s** (SoccerNet ball-action style).
 - **Jersey (Phase 2):** tracklet accuracy.
 Wire these before optimizing anything. Log a run report (numbers + config hash) per run.
+
+### 9.1 Eval datasets on disk
+| Set | Path | Content | Licence | What it measures |
+|---|---|---|---|---|
+| **Roboflow football-players v20** | `data/eval/roboflow-football-players-v20/` | 372 imgs / 8,905 anns (train 298 · valid 49 · test 25); classes `ball, goalkeeper, player, referee` | **CC BY 4.0** — attribution required, see `ATTRIBUTION.md` | Detection mAP **baseline** |
+| **Our Veo slice** | `data/eval/veo-labeled/` | ⛔ **not yet created** — must be hand-labeled from `input/` | own footage | Detection mAP + HOTA **that actually counts** |
+
+> ⚠️ **The Roboflow set is a sanity baseline, not our number.** Its images are **576×576 crops of
+> professional broadcast** footage. Per **ADR-10**, results there do **not** transfer to youth/amateur Veo
+> footage with a high fixed camera and much smaller players. A Phase-1 "definition of done" mAP/HOTA claim
+> must be measured on a **hand-labeled slice of our own clips** — creating that slice is a Phase-1 task, not
+> an optional extra. Report both numbers side by side so the domain gap stays visible.
+>
+> Note: dataset **v20 is named "rf-detr-m"** — the publisher prepared it for RF-DETR training, which
+> corroborates ADR-8's model choice and makes it the natural base for the ADR-9 clean-licence fine-tune.
 
 ## 10. Working conventions
 - Python 3.11 (via `uv`, see ADR-5). One `configs/*.yaml` per stage; **no magic numbers in code.**
