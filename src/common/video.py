@@ -203,47 +203,86 @@ def write_video(
     dst: str | Path,
     fps: float,
     size: tuple[int, int],
+    encoder: str = "libx264",
 ) -> Path:
-    """Write a sequence of BGR uint8 frames to `dst` (mp4, libx264) via an `ffmpeg` subprocess.
+    """Write a sequence of BGR uint8 frames to `dst` (mp4) via an `ffmpeg` subprocess.
 
     `size` is ``(width, height)``; every frame in `frames_iter` must already match it. Used for
     annotated overlay video artifacts (CLAUDE.md §10: "annotated overlay video artifact" per stage).
+
+    `encoder` defaults to the CPU `libx264` encoder (unchanged default behaviour for existing
+    callers). Passing a hardware encoder (e.g. ``"h264_nvenc"``, CLAUDE.md §11.1) buffers frames
+    in memory and retries once with `libx264` if the hardware encoder fails (logging the
+    fallback), mirroring :func:`extract_clip`'s NVENC/CPU fallback pattern.
     """
     dst = Path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
     width, height = size
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-v",
-        "error",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "bgr24",
-        "-s",
-        f"{width}x{height}",
-        "-r",
-        str(fps),
-        "-i",
-        "-",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:v",
-        "libx264",
-        str(dst),
-    ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    n = 0
-    try:
-        for frame in frames_iter:
-            proc.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
-            n += 1
-    finally:
-        proc.stdin.close()
-        proc.wait()
+
+    def build_cmd(enc: str) -> list[str]:
+        return [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            str(fps),
+            "-i",
+            "-",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            enc,
+            str(dst),
+        ]
+
+    def run(enc: str, frames: list[np.ndarray]) -> subprocess.Popen:
+        proc = subprocess.Popen(build_cmd(enc), stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            for frame in frames:
+                proc.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+        finally:
+            proc.stdin.close()
+            proc.wait()
+        return proc
+
+    if encoder == "libx264":
+        # Fast path: stream frames straight through without buffering them all in memory.
+        proc = subprocess.Popen(build_cmd(encoder), stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        n = 0
+        try:
+            for frame in frames_iter:
+                proc.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+                n += 1
+        finally:
+            proc.stdin.close()
+            proc.wait()
+        if proc.returncode != 0:
+            stderr = proc.stderr.read().decode(errors="replace")
+            raise RuntimeError(f"ffmpeg failed writing {dst}: {stderr}")
+        logger.info("wrote %d frame(s) -> %s", n, dst)
+        return dst
+
+    # Hardware-encoder path: buffer frames so a failed attempt can be retried with libx264.
+    frames = list(frames_iter)
+    proc = run(encoder, frames)
     if proc.returncode != 0:
         stderr = proc.stderr.read().decode(errors="replace")
-        raise RuntimeError(f"ffmpeg failed writing {dst}: {stderr}")
-    logger.info("wrote %d frame(s) -> %s", n, dst)
+        logger.warning(
+            "encoder %s failed for %s, falling back to libx264: %s",
+            encoder,
+            dst,
+            stderr.strip()[:500],
+        )
+        proc = run("libx264", frames)
+        if proc.returncode != 0:
+            stderr = proc.stderr.read().decode(errors="replace")
+            raise RuntimeError(f"ffmpeg failed writing {dst}: {stderr}")
+    logger.info("wrote %d frame(s) -> %s", len(frames), dst)
     return dst

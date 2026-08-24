@@ -2,15 +2,46 @@
 # single-static / single-panning so downstream stages branch correctly (CLAUDE.md §3.1).
 # fps_sample for this stage lives in configs/hardware.yaml (stages.profile.fps_sample).
 
-scenedetect:
-  detector: content # PySceneDetect ContentDetector
-  threshold: 27.0 # higher = fewer cuts detected; PySceneDetect's own ballpark default
-  min_scene_len_frames: 15 # ignore cuts shorter than this many frames (debounces flash/graphic cuts)
+# scenedetect params (ContentDetector threshold/min_scene_len/downscale) live in
+# configs/shots.yaml, not here — ADR-7 made shot-boundary detection a single engine shared by
+# Stage 0.5 (this profiler, for n_cuts/cuts_per_min) and Stage 1 (src/shots/boundaries.py), so the
+# knob isn't duplicated across two config files. src/pipeline/profiler.py loads shots.yaml itself.
 
 motion:
-  flow_method: farneback # cv2 dense optical-flow method used for the motion score
-  static_motion_threshold: 1.5 # mean flow magnitude (px/frame) below this => "static" camera
-  panning_motion_threshold: 6.0 # mean flow magnitude above this => "panning"; between is ambiguous
+  # Robust global camera-motion estimator (see src/pipeline/profiler.py:compute_motion_score
+  # docstring for the full history/rationale -- two earlier designs were tried and empirically
+  # rejected on this footage before landing here, both logged in the docstring). Final design:
+  # sparse good-features-to-track + Lucas-Kanade optical flow between **truly consecutive native
+  # frames** (not frames `fps_sample` apart -- see docstring, this was a real bug: KLT/Farneback
+  # both assume small inter-frame displacement, and at fps_sample=2 on 30fps footage consecutive
+  # *sampled* frames are 15 native frames apart, well outside that assumption, producing garbage
+  # flow) at a sparse set of `fps_sample`-per-second anchor points across the clip, then
+  # cv2.estimateAffinePartial2D(..., RANSAC) on each anchor's matched points to fit ONE dominant
+  # (translation+rotation+scale) motion model per anchor -- RANSAC's outlier rejection is what
+  # makes this robust to the players (a minority of tracked points at this camera's wide framing,
+  # CLAUDE.md §3.2): a moving player's points get voted down as outliers against the majority
+  # background consensus. The final score is the **median** translation magnitude across anchors
+  # (not the mean): CLAUDE.md §3.2's footage turns out to have a short (~3-5s) genuine camera-pan
+  # "settling" period at the very start of every one of the 5 clips (confirmed by eye -- see
+  # docstring), a real, non-noise, non-artifact transient CLAUDE.md's ~1px/frame figure doesn't
+  # mention; the median is dominated by the long static remainder and isn't skewed by it the way
+  # a mean would be. Reported in native-resolution px/**native video frame**.
+  flow_width: 960 # decode width for feature tracking -- large enough for goodFeaturesToTrack to
+  # find real structure (treeline/stands/pitch-lines), small enough to be fast; unlike Farneback,
+  # KLT on ~200 sparse points is cheap even before this downscale, so this is a smaller factor in
+  # runtime than the (unavoidable) full native-fps decode pass (see docstring: we still have to
+  # decode every native frame once, sequentially, to land the flow computation on truly
+  # consecutive frames without repeated-seek artifacts -- see docstring).
+  max_corners: 200 # cv2.goodFeaturesToTrack: max points to track per anchor
+  quality_level: 0.01 # cv2.goodFeaturesToTrack: minimum accepted corner quality (relative to best)
+  min_distance: 10 # cv2.goodFeaturesToTrack: minimum pixel distance between accepted corners
+  block_size: 7 # cv2.goodFeaturesToTrack: corner-detection window size
+  lk_win_size: 21 # cv2.calcOpticalFlowPyrLK: tracking window side length (px)
+  lk_max_level: 3 # cv2.calcOpticalFlowPyrLK: pyramid levels
+  ransac_reproj_threshold: 3.0 # cv2.estimateAffinePartial2D: RANSAC inlier reprojection error (px)
+  min_tracked_points: 10 # skip an anchor if fewer than this many points survive tracking
+  static_motion_threshold: 1.5 # native-res px/native-frame below this => "static" camera
+  panning_motion_threshold: 6.0 # native-res px/native-frame above this => "panning"; between is ambiguous
 
 classification:
   # cuts-per-minute at/above this => broadcast (multi-camera cut pattern). A single continuous

@@ -13,3 +13,9 @@ decode:
 
 frame_index:
   start_at_zero: true # Frame.index is 0-based per src/common/types.py
+
+debug_dump:
+  # Opt-in only (--dump-frames on src/ingest/decode.py's CLI); never on by default (CLAUDE.md
+  # §10: don't dump 135k JPEGs to disk for a 90-min match). Writes an evenly-sampled subset of
+  # decoded frames as PNGs to work/<slug>/frames_debug/ for eyeballing decode correctness.
+  max_frames: 40 # cap on how many frames get written regardless of video length

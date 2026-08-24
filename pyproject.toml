@@ -74,6 +74,11 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+# B008: typer's documented CLI pattern is `param: T = typer.Option(default, ...)` -- the "function
+# call in a default argument" this rule warns about is typer's own API, not a mutable-default
+# footgun, so every typer CLI entrypoint in this repo trips it. Ignored project-wide rather than
+# per-line since every future `src/pipeline/*_cli.py` will use the same pattern.
+ignore = ["B008"]
 
 [tool.black]
 line-length = 100

@@ -7,10 +7,27 @@
 # fps_sample for this stage lives in configs/hardware.yaml (stages.shots.fps_sample).
 
 scenedetect:
-  # Runs unconditionally (ADR-7), same engine as the Stage 0.5 profiler.
-  detector: content # PySceneDetect ContentDetector
-  threshold: 27.0
-  min_scene_len_frames: 15
+  # Runs unconditionally (ADR-7). This is the ONE place `scenedetect` params live — the Stage 0.5
+  # profiler (src/pipeline/profiler.py) calls src/shots/boundaries.py for its n_cuts/cuts_per_min
+  # rather than re-reading its own copy, so the knob isn't duplicated across configs/profile.yaml.
+  detector: content # PySceneDetect ContentDetector, driven frame-by-frame over our own NVDEC
+  # decode (src/common/video.decode_frames) rather than scenedetect's own (slow, CPU-only opencv
+  # backend) VideoStream, so cut detection reuses the same decode path as the rest of the pipeline.
+  downscale_width: 640 # decode width fed to ContentDetector; matches the 640px scale CLAUDE.md
+  # §3.2 used for its own independent ffmpeg cut measurement, and is fast (small frames + NVDEC).
+  #
+  # threshold: measured 2026-08-24 on input/clip4 77.mp4 (the only clip with a real cut) at this
+  # exact downscale: the true venue cut at t=60.07s scores content_val=57.5, and two further real
+  # cuts (confirmed by eye — see notes below) at t=73.6s/t=87.2s score 45.6/61.8. Meanwhile
+  # PySceneDetect's stock default (27.0) also fires on three frames that are NOT cuts — a person
+  # entering the extreme foreground / fast pan at t=14.5s, t=47.0s and t=99.6s (content_val
+  # 32.0/29.5/28.4) — because those are within-take foreground-object flicker, not scene changes
+  # (confirmed by extracting frames around each timestamp: same venue/camera before and after).
+  # 38.0 sits in the clean gap between the highest false-positive (32.0) and lowest real cut
+  # (45.6), so it keeps the 3 real cuts and drops the 3 false ones. NOT tuned to force a
+  # predetermined cut *count* — see the profiler's docstring/report for the full investigation.
+  threshold: 38.0
+  min_scene_len_frames: 15 # ignore cuts shorter than this many frames (debounces flash/graphic cuts)
 
 replay:
   # Broadcast-gated (profile == "broadcast" only, ADR-7). Heuristic replay/close-up flags;

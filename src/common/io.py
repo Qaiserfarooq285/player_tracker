@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 import pandas as pd
+import yaml
 from pydantic import BaseModel
 
 from .logging import get_logger
@@ -64,6 +65,16 @@ def save_json(obj: Any, path: str | Path) -> None:
 def load_json(path: str | Path) -> Any:
     """Load and parse a JSON file written by :func:`save_json`."""
     return json.loads(Path(path).read_text())
+
+
+def load_yaml(path: str | Path) -> dict:
+    """Load a `configs/*.yaml` file into a plain dict (CLAUDE.md §10: one config per stage).
+
+    Every stage loads its config through this one helper so YAML parsing stays in a single
+    place; callers pass the resulting dict into stage functions rather than each module
+    re-reading/re-parsing YAML itself (keeps stage logic unit-testable with synthetic configs).
+    """
+    return yaml.safe_load(Path(path).read_text())
 
 
 def save_models_parquet(models: list[BaseModel], path: str | Path) -> None:
