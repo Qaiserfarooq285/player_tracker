@@ -1,0 +1,15 @@
+# Stage 0 — ingest (CLAUDE.md §5 Stage 0). Decode the source video and sample frames.
+# fps_sample for this stage lives in configs/hardware.yaml (stages.ingest.fps_sample) so all
+# per-stage sampling rates stay in one place.
+
+input_dir: input
+work_dir: work
+
+video_extensions: [".mp4", ".mkv", ".mov"] # containers accepted from input/
+
+decode:
+  use_nvdec: true # try `ffmpeg -hwaccel cuda -c:v h264_cuvid` first, fall back to CPU decode (ADR-1)
+  pix_fmt: bgr24 # intermediate pixel format piped from ffmpeg into numpy (src/common/video.py)
+
+frame_index:
+  start_at_zero: true # Frame.index is 0-based per src/common/types.py

@@ -1,0 +1,19 @@
+# Stage 1 — temporal structure (CLAUDE.md §5 Stage 1). Only runs when RunProfile.profile ==
+# "broadcast"; auto-skipped for single-camera input (CLAUDE.md §3.1). Protects everything
+# downstream by segmenting camera takes and dropping replays/close-ups (Golden Rule 3).
+# fps_sample for this stage lives in configs/hardware.yaml (stages.shots.fps_sample).
+
+scenedetect:
+  detector: content # PySceneDetect ContentDetector (same engine as the profiler)
+  threshold: 27.0
+  min_scene_len_frames: 15
+
+replay:
+  # heuristic replay/close-up flags; refined once a dedicated shot-type classifier is wired in
+  min_take_seconds: 1.0 # takes shorter than this are suspect (likely a replay sting/transition)
+  closeup_bbox_area_ratio: 0.35 # a single dominant detection covering this fraction of frame area => closeup
+  logo_wipe_black_frame_ratio: 0.9 # fraction of near-black pixels that flags a transition/wipe frame
+
+ocr:
+  engine: easyocr # Apache-2.0 (CLAUDE.md §7); requires the `ocr` extra
+  scoreboard_region_relative: [0.0, 0.0, 0.25, 0.12] # [x1,y1,x2,y2] as fraction of frame, typical scoreboard corner

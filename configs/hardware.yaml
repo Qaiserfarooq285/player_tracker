@@ -1,0 +1,55 @@
+# Hardware + compute-budget configuration (CLAUDE.md §11).
+# Single machine: NVIDIA RTX A2000 12 GB (Ampere). LOCAL ONLY — no paid cloud (CLAUDE.md §11).
+
+device: cuda # "cuda" or "cpu"; pipeline falls back to cpu automatically if no GPU is visible
+precision: fp16 # mixed precision everywhere (CLAUDE.md §11 fit-in-12GB rules)
+
+# VRAM budget the pipeline targets per stage. CLAUDE.md §11.1 measured an unrelated process
+# (Downloads/Ad Blocker/.venv) holding 6.0 GB at scaffold time, leaving ~5.2 GB free — so the
+# default budget below is conservative (5 GB), not the full 12 GB card.
+vram_budget_mb: 5000
+vram_total_mb: 12282 # measured total VRAM of the RTX A2000 12 GB (CLAUDE.md §11.1)
+preflight_warn: true # warn (not fail) when free VRAM < stage budget before a stage starts
+
+decode:
+  scale_width: 1920 # downscale 4K input before detection (CLAUDE.md §3.1) — never feed 4K raw to a detector
+  chunk_seconds: 180 # process the match in fixed chunks so long runs are resumable (CLAUDE.md §11)
+
+# Per-stage compute knobs. `fps_sample` = frames sampled per second of source video for that
+# stage (CLAUDE.md §11 "per-stage fps sampling defaults"); `batch_size`/`image_size` bound VRAM.
+stages:
+  ingest:
+    fps_sample: 30 # ingest decodes at native fps; downstream stages subsample further
+
+  profile:
+    fps_sample: 2 # source profiler: cuts/motion only need a sparse sample
+
+  shots:
+    fps_sample: 2 # shot-boundary/replay detection: 1-2 fps per CLAUDE.md §11
+
+  detect:
+    batch_size: 2
+    image_size: 1280
+    fps_sample: 10 # detection+tracking: 5-12 fps per CLAUDE.md §11
+
+  ball:
+    batch_size: 1
+    image_size: 1280
+    fps_sample: 30 # ball needs full-fps sampling where it matters (CLAUDE.md §11)
+    sahi:
+      tile_size: 640 # SAHI tiling for small-object (ball) detection
+      overlap_ratio: 0.2
+
+  pitch:
+    fps_sample: 1 # one calibration per take for static cams (ADR-3); sparse otherwise
+
+  track:
+    fps_sample: 10 # matches detect.fps_sample; tracker consumes the detector's output
+
+  team:
+    batch_size: 8
+    image_size: 224
+    fps_sample: 2 # team/jersey: 1-2 fps per tracklet (CLAUDE.md §11)
+
+  ocr:
+    fps_sample: 1 # Phase-2 jersey OCR; scoreboard OCR uses the same cadence

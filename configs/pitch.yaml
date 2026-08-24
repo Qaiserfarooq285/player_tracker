@@ -1,0 +1,22 @@
+# Stage 2 — pitch homography (CLAUDE.md §5 Stage 2, ADR-3).
+# Phase 1 single-camera: one assisted 4-point manual calibration per take (ADR-3) — the usual
+# auto pitch-keypoint model is AGPL (YOLOv8-pose), same problem as ADR-2.
+
+pitch_length_m: 105.0 # FIFA standard pitch length (metres) used as the pitch-coordinate frame
+pitch_width_m: 68.0 # FIFA standard pitch width (metres)
+
+manual_calibration:
+  enabled_for_profiles: [single-static] # one calibration serves the whole clip for a static camera
+  min_points: 4 # minimum correspondence points for cv2.findHomography
+  reproj_error_warn_px: 15.0 # warn if reprojection error exceeds this many pixels
+
+auto_keypoints:
+  # Evaluated for the broadcast branch (ADR-3); not used on the Phase-1 single-camera path.
+  enabled: false
+  method: null # e.g. "pnlcalib" / "tvcalib" once selected + license-checked
+  # fps_sample for this stage lives in configs/hardware.yaml (stages.pitch.fps_sample)
+
+minimap:
+  # placement for src/common/viz.py::draw_pitch_overlay debug minimaps
+  origin_px: [20, 20]
+  size_px: [220, 140]

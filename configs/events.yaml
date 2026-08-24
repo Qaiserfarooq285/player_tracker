@@ -1,0 +1,19 @@
+# Stage 5 — events (CLAUDE.md §5 Stage 5). Phase 1: goals (scoreboard delta), shots (heuristic),
+# sprints (homography + speed) only — no passes/touches/tackles yet (CLAUDE.md §12 Don'ts).
+
+sprint:
+  speed_threshold_mps: 6.0 # ~21.6 km/h; sustained speed above this counts as a sprint
+  min_duration_s: 1.0 # minimum sustained duration to count as a sprint event
+  smoothing_window_frames: 5 # median-filter window applied to the pitch-position speed signal
+
+shot:
+  # heuristic: ball moving fast toward goal + player proximity; refined once ball tracking is solid
+  ball_speed_threshold_mps: 15.0
+  goal_proximity_m: 25.0
+  min_confidence: 0.4
+
+goal:
+  scoreboard_ocr_fps_sample: 1 # cadence for scoreboard-delta detection (matches configs/shots.yaml ocr)
+
+confidence:
+  min_emit_confidence: 0.3 # events below this confidence are dropped, not emitted (logged via DropCounter)

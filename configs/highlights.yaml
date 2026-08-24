@@ -1,0 +1,26 @@
+# Stage 6 — highlights (CLAUDE.md §5 Stage 6). Rank, dedupe, cut, and export the reel.
+
+clip:
+  pre_roll_s: 3.0 # seconds of context included before an event's t_start
+  post_roll_s: 2.0 # seconds of context included after an event's t_end
+  snap_to_take_boundaries: true # never let a clip cross a camera cut (Golden Rule 3)
+
+dedupe:
+  iou_over_time_threshold: 0.6 # clips overlapping this much in time are considered duplicates
+
+rank:
+  # Higher weight = ranked earlier in the reel, per CLAUDE.md §5 Stage 6 priority order:
+  # goal > assist > shot > dribble > key_pass > sprint > pass.
+  weights:
+    goal: 100
+    assist: 80
+    shot: 60
+    dribble: 40
+    key_pass: 30
+    sprint: 20
+    pass: 10
+  confidence_weight: 0.5 # how much an event's own confidence scales its final rank_score
+
+export:
+  max_clips: 15
+  target_reel_seconds: null # null = no cap; otherwise trims lowest-ranked clips to fit

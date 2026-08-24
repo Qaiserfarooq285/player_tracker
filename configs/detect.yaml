@@ -1,0 +1,17 @@
+# Stage 2 — detection (CLAUDE.md §5 Stage 2). RF-DETR (Apache-2.0) only — NEVER Ultralytics
+# YOLO (Golden Rule 6, ADR-2). batch_size/image_size for this stage live in configs/hardware.yaml
+# (stages.detect / stages.ball) so VRAM knobs stay in one place; model choice + thresholds live here.
+
+model:
+  name: rfdetr-base # small/base variant, not large (CLAUDE.md §11 fit-in-12GB rule)
+  checkpoint: coco # "coco" pretrained until an Apache-2.0 soccer checkpoint is verified (ADR-2)
+  classes: [person, sports_ball] # COCO classes; mapped to DetectionClass in src/detect
+
+inference:
+  conf_threshold: 0.35
+  nms_iou_threshold: 0.5
+
+sahi:
+  enabled_for: [ball] # SAHI tiling only where small-object detail matters (CLAUDE.md §3.1)
+  tile_conf_threshold: 0.25
+  # tile_size / overlap_ratio live in configs/hardware.yaml (stages.ball.sahi)

@@ -1,0 +1,10 @@
+# Stage 3 — tracking (CLAUDE.md §5 Stage 3). `supervision` ByteTrack (MIT) only — NEVER BoxMOT
+# (AGPL-3.0, Golden Rule 6).
+
+bytetrack:
+  track_activation_threshold: 0.25 # confidence required to start a new track
+  lost_track_buffer: 30 # frames to keep a lost track alive before dropping it
+  minimum_matching_threshold: 0.8 # IoU threshold for associating detections to existing tracks
+  frame_rate: 10 # must match configs/hardware.yaml stages.detect.fps_sample
+
+reset_ids_at_cuts: true # Golden Rule 3: track only within a take; reset IDs at every camera cut

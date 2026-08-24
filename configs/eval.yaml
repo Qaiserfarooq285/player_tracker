@@ -1,0 +1,26 @@
+# Evaluation harness (CLAUDE.md §9). Stand this up early; verify with numbers, not vibes
+# (Golden Rule 8). Wire this before optimizing anything.
+
+detection:
+  metric: mAP50 # players first; ball tracked separately and expected lower (CLAUDE.md §9)
+  iou_threshold: 0.5
+  labeled_slice_dir: data/eval/detection
+
+tracking:
+  metric: HOTA # via TrackEval (MIT, CLAUDE.md §7)
+  also_report: [IDF1, id_switches]
+  tool: TrackEval
+  within_takes_only: true # Golden Rule 3 — never evaluate tracking across a camera cut
+  labeled_slice_dir: data/eval/tracking
+
+actions: # Phase 2+
+  metric: mAP@1s # SoccerNet ball-action style (CLAUDE.md §9)
+  labeled_slice_dir: data/eval/actions
+
+jersey: # Phase 2
+  metric: tracklet_accuracy
+  labeled_slice_dir: data/eval/jersey
+
+report:
+  out_dir: output
+  include_config_hash: true # every run report logs numbers + config hash (CLAUDE.md §9)

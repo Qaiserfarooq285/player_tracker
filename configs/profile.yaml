@@ -1,0 +1,20 @@
+# Stage 0.5 — source profiler (CLAUDE.md §5 Stage 0.5). Classifies input as broadcast /
+# single-static / single-panning so downstream stages branch correctly (CLAUDE.md §3.1).
+# fps_sample for this stage lives in configs/hardware.yaml (stages.profile.fps_sample).
+
+scenedetect:
+  detector: content # PySceneDetect ContentDetector
+  threshold: 27.0 # higher = fewer cuts detected; PySceneDetect's own ballpark default
+  min_scene_len_frames: 15 # ignore cuts shorter than this many frames (debounces flash/graphic cuts)
+
+motion:
+  flow_method: farneback # cv2 dense optical-flow method used for the motion score
+  static_motion_threshold: 1.5 # mean flow magnitude (px/frame) below this => "static" camera
+  panning_motion_threshold: 6.0 # mean flow magnitude above this => "panning"; between is ambiguous
+
+classification:
+  # cuts-per-minute at/above this => broadcast (multi-camera cut pattern). A single continuous
+  # take (one giant shot spanning the whole clip) reads as ~0 cuts/min and is never broadcast.
+  broadcast_cuts_per_min_threshold: 3.0
+  # below this shortest-side resolution, RunProfile.quality_flag is set to "low_res"
+  quality_min_resolution_px: 640

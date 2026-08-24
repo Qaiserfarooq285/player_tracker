@@ -1,0 +1,45 @@
+# ---- I/O contract dirs (CLAUDE.md §10) ----
+input/
+work/
+output/
+data/
+models/
+
+# ---- secrets ----
+.env
+.env.local
+
+# ---- media ----
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+*.ts
+*.png
+*.jpg
+*.jpeg
+!docs/**/*.png
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+dist/
+build/
+
+# ---- node (apps/web) ----
+node_modules/
+apps/web/dist/
+
+# ---- os / editor ----
+.DS_Store
+*.swp
+.vscode/
+.idea/

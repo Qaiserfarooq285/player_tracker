@@ -1,0 +1,83 @@
+[project]
+name = "soccer-highlight-analyzer"
+version = "0.1.0"
+description = "Ingest a full broadcast soccer match and produce per-player highlight reels + a stat card."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = { text = "MIT" }
+
+# Core deps: kept lean so `uv pip install -e .` resolves fast and never pulls torch.
+# Optional/heavy stacks (torch, transformers, ocr, api) live in [project.optional-dependencies].
+dependencies = [
+    "pydantic>=2.7",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "pyyaml",
+    "typer",
+    "rich",
+    "opencv-python",
+    "av",
+    "scenedetect[opencv]",
+    "supervision",
+    "tqdm",
+    "python-dotenv",
+    "scipy",
+]
+
+[project.optional-dependencies]
+# Stage 2 perception: RF-DETR (Apache-2.0) detector + SAHI tiling + torch runtime.
+# NEVER add ultralytics or boxmot here (AGPL-3.0, forbidden by Golden Rule 6 / CLAUDE.md §7).
+detect = [
+    "rfdetr",
+    "sahi",
+    "torch",
+    "torchvision",
+    "timm",
+]
+# Stage 3 team assignment: SigLIP embeddings + UMAP + KMeans clustering.
+team = [
+    "transformers",
+    "umap-learn",
+    "scikit-learn",
+]
+# Phase 2 identity: jersey-number OCR.
+ocr = [
+    "easyocr",
+]
+# Thin API serving the pipeline to apps/web.
+api = [
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",
+]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "black",
+    "pre-commit",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.uv.sources]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

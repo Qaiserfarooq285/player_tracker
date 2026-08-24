@@ -1,0 +1,17 @@
+# Top-level run defaults (CLAUDE.md §10 I/O contract): input video in input/ (auto-detected),
+# cached artifacts in work/ (resumable, chunked), final reel + stat card + run report in output/.
+
+input_dir: input
+work_dir: work
+output_dir: output
+
+# Parsed from the input filename per CLAUDE.md §3.1; null until a file is matched. Phase 1: run
+# metadata + output naming + manual-selection prompt label only — never auto-ID (Golden Rule 7).
+target_jersey: null
+
+# CLAUDE.md §3.1 filename convention: "clip<N> <jersey>.mp4" — the trailing integer is the
+# target player's jersey number. Named groups: n (clip number), jersey (jersey number).
+filename_convention_regex: '^clip(?P<n>\d+)\s+(?P<jersey>\d+)$'
+
+hardware_config: configs/hardware.yaml
+log_level: INFO
