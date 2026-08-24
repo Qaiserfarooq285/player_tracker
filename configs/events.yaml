@@ -5,6 +5,11 @@ sprint:
   speed_threshold_mps: 6.0 # ~21.6 km/h; sustained speed above this counts as a sprint
   min_duration_s: 1.0 # minimum sustained duration to count as a sprint event
   smoothing_window_frames: 5 # median-filter window applied to the pitch-position speed signal
+  # ADR-6: when a take's PitchHomography has fewer usable landmarks than
+  # configs/pitch.yaml:manual_calibration.min_points, speed is reported in normalised-pixel units
+  # with Event.evidence["calibrated"]=false, never fabricated metres (Golden Rule 5). This factor
+  # multiplies the event's confidence in that case instead of a hard-coded penalty in code.
+  uncalibrated_confidence_penalty: 0.5
 
 shot:
   # heuristic: ball moving fast toward goal + player proximity; refined once ball tracking is solid
@@ -14,6 +19,9 @@ shot:
 
 goal:
   scoreboard_ocr_fps_sample: 1 # cadence for scoreboard-delta detection (matches configs/shots.yaml ocr)
+  # CLAUDE.md §3.2(3): the current single-camera footage has no scoreboard anywhere, so this
+  # detector is N/A on it. It stays wired for broadcast input; on scoreboard-less footage it must
+  # emit "not available", never a guessed goal (Golden Rule 5).
 
 confidence:
   min_emit_confidence: 0.3 # events below this confidence are dropped, not emitted (logged via DropCounter)

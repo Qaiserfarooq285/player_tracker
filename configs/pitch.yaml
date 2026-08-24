@@ -7,6 +7,10 @@ pitch_width_m: 68.0 # FIFA standard pitch width (metres)
 
 manual_calibration:
   enabled_for_profiles: [single-static] # one calibration serves the whole clip for a static camera
+  # CLAUDE.md §3.2(4): some clips (e.g. painted-over American-football lines, portable goals) show
+  # fewer than 4 usable pitch landmarks. Below min_points, do NOT calibrate — leave the take
+  # without a PitchHomography and let Stage 5 fall back to uncalibrated speed (ADR-6,
+  # configs/events.yaml sprint.uncalibrated_confidence_penalty), never fabricated metres.
   min_points: 4 # minimum correspondence points for cv2.findHomography
   reproj_error_warn_px: 15.0 # warn if reprojection error exceeds this many pixels
 

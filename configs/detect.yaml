@@ -3,15 +3,39 @@
 # (stages.detect / stages.ball) so VRAM knobs stay in one place; model choice + thresholds live here.
 
 model:
-  name: rfdetr-base # small/base variant, not large (CLAUDE.md §11 fit-in-12GB rule)
-  checkpoint: coco # "coco" pretrained until an Apache-2.0 soccer checkpoint is verified (ADR-2)
-  classes: [person, sports_ball] # COCO classes; mapped to DetectionClass in src/detect
+  # Primary checkpoint per ADR-8: julianzu9612/RFDETR-Soccernet (HF, Apache-2.0 *declared*),
+  # RF-DETR-Large, classes already match DetectionClass exactly: ball/player/referee/goalkeeper.
+  # ⚠️ ADR-9: trained on SoccerNet (research/education license, CLAUDE.md §7) — dev/eval only
+  # until licensing is cleared; do not ship commercially on this checkpoint without resolving
+  # ADR-9's open items. ADR-10: do not trust its published 0.857 mAP on our footage (domain gap,
+  # youth/amateur Veo vs. pro broadcast) — measure on our labeled slice instead (configs/eval.yaml).
+  name: rfdetr-soccernet
+  checkpoint: julianzu9612/RFDETR-Soccernet
+  classes: [ball, player, referee, goalkeeper] # already 1:1 with DetectionClass — no remapping needed
+  fallback:
+    # RF-DETR-COCO per ADR-2(b): Apache-2.0 clean, no training, used if the soccer checkpoint is
+    # unavailable/fails to load, or once ADR-9's licensing question forces dropping it for a ship.
+    name: rfdetr-base
+    checkpoint: coco
+    classes: [person, sports_ball] # COCO classes; mapped to DetectionClass in src/detect
 
 inference:
   conf_threshold: 0.35
   nms_iou_threshold: 0.5
+  # CLAUDE.md §3.2(5): at image_size 1280 far players are ~30px tall (marginal) on this footage;
+  # plan to try 1536-1920 and measure via configs/eval.yaml before changing the hardware.yaml
+  # default (stages.detect.image_size) — not yet an adopted change.
 
 sahi:
   enabled_for: [ball] # SAHI tiling only where small-object detail matters (CLAUDE.md §3.1)
   tile_conf_threshold: 0.25
   # tile_size / overlap_ratio live in configs/hardware.yaml (stages.ball.sahi)
+  # CLAUDE.md §3.2(5) also floats SAHI for players on this footage ("plan to... and measure") —
+  # not yet adopted; enabled_for stays [ball] until that's evaluated.
+
+masking:
+  # CLAUDE.md §3.2(1): clip2/clip4 carry a burned-in red arrow graphic marking the target player
+  # in the opening seconds — an editorial overlay that both spuriously detects and occludes the
+  # target. "Tracked as a task, not yet implemented" in CLAUDE.md — left disabled here as a stub
+  # until src/detect wires the mask/ignore logic.
+  ignore_burned_in_graphics: false

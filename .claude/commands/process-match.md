@@ -38,8 +38,8 @@ and is skipped on a cache hit (matching config hash) — safe to re-run after a 
 |---|---|---|---|
 | 0 | Ingest | `$(PYTHON) -m src.ingest.run --video "<path>"` | `configs/ingest.yaml`, `configs/hardware.yaml` |
 | 0.5 | Source profiler | `$(PYTHON) -m src.pipeline.profile_cli "<path>"` (also `make profile`) | `configs/profile.yaml` |
-| 1 | Shots (broadcast only; auto-skipped for single-camera) | `$(PYTHON) -m src.shots.run --video "<path>"` | `configs/shots.yaml` |
-| 2 | Detect (players/ball, pretrained RF-DETR + SAHI, **no training**) | `$(PYTHON) -m src.detect.run --video "<path>"` | `configs/detect.yaml` |
+| 1 | Shots: cut/take segmentation (**every profile**, ADR-7); replay/close-up/scoreboard-OCR (broadcast only) | `$(PYTHON) -m src.shots.run --video "<path>"` | `configs/shots.yaml` |
+| 2 | Detect (players/ball, pretrained RF-DETR + SAHI, **no training** — soccer checkpoint per ADR-8, dev/eval only per ADR-9) | `$(PYTHON) -m src.detect.run --video "<path>"` | `configs/detect.yaml` |
 | 2 | Pitch homography (assisted manual calibration for single-camera, ADR-3) | `$(PYTHON) -m src.pitch.run --video "<path>"` | `configs/pitch.yaml` |
 | 3 | Track + team (within-take ByteTrack + SigLIP/UMAP/KMeans) | `$(PYTHON) -m src.track.run --video "<path>"` | `configs/track.yaml`, `configs/team.yaml` |
 | 5 | Events without identity (goals/shots/sprints) | `$(PYTHON) -m src.events.run --video "<path>"` | `configs/events.yaml` |
@@ -62,6 +62,22 @@ dropped (`src/common/logging.py::DropCounter`) — CLAUDE.md §10. Log a `RunRep
 
 ## 4. Report back
 
-Summarize: which stages ran vs. were skipped (cache hits, or broadcast-only stages skipped for
-single-camera input), what got dropped and why, the manual track pick, and where the outputs
-landed. Never claim automatic player identification in Phase 1 (CLAUDE.md §12).
+Summarize: which stages ran vs. were skipped (cache hits, or broadcast-only sub-stages skipped
+for single-camera input — cut detection itself still runs per ADR-7), what got dropped and why,
+the manual track pick, and where the outputs landed. Never claim automatic player identification
+in Phase 1 (CLAUDE.md §12).
+
+## Notes on the current footage (CLAUDE.md §3.2 — check before assuming the general case)
+
+The 5 clips in `input/` are youth/amateur single-camera Veo exports, not broadcast, and several
+ADRs exist specifically because of what was measured in them:
+- **ADR-7**: `clip4` is single-camera but contains a real cut at t=60.07s (two different
+  matches) — cut detection must never be skipped just because a clip "looks" single-take.
+- **ADR-6**: this footage often has fewer than 4 usable pitch landmarks; sprint speed must be
+  reported as uncalibrated (pixel units, confidence-penalised) rather than fabricated metres.
+- **§3.2(3)**: there is no scoreboard anywhere in this footage, so the goal detector must report
+  "not available" here, never a guessed goal.
+- **§3.2(1)**: `clip2`/`clip4` carry a burned-in red-arrow graphic pointing at the target player
+  early on — a detection hazard *and* a free (not-yet-implemented) manual-selection aid.
+Re-check CLAUDE.md §3.2 directly if any of this seems to have changed — it is updated live as the
+footage gets inspected further.
