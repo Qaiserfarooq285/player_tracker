@@ -90,9 +90,207 @@ goal:
   # runnable/debuggable per CLAUDE.md §10, and this key is never actually read on this footage.
 
 confidence:
-  min_emit_confidence: 0.15 # ANY event (sprint or shot) scoring below this after its own
-  # type-specific formula is dropped outright, not emitted — logged via DropCounter, never
-  # silently lowered to make something appear (Golden Rule 5).
+  min_emit_confidence: 0.15 # ANY event (sprint, shot, or any of the ADR-13/14 heuristics below)
+  # scoring below this after its own type-specific formula is dropped outright, not emitted —
+  # logged via DropCounter, never silently lowered to make something appear (Golden Rule 5).
   continuity_weight: 0.5 # sprint confidence = continuity_weight * track_continuity +
   # (1 - continuity_weight) * mean_detection_confidence, BEFORE the uncalibrated penalty above —
   # see src/events/sprints.py::_segment_confidence for the exact formula.
+
+# ---------------------------------------------------------------------------------------------
+# ADR-13/14 — best-effort touch/pass/tackle/save/dribble/possession heuristics (owner-authorized
+# 2026-08-25, CLAUDE.md §13.3). Golden Rule 2 still holds: everything below is ARITHMETIC on top
+# of existing Detection/Track/BallDetection artifacts already cached in work/<slug>/ — no training,
+# no new pretrained model. Golden Rule 5 still holds harder here than anywhere else in this file:
+# each category's own max_confidence is a HARD, deliberately low ceiling (never > 0.5) — these are
+# proximity/possession-change proxies, not verified events, and must never read as more certain
+# than "worth a human glance".
+#
+# Coordinate space: every pixel-unit threshold below (touch_distance_px, possession_max_dist,
+# pass_max_dist, save_gk_proximity_px) is in the SAME pixel space as the cached
+# Detection/Track/BallDetection bbox coordinates already are — i.e. `configs/hardware.yaml:
+# stages.detect.image_size`'s decoded/downscaled frame (measured 1920x1080 on both clip2/clip4,
+# half native 4K — see `src/detect/detector.py`/`configs/detect.yaml`), NOT raw 3840x2160. This
+# matches how sprint/shot already implicitly scale (sprint normalises by bbox-height, shot by
+# frame-width, both computed directly off these same cached bbox numbers).
+# ---------------------------------------------------------------------------------------------
+
+touch:
+  # A "touch" = the ball's centroid comes within `touch_distance_px` of a player's bbox (0px =
+  # ball centroid literally inside the box; positive = distance to the box's nearest edge/corner).
+  # ⚠️ MEASURED 2026-08-25 on work/clip2_77 + work/clip4_77's own cached ball_detections.parquet /
+  # track/tracks.parquet (this task): for every ball detection, the point-to-bbox distance to its
+  # nearest non-referee player track (matched within `match_tolerance_s`) was computed directly.
+  # clip2 (404 ball samples): the ball's centroid falls INSIDE some player's own box 60.1% of the
+  # time (0px); at 40px, 83.9% of samples qualify. clip4 (3332 samples, 4 takes): inside-a-box
+  # 27.0% of the time; at 40px, 64.9% qualify (combined across both clips: 66.9%). 40px sits just
+  # past the "inside or touching the box" mass on both clips without opening up to "merely
+  # somewhere nearby" (55px/70px push combined coverage to 75.5%/79.3% — a materially looser
+  # bar) — chosen as the tighter of the two plausible readings since a "touch" should mean
+  # contact, and `possession_max_dist` below covers the broader "currently controls the ball"
+  # zone. Debounced by `touch_min_gap_s` so continuous proximity (e.g. a stationary dribble) fires
+  # one touch every debounce window, not once per ball sample (ball is sampled at
+  # `configs/hardware.yaml: stages.ball.fps_sample`=30 i.e. every 0.033s — far faster than a human
+  # can actually touch a ball).
+  touch_distance_px: 40
+  touch_min_gap_s: 0.3 # a fast dribble touches the ball roughly every 0.25-0.5s in reality; below
+  # this a "new" touch for the SAME (stitched) identity is almost certainly the same contact
+  # re-triggering across consecutive ball samples, not a second genuine touch. Comfortably above
+  # both the ball's own 0.033s sampling interval and the track's 0.1s sampling interval
+  # (`configs/hardware.yaml: stages.track.fps_sample`=10), so it can't fire from pure frame-to-
+  # frame jitter at either rate.
+  match_tolerance_s: 0.15 # time-alignment tolerance between a ball sample (30fps) and a track's
+  # own box (10fps) — same value/reasoning as `configs/highlights.yaml:
+  # selection.arrow_match_tolerance_s` (kept duplicated here rather than cross-imported, per this
+  # file's own existing precedent — see the `goal` section's `scoreboard_region_relative`
+  # comment — since `configs/events.yaml` stages must stay independently runnable, CLAUDE.md §10).
+  min_ball_conf: 0.3 # ignore ball detections below this confidence — identical value/reasoning to
+  # `shot.min_ball_conf` above (also softly deweights long interpolated stretches via
+  # `configs/detect.yaml: ball_interpolation.interpolated_conf_penalty`).
+  min_confidence: 0.1
+  max_confidence: 0.45 # HARD CEILING (Golden Rule 5): the most directly-grounded heuristic in
+  # this file (literal measured pixel proximity), so it gets the highest ceiling of the new
+  # categories — still never allowed to read as more than "worth a human glance".
+
+possession:
+  # For each (confidence-filtered) ball sample, the nearest non-referee player within
+  # `possession_max_dist` "has" the ball; consecutive same-identity samples merge into possession
+  # INTERVALS (bridging brief `None`/no-one-close-enough gaps under `possession_merge_gap_s`, but
+  # NEVER bridging across another identity's own intervening spell — see
+  # src/events/possession.py::merge_possession_runs for the exact semantics), then intervals
+  # shorter than `possession_min_duration_s` are dropped as noise.
+  # ⚠️ MEASURED 2026-08-25 (same pass as `touch` above): 70px sits at the 92.3% mark on clip2's own
+  # 404 ball samples and 77.7% on clip4's 3332 (combined 79.3%) — deliberately broader than
+  # `touch_distance_px`'s 40px/66.9%, since "currently in this player's playing radius" is a wider
+  # zone than "in literal contact this instant".
+  possession_max_dist: 70
+  possession_min_duration_s: 0.3 # matches `shot.min_duration_s`'s own reasoning ("a real strike's
+  # fast phase is brief") applied to the opposite case: a single-sample proximity blip is noise,
+  # but a real possession spell need not be long to count.
+  possession_merge_gap_s: 0.5 # matches `sprint.sprint_merge_gap_s`'s reasoning: a brief ball-
+  # tracking miss/occlusion mid-possession (SAHI gap, `configs/detect.yaml:
+  # ball_interpolation.max_gap_frames`) shouldn't split one real spell into two.
+  match_tolerance_s: 0.15 # see `touch.match_tolerance_s` — identical reasoning, duplicated per
+  # this file's own independently-runnable-stages convention.
+  min_ball_conf: 0.3 # see `touch.min_ball_conf`.
+  continuity_weight: 0.5 # possession confidence blends CONTINUITY (fraction of the interval's
+  # expected 30fps ball samples actually present) and mean proximity CLOSENESS the same way
+  # `sprint`'s `confidence.continuity_weight` blends continuity and detection confidence — see
+  # src/events/possession.py::possession_confidence.
+  min_confidence: 0.1
+  max_confidence: 0.4 # HARD CEILING — one step below `touch`'s, since a possession INTERVAL
+  # chains several ball samples' worth of nearest-player lookups together (more surface area for
+  # the heuristic to be wrong than a single touch instant).
+
+pass:
+  # A pass = a possession interval by player A ends, and a TEAMMATE B's possession interval begins
+  # within `pass_max_gap_s`/`pass_max_dist`, with no other identity's possession interval in
+  # between (guaranteed by construction — see src/events/possession.py: adjacency is checked on
+  # the full, pre-min-duration-filtered interval list, so even a real but brief opposing touch
+  # in between correctly blocks a pass being inferred straight through it).
+  # ⚠️ MEASURED 2026-08-25 on work/clip2_77 + work/clip4_77's tracks.parquet: pairwise distances
+  # between every pair of simultaneously-visible non-referee players, per take. Combined p75
+  # across clip2's one take and clip4's four takes ranges 662-769px, p90 826-1040px, max
+  # 1647-1855px (frame is ~1920px wide at this stage's coordinate space). `pass_max_dist` is set
+  # at the upper edge of the "typical spacing" band (p75-ish) rather than the p90+ tail — a
+  # possession change at p90+ distance reads more like an unrelated separate event (or a
+  # long-ball/clearance `shot` candidate) than one continuous passing sequence.
+  pass_max_dist: 750
+  pass_max_gap_s: 2.0 # generous enough for the ball to travel `pass_max_dist` in flight without
+  # anyone else registering as "in possession" in between, informally calibrated the same way
+  # `shot.ball_speed_threshold` is (no direct ball-flight-time measurement on this footage,
+  # deliberately conservative) — short enough to exclude a slow, unrelated build-up that only
+  # coincidentally ends at a teammate.
+  team_confidence_threshold: 0.5 # gates "is B a TEAMMATE of A" on BOTH possessors' own
+  # `team_confidence` clearing this bar (ADR-12: team is a soft signal, ⚠️ see below) — same VALUE
+  # as `configs/highlights.yaml: selection.team_match_confidence_threshold`, kept independently
+  # duplicated (not cross-imported) per this file's own convention, chosen because it is measured
+  # to matter here just as much: on clip2, EVERY ONE of its 47 tracks has `team_confidence <= 0.3`
+  # (ADR-12's own documented degenerate-split take) — a pass heuristic gated at 0.5 therefore
+  # emits ZERO pass events on clip2, which is the CORRECT, honest behaviour (Golden Rule 5: no
+  # team signal worth trusting there), not a bug. On clip4, 506/666 (76%) tracks clear 0.5.
+  min_confidence: 0.1
+  max_confidence: 0.35 # HARD CEILING — below `possession`'s, since a pass additionally depends on
+  # the (soft, ADR-12) team signal on top of two chained possession-interval lookups.
+
+dribble:
+  # A single possession interval by ONE identity, long enough (`dribble_min_duration_s`) with an
+  # opponent within `dribble_contest_dist` for at least part of it (pressure) AND the possessor's
+  # own position moving at least `dribble_min_travel` over the interval (rules out "standing still
+  # with the ball loosely nearby"). Distances here are in BBOX-HEIGHTS, the same normalised unit
+  # `sprint`/`configs/highlights.yaml: selection.stitch_max_dist` already use — NOT the raw-pixel
+  # unit `touch`/`possession` use above, since "how close is a marker" and "how far did the
+  # dribbler travel" both scale with the player's own apparent size the same way sprint speed does
+  # (ADR-6's own justification for that unit applies identically here).
+  dribble_min_duration_s: 1.0 # reuses `sprint.sprint_min_duration_s`'s exact reasoning: a fast
+  # 1-2 stride touch-and-release is not "a dribble", a spell sustained for a full second is.
+  dribble_contest_dist: 2.0 # tighter than `configs/highlights.yaml:
+  # selection.stitch_max_dist`=3.0 (that value is a reacquisition SLOP bound for "might be the
+  # same person", deliberately loose) — genuine marking/pressure from an opponent should read as
+  # closer than that, so 2.0 is chosen strictly below it.
+  dribble_min_travel: 1.0 # roughly one body-length of net displacement over the interval — enough
+  # to exclude standing still while the ball merely sits near a stationary player's feet.
+  team_confidence_threshold: 0.5 # see `pass.team_confidence_threshold` — identical value/
+  # reasoning, gates "is the nearby player actually an OPPONENT" the same way.
+  min_confidence: 0.1
+  max_confidence: 0.35 # HARD CEILING — same tier as `pass` (also chains a possession-interval
+  # lookup plus a soft team-opposition check).
+
+tackle:
+  # A tackle candidate = possession changes from identity A to an OPPOSING-team identity B
+  # (`team_confidence_threshold`-gated, reusing `pass`'s exact value/reasoning) within
+  # `tackle_max_duration_s`, where B was measurably CLOSING distance on A/the ball beforehand
+  # (`tackle_min_closing_speed`, looking back up to `tackle_lookback_s`). Attribution: emitted
+  # `player_track_id` is the TACKLER (B) — matches the conventional football-stats reading of
+  # "Tackles: N" on a player's own card (CLAUDE.md §13.2) as tackles THEY made, not tackles they
+  # suffered. `Event.evidence` additionally carries both `tackler_identity`/`tackled_identity` so
+  # a future consumer could derive "times dispossessed" from the same event stream without
+  # re-running the heuristic (Golden Rule 5 traceability).
+  tackle_max_duration_s: 1.5 # a genuine dispossession is fast — a possession change taking longer
+  # than this reads as an unrelated later event, not one continuous challenge.
+  tackle_lookback_s: 1.0 # how far back from the possession-change instant to sample B's own
+  # position for the closing-speed check — long enough to see a real closing run, short enough to
+  # stay "just before this specific challenge" rather than B's whole prior trajectory.
+  tackle_min_closing_speed: 1.0 # bbox-heights/second — reuses `sprint.sprint_speed_threshold`'s
+  # own measured justification verbatim (CLAUDE.md task: "notably faster than typical movement,
+  # not exceptional" on this exact footage's measured speed distribution): closing in at least
+  # sprint-speed is what distinguishes a real challenge from B merely being nearby already.
+  team_confidence_threshold: 0.5 # see `pass.team_confidence_threshold`.
+  min_confidence: 0.1
+  max_confidence: 0.3 # HARD CEILING — lowest of the possession-chain heuristics: a tackle chains
+  # TWO possession intervals, a soft team-opposition check, AND a closing-speed proxy with no
+  # actual contact/challenge detection at all.
+
+save:
+  # Structurally the WEAKEST heuristic in this file (see src/events/saves.py module docstring): no
+  # goal-position model or pitch homography exists on this footage (ADR-3), so "near the
+  # goalkeeper" is only ever "near whatever bbox a GOALKEEPER-class track happens to have" — no
+  # notion of "the goal line" at all. Only evaluated for takes containing a track with
+  # `dominant_class == GOALKEEPER`; a take with none simply produces zero save events (not forced).
+  # ⚠️ NOT GROUNDED in this project's own measured data the way every other section above is:
+  # neither work/clip2_77 nor work/clip4_77 contains a single GOALKEEPER-class track (checked
+  # 2026-08-25, this task) — there is no real footage to calibrate `save_gk_proximity_px` against.
+  # It is set at the same ORDER OF MAGNITUDE as `possession_max_dist`/`pass_max_dist` (this stage's
+  # own pixel coordinate space) as an honest placeholder, not a measured value — flagged here so it
+  # is revisited the moment footage with a keeper exists.
+  smoothing_window_frames: 3 # identical value/reasoning to `shot.smoothing_window_frames` — same
+  # underlying ball-speed series (`src/events/shots.py::ball_speed_series`, reused not
+  # reimplemented).
+  ball_speed_threshold: 0.12 # frame-widths/second — identical value/reasoning to
+  # `shot.ball_speed_threshold` (same underlying signal: "the ball is moving fast").
+  min_duration_s: 0.3 # identical value/reasoning to `shot.min_duration_s` — the fast-approach
+  # phase this looks for is, like a shot, brief by nature.
+  merge_gap_s: 0.3 # identical value/reasoning to `shot.merge_gap_s`.
+  save_gk_proximity_px: 300 # ⚠️ UNGROUNDED placeholder, see above.
+  save_max_window_s: 1.0 # the deceleration/reversal must follow the fast approach quickly to read
+  # as one continuous save event, not two unrelated ball movements.
+  save_deceleration_ratio: 0.3 # "sharp deceleration" = the ball's peak speed in the window AFTER
+  # the fast approach drops to at most this fraction of the peak speed BEFORE it (a save either
+  # decelerates the ball sharply OR reverses its net horizontal direction — see
+  # src/events/saves.py::detect_saves — either condition alone qualifies).
+  min_ball_conf: 0.3 # see `touch.min_ball_conf`.
+  min_confidence: 0.1
+  max_confidence: 0.2 # HARD CEILING, deliberately the LOWEST of every category in this file —
+  # this heuristic has no goal-position awareness, no contact detection, and (per the note above)
+  # zero real footage to have ever been checked against. Never allowed to read as anything beyond
+  # "flag for a human to look at", and expect it to be the noisiest category by far.

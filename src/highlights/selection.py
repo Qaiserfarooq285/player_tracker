@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from src.common.logging import get_logger
 from src.common.types import BBox, DetectionClass, Take, Track, TrackBox
 from src.detect.overlay_mask import ArrowHint
+from src.track.continuity import stitch_timeline as stitch_timeline  # re-export, see below
 from src.track.tracker import assign_take_id
 
 logger = get_logger(__name__)
@@ -154,112 +155,12 @@ def vote_seed_tracks(
 # 2. within-take stitching
 # ---------------------------------------------------------------------------
 
-
-def _spatial_jump(a: Track, b_start_box: TrackBox) -> float:
-    """Normalised distance (bbox-heights, same unit as `configs/events.yaml: sprint`) between
-    track `a`'s LAST box and `b_start_box` (candidate fragment's first box)."""
-    a_box = a.boxes[-1]
-    dx = a_box.bbox.cx - b_start_box.bbox.cx
-    dy = a_box.bbox.cy - b_start_box.bbox.cy
-    dist = (dx * dx + dy * dy) ** 0.5
-    mean_h = (a_box.bbox.height + b_start_box.bbox.height) / 2.0
-    return dist / mean_h if mean_h > 0 else float("inf")
-
-
-def _team_agrees(a: Track, b: Track, threshold: float) -> bool | None:
-    """`True`/`False` when BOTH tracks' `team_confidence` clears `threshold` (a real signal to
-    tiebreak on); `None` when it can't be judged (ADR-12: team is a SOFT signal only, never a
-    hard filter) — see `configs/highlights.yaml: selection.team_match_confidence_threshold`."""
-    if a.team_confidence < threshold or b.team_confidence < threshold:
-        return None
-    if a.team is None or b.team is None:
-        return None
-    return a.team == b.team
-
-
-def stitch_timeline(
-    seed_track_id: int, take_tracks: list[Track], selection_cfg: dict
-) -> tuple[list[int], float]:
-    """Greedily extend `seed_track_id` FORWARD in time within `take_tracks` (all belonging to the
-    SAME take — the caller guarantees this, and it is also asserted defensively below).
-
-    A candidate fragment is joined when: (a) the time gap between the timeline's current last box
-    and the candidate's first box is under `stitch_max_gap_s`, AND (b) the spatial jump between
-    those two boxes (bbox-heights, see `_spatial_jump`) is under `stitch_max_dist`. Among all
-    fragments satisfying both, the one with the SMALLEST spatial jump wins; team agreement
-    (`_team_agrees`) only breaks an exact tie between otherwise-equal candidates — it is never a
-    hard filter (ADR-12).
-
-    This is ONE-DIRECTIONAL (forward only): the seed itself is chosen by whichever evidence
-    (arrow vote or the fallback heuristic) is expected to already sit near the most informative
-    part of the take, and CLAUDE.md's task spec describes stitching as extending forward from a
-    seed, not searching in both directions — kept simple and explicit rather than adding a
-    backward pass with its own separate (currently unexercised) tie-break rules.
-
-    Returns `(ordered_track_ids, id_confidence)` where `id_confidence` is
-    `join_retention_factor ** n_joins * mean(track's own mean detection confidence)` across every
-    stitched fragment (see `configs/highlights.yaml: selection.join_retention_factor`) — the
-    caller multiplies this by the seed's own selection-method confidence (arrow vote share, or the
-    fallback ceiling).
-    """
-    by_id = {tr.id: tr for tr in take_tracks}
-    if seed_track_id not in by_id:
-        return [], 0.0
-    take_ids = {tr.take_id for tr in take_tracks}
-    assert len(take_ids) <= 1, "stitch_timeline must only ever see one take's tracks"
-
-    max_gap_s = selection_cfg["stitch_max_gap_s"]
-    max_dist = selection_cfg["stitch_max_dist"]
-    team_threshold = selection_cfg["team_match_confidence_threshold"]
-
-    timeline: list[Track] = [by_id[seed_track_id]]
-    used = {seed_track_id}
-    remaining = [tr for tr in take_tracks if tr.id != seed_track_id]
-
-    while True:
-        current = timeline[-1]
-        current_end_t = current.boxes[-1].t
-        best: Track | None = None
-        best_dist = None
-        best_agrees = None
-        for cand in remaining:
-            if cand.id in used or not cand.boxes:
-                continue
-            gap = cand.boxes[0].t - current_end_t
-            if gap < 0 or gap >= max_gap_s:
-                continue
-            dist = _spatial_jump(current, cand.boxes[0])
-            if dist >= max_dist:
-                continue
-            agrees = _team_agrees(current, cand, team_threshold)
-            if (
-                best is None
-                or dist < best_dist
-                or (dist == best_dist and agrees and not best_agrees)
-            ):
-                best, best_dist, best_agrees = cand, dist, agrees
-        if best is None:
-            break
-        timeline.append(best)
-        used.add(best.id)
-
-    join_retention = selection_cfg["join_retention_factor"]
-    n_joins = len(timeline) - 1
-    mean_track_confs = [
-        (sum(b.conf for b in tr.boxes) / len(tr.boxes)) if tr.boxes else 0.0 for tr in timeline
-    ]
-    quality = sum(mean_track_confs) / len(mean_track_confs) if mean_track_confs else 0.0
-    id_confidence = (join_retention**n_joins) * quality
-
-    logger.info(
-        "stitched timeline seed=%d take=%s: %d fragment(s) joined (%s), id_confidence=%.3f",
-        seed_track_id,
-        next(iter(take_ids), None),
-        len(timeline),
-        [tr.id for tr in timeline],
-        id_confidence,
-    )
-    return [tr.id for tr in timeline], id_confidence
+# `stitch_timeline` (gap/distance greedy forward-extension + its `_spatial_jump`/`_team_agrees`
+# helpers) moved to `src/track/continuity.py` (ADR-13/14): the best-effort event heuristics
+# (`src/events/{touches,possession,tackles}.py`) need the SAME "same person across a brief
+# occlusion" judgement for EVERY player in a take, not just this module's one arrow/fallback seed,
+# so the core greedy-chaining logic is shared rather than duplicated. Re-imported above as
+# `stitch_timeline` — behaviour-preserving, this module's own public API/tests are unchanged.
 
 
 def timeline_coverage_seconds(track_ids: list[int], take_tracks: list[Track]) -> float:
