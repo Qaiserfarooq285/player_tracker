@@ -145,7 +145,8 @@ Anything here overrides the brief's default suggestion. Add a row whenever a rec
 | ADR-8 | **Phase-1 detector = `julianzu9612/RFDETR-Soccernet` (Apache-2.0), with RF-DETR-COCO as fallback** | Investigated 2026-08-24 with the validated Roboflow key. **(1)** The three canonical Roboflow soccer projects (`football-players-detection-3zvbc`, `football-field-detection-f07vi`, `football-ball-detection-rejhg`) return `model: None` on **every** version — Roboflow hosts **no trained weights** for them, only data. Their *datasets* are **CC BY 4.0** (commercially usable with attribution) — so they are excellent **eval + future fine-tune** material, which is how we use them. **(2)** On HF, `julianzu9612/RFDETR-Soccernet` is **Apache-2.0**, RF-DETR-Large (128 M, DINOv2 backbone, 1280², 1.46 GB) with exactly the classes we need — `ball, player, referee, goalkeeper` — reporting mAP@50 **0.857** / mAP **0.498** on SoccerNet. **(3)** The alternative `OrbitalLab/mova-rfdetr-soccernet-v1` (MIT) is **gated** (needs an access request) → skipped. | ✅ adopted for P1 |
 | ADR-9 | **⚠️ SoccerNet-derived weights are dev-only until licensing is cleared** | ADR-8's checkpoint is *declared* Apache-2.0 by its uploader, but it was **trained on SoccerNet-Tracking-2023**, and §7 lists SoccerNet data as **research/education only**. Whether an uploader can relicense a model trained on restricted data is legally unsettled — so this is a Golden-Rule-6 "flag before adding", not a silent adoption. **Use it for Phase-1 development and evaluation** (internal R&D, not distribution). **Before any commercial ship**, take one of: (i) obtain SoccerNet commercial terms, (ii) fine-tune RF-DETR on the **CC BY 4.0** Roboflow soccer dataset, or (iii) fall back to RF-DETR-COCO. Do not ship (i)-unresolved. | ⚠️ open — revisit before ship |
 | ADR-11 | **Downstream stages must consume the *motion score*, not the static/panning *label*** | Stage 0.5 put **4 of 5 clips inside the ambiguous band** (1.5–6.0 px/frame). clip2 scores **3.79 → `single-panning`** while clip4 scores **3.14 → `single-static`**, purely because the band's midpoint is 3.75 — essentially identical footage landing on opposite sides of a knife-edge. Worse, the label is contaminated by the ~3–5 s settling pan every clip opens with (§3.2), which is a startup transient, not a camera regime. Acting on the label would mean "calibrate homography once" vs "re-estimate continuously" flipping on noise. **Resolution:** the label stays in `RunProfile` for reporting, but **ADR-3's homography cadence reads `motion_score` directly** — recalibration interval scales continuously with measured motion, with the settling window excluded. For Veo footage the honest answer is that the camera digitally pans to follow play, so homography needs periodic re-estimation *regardless* of which label it got. | ✅ adopted — implement at Stage 2/pitch |
-| ADR-13 | **Owner explicitly authorized best-effort touch/pass/tackle/save heuristics ahead of Phase 1 completion** | Golden Rule 7 reserves fine-grained action stats for Phase 2+ and requires asking the owner before breaking it. Asked (2026-08-25): owner chose "best-effort heuristics now" over staying Phase-1-only or building a real fine-tuned action-spotting model. Scope: touch/pass/tackle/save-for-GK detectors, **no training, no new pretrained model** (Golden Rule 2 still holds) — proximity/possession-change/speed heuristics on top of existing detections+tracks, each with a low, honestly-stated confidence ceiling (Golden Rule 5). **Still structurally impossible regardless of this decision:** goals and assists on this footage — no scoreboard exists to verify a goal (§3.2(3)), so assist's own rule ("the pass before a goal") can never fire here. **Not authorized by this decision:** celebration/key-moment detection — that needs pose analysis or a VLM API, neither requested nor in scope; stays "not detected" until asked separately. | ✅ owner-authorized 2026-08-25 |
+| ADR-14 | **Full extended-output spec: exact statcard.md format, full-resolution annotated original video, per-category highlight reels, Gemini for celebrations** | Owner supplied a complete, detailed spec (2026-08-25) superseding/extending ADR-13 — see **§13** for the full text. Key decisions: (1) the "primary output" is the **original video at original resolution/fps/duration/audio**, annotated in place (red box = target, green = others, ball marker, live stat panel) — not a separate downscaled debug render; (2) `statcard.md` must use the owner's exact template with real computed values, `[uncertain]` wherever a stat can't be reliably derived rather than any invented number (owner's own accuracy rule, independently identical to Golden Rule 5); (3) category-specific highlight compilations (`ball_possession.mp4`, `dribbles.mp4`, `assists.mp4`, `goals.mp4`) — an empty file (not a fabricated one) when a category never occurs, per the owner's own "do not fabricate a highlight" rule; (4) celebrations/"other key moments" — asked the owner directly (no heuristic exists that means anything here); owner chose to supply a **Gemini API key** rather than a cheap heuristic or skipping — Gemini is used ONLY to classify short, cheaply-pre-filtered candidate windows as celebration/key-moment or not; it never touches player/ball detection, which stays RF-DETR (Golden Rule 1 — pipeline of specialized models, VLM is one more specialized stage, not a replacement). | ✅ owner-authorized 2026-08-25 |
+| ADR-13 | **Owner explicitly authorized best-effort touch/pass/tackle/save heuristics ahead of Phase 1 completion** | Golden Rule 7 reserves fine-grained action stats for Phase 2+ and requires asking the owner before breaking it. Asked (2026-08-25): owner chose "best-effort heuristics now" over staying Phase-1-only or building a real fine-tuned action-spotting model. Scope: touch/pass/tackle/save-for-GK detectors, **no training, no new pretrained model** (Golden Rule 2 still holds) — proximity/possession-change/speed heuristics on top of existing detections+tracks, each with a low, honestly-stated confidence ceiling (Golden Rule 5). **Still structurally impossible regardless of this decision:** goals and assists on this footage — no scoreboard exists to verify a goal (§3.2(3)), so assist's own rule ("the pass before a goal") can never fire here. **Superseded by ADR-14** on celebration/key-moment scope (Gemini approved, see above). | ✅ owner-authorized 2026-08-25 |
 | ADR-12 | **Team assignment = torso-colour clustering, NOT SigLIP, on this footage** | §5 Stage 3 recommended SigLIP→UMAP→KMeans (the `roboflow/sports` recipe). Measured on `clip2`, it failed twice: team splits of **48/3** then **27/2/18-NaN** where a real two-team split is ~50/50 — it was clustering grass and pose, not kit. A controlled experiment on the *same* tracks (torso band y∈[0.15,0.50]·h, x inset 18%, boxes ≥25 px, mean **CIELAB**, KMeans k=2, 39 usable tracks) gave **24/15** with cluster means L\*=**97** (dark-blue kit) vs L\*=**146** (white kit) — a large, physically meaningful separation. **Why SigLIP loses:** it is trained for image–*text* semantic alignment, so at 60–150 px crop size every crop reads as "a soccer player" and the dominant variance is pose/blur/background, not jersey colour. It is right for Roboflow's large broadcast crops, wrong for youth Veo footage at this scale. **Resolution:** `team.method: colour` (default) with SigLIP retained as a config-selectable fallback for real broadcast input. **Cluster per take, not globally** — clip4 spans 4 venues with very different lighting. Confidence = distance to own centroid relative to inter-centroid distance. | ✅ adopted |
 | ADR-10 | **Expect a real domain gap; do not trust the published 0.857 mAP on this footage** | ADR-8's checkpoint was trained on SoccerNet = **professional broadcast** footage. §3.2 footage is **youth/amateur Veo** — higher/wider fixed camera, smaller players, different kits, painted-over American-football lines. Published mAP does **not** transfer. This is precisely why §9's eval harness is built before tuning: measure mAP on *our* labeled slice, and treat the Roboflow CC BY 4.0 set as a second eval set. | ✅ adopted |
 | ADR-3 | **Phase-1 homography = assisted 4-point manual calibration for single-camera profiles** | The usual auto pitch-keypoint model is also YOLOv8-pose (AGPL, same problem as ADR-2). For a *static* camera one calibration serves the whole clip, it is more accurate than a per-frame keypoint model, it costs no VRAM, and it is consistent with the human-in-the-loop principle (Golden Rule 4). Auto keypoints (PnLCalib / TVCalib / an Apache RF-DETR-pose) get evaluated for the broadcast branch. | ✅ adopted for P1 |
@@ -288,6 +289,100 @@ wall-clock report** so bottlenecks are visible. A full match taking a few hours 
 If a stage OOMs: batch→1, lower image size, or switch to a smaller variant.
 
 ## 12. Don'ts
-❌ Train from scratch. ❌ Ship YOLO/BoxMOT (AGPL). ❌ Auto-ID player in Phase 1. ❌ Pass/touch/tackle stats in
-Phase 1. ❌ Track across cuts. ❌ Emit untraceable stats. ❌ Build everything at once. ❌ Hard-code params.
-❌ Over-promise accuracy in UI copy. ❌ Feed raw 4K to a detector.
+❌ Train from scratch. ❌ Ship YOLO/BoxMOT (AGPL). ❌ Auto-ID player in Phase 1. ❌ Track across cuts.
+❌ Emit untraceable stats. ❌ Build everything at once. ❌ Hard-code params. ❌ Over-promise accuracy in
+UI copy. ❌ Feed raw 4K to a detector.
+> ❌ ~~Pass/touch/tackle stats in Phase 1~~ — **owner-authorized exception, ADR-13/14, §13.** Best-effort
+> heuristics only, never a fine-tuned model, always a low honestly-stated confidence.
+
+## 13. Extended output spec (owner-authorized 2026-08-25 — ADR-14; supersedes prior output shape)
+
+### 13.1 Primary output: full-resolution annotated original video
+**`output/<slug>/original_annotated_video.mp4`** — the original input video, unchanged resolution/fps/
+duration, **original audio preserved**, with detections/tracking/events/stats drawn directly on top.
+Not a separate downscaled debug clip — the actual footage the owner uploaded. Draw:
+- **Red** box, thick, persistent label, around the **target player** — ID must not visibly reset when the
+  target overlaps another player or leaves/re-enters frame (best-effort continuity via the existing
+  within-take stitching logic, generalised to run continuously rather than gated to arrow-hint votes only;
+  this is still inference on top of raw tracks, not magic — flag it as approximate, never silently drop it).
+- **Green** boxes, thin, around every other detected player, with a track ID where available.
+- A small distinct **ball marker** (already exists from Stage 2's SAHI ball detection) — solid when
+  observed, visually distinct (e.g. hollow/dashed) when interpolated across a gap (Golden Rule 5: never
+  present an inferred position as if it were observed).
+- A **live stats panel** (semi-transparent, corner-anchored) that accumulates as the video plays: every
+  category in §13.3, each showing its real running count/value, or a static "not detected"/"uncertain" line
+  for whatever the current build genuinely cannot produce — never a fabricated or frozen-fake number.
+- A brief "CUT — take N" banner at every take boundary (existing pattern from `scripts/overlay_tracks.py`).
+4K NVENC encode + audio mux is expensive (multi-minute per clip, large files) — that is an accepted cost,
+not a reason to substitute a downscaled render.
+
+### 13.2 `statcard.md` — exact template (owner-specified)
+```
+PLAYER STATISTICS
+
+Player #<target_jersey>
+
+Touches: [actual value]
+Passes: [actual value]
+Sprints/Runs: [actual value]
+Goals: [actual value]
+Assists: [actual value]
+Shots: [actual value]
+Tackles: [actual value]
+Saves: [actual value]
+Dribbles: [actual value]
+Possession Time: [actual value]
+Distance Covered: [actual value]
+
+EVENT TIMELINE
+
+[Timestamp] — Touch
+[Timestamp] — Pass
+[Timestamp] — Sprint
+[Timestamp] — Dribble
+[Timestamp] — Shot
+[Timestamp] — Tackle
+[Timestamp] — Assist
+[Timestamp] — Goal
+[Timestamp] — Celebration
+[Timestamp] — Other Key Moment
+```
+Only list events that actually fired; **never pad the timeline to look complete.** Wherever a value can't be
+reliably derived, write `uncertain` (owner's own words) rather than a number — this is Golden Rule 5 stated
+in the owner's own terms, not a new rule. `Distance Covered` and any speed-derived value are additionally
+suffixed `(uncalibrated)` per ADR-6 — never bare metres/km. `Goals`/`Assists` read `not available` on this
+footage specifically (no scoreboard, §3.2(3)) — that is a data ceiling, true regardless of build effort.
+
+### 13.3 Event categories and their real status on this footage
+| Category | Status | Method |
+|---|---|---|
+| Sprint, Shot | ✅ built (Stage 4/5, pre-ADR-13) | speed/direction heuristic |
+| Touch, Pass, Tackle, Save (GK) | 🔧 building (ADR-13) | ball-proximity / possession-change heuristic, no training, low confidence ceiling |
+| Dribble, Ball-possession, Possession duration | 🔧 building (ADR-14) | extension of the same possession-heuristic layer |
+| Distance covered | 🔧 building (ADR-14) | same normalised-pixel-unit speed integration as sprints (ADR-6) — always `(uncalibrated)` |
+| Celebration, Other key moment | 🔧 building (ADR-14) | cheap motion/clustering pre-filter → **Gemini** classifies only the surviving candidate windows; never runs on every frame (cost control) |
+| Goal, Assist | ⛔ **not available on this footage** | no scoreboard exists to verify against (§3.2(3)) — true for every clip in `input/`, not a missing feature |
+
+### 13.4 Highlight compilations (per clip, category-specific — not the single ranked reel)
+`output/<slug>/highlights/{ball_possession,dribbles,assists,goals}.mp4` — each a concatenation of every
+event in that category for the target player, a few seconds of context before/after each event (config
+knob, matches the existing `pre_seconds`/`post_seconds` pattern). **An empty/absent file, not a fabricated
+one, when a category has zero real events** (owner's rule, identical in spirit to Golden Rule 5) — expect
+`assists.mp4` and `goals.mp4` to always be empty on this footage (§13.3).
+
+### 13.5 Required directory layout (per clip slug)
+```
+output/<slug>/
+  original_annotated_video.mp4   # §13.1 — the primary deliverable
+  statcard.md                    # §13.2 — exact owner template
+  highlights/
+    ball_possession.mp4
+    dribbles.mp4
+    assists.mp4                  # expect empty on this footage
+    goals.mp4                    # expect empty on this footage
+  events/
+    event_timeline.json          # machine-readable form of §13.2's timeline
+```
+The pre-existing `reel.mp4` / `stat_card.json` / `stat_card.md` / `run_report.json` / `clips/` artifacts are
+kept alongside (other tooling/tests depend on them) — §13.5 is additive, not a replacement of the verified
+Stage 4–6 output.
