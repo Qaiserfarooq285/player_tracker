@@ -1,27 +1,98 @@
-# Stage 5 — events (CLAUDE.md §5 Stage 5). Phase 1: goals (scoreboard delta), shots (heuristic),
-# sprints (homography + speed) only — no passes/touches/tackles yet (CLAUDE.md §12 Don'ts).
+# Stage 4 — events (CLAUDE.md §5 Stage 5). Phase 1: sprints (speed heuristic), shots (heuristic,
+# low-confidence ceiling), goals (scoreboard delta — N/A on this footage) only. No
+# passes/touches/tackles (CLAUDE.md §12 Don'ts).
+#
+# ⚠️ ADR-6: there is NO metric pitch homography on this footage (`src/pitch/` is an empty seam —
+# CLAUDE.md §3.2(4): the pitch lines here are too sparse/non-standard for the assisted 4-point
+# calibration ADR-3 describes). Every speed figure below is therefore in a NORMALISED PIXEL unit
+# we define ourselves, never m/s (Golden Rule 5) — see `sprint.unit`/`shot.unit` comments.
 
 sprint:
-  speed_threshold_mps: 6.0 # ~21.6 km/h; sustained speed above this counts as a sprint
-  min_duration_s: 1.0 # minimum sustained duration to count as a sprint event
-  smoothing_window_frames: 5 # median-filter window applied to the pitch-position speed signal
-  # ADR-6: when a take's PitchHomography has fewer usable landmarks than
-  # configs/pitch.yaml:manual_calibration.min_points, speed is reported in normalised-pixel units
-  # with Event.evidence["calibrated"]=false, never fabricated metres (Golden Rule 5). This factor
-  # multiplies the event's confidence in that case instead of a hard-coded penalty in code.
-  uncalibrated_confidence_penalty: 0.5
+  # unit = "bbox-heights per second": a track's smoothed centroid displacement (px) / dt, divided
+  # by the mean bbox height of the two boxes being diffed. This self-scales with the player's own
+  # apparent size (near players are physically taller in pixels AND cover more pixels/second for
+  # the same real speed; dividing by height partially cancels that perspective effect) — a crude,
+  # documented proxy, NOT a calibrated metric. Every sprint Event.evidence carries
+  # `"calibrated": false` and `"unit": "bbox_heights_per_second"` (Golden Rule 5 / ADR-6).
+  smoothing_window_frames: 5 # trailing moving-average window (in SAMPLED frames, i.e. at
+  # configs/hardware.yaml stages.track.fps_sample) applied to the raw (cx, cy) centroid series
+  # before differencing, so single-frame detector jitter doesn't register as a speed spike.
+  sprint_speed_threshold: 1.0 # ⚠️ RECALIBRATED 2026-08-25 against REAL measured speed on both
+  # available tracked clips (this task's own Stage 4 build) — the original placeholder (4.0,
+  # picked before any real track existed to measure) turned out to sit ABOVE the observed max
+  # instantaneous speed on clip2 (max 3.70 bbox-heights/s across all 47 tracks) and produced ZERO
+  # sprint events on either clip. Measured instantaneous per-sample speed distribution: clip2
+  # (1977 samples, 40 usable tracks) mean=0.66, median=0.46, p90=1.67, p95=2.10, max=3.70; clip4
+  # (17885 samples, ~640 usable tracks across 4 takes) mean=0.72, median=0.46, p90=1.80, p95=2.31
+  # — closely consistent between the two clips despite very different venues/player counts. 1.0
+  # sits between the median and p90 on both (i.e. "notably faster than typical movement, not
+  # exceptional"); combined with the SUSTAINED >=1s duration requirement below, it yields a
+  # real, selective set of segments (14/40 usable tracks on clip2, ~116/640 on clip4), not a
+  # near-constant trigger — see the Stage 4-6 run report for the exact per-clip counts.
+  sprint_min_duration_s: 1.0 # minimum SUSTAINED duration above threshold to count as a sprint —
+  # matches configs/events.yaml's original Phase-0 scaffold default (a fast 1-2 stride burst is
+  # noise; a genuine sprint holds for at least a second).
+  sprint_merge_gap_s: 0.5 # merge two qualifying runs separated by a gap STRICTLY UNDER this many
+  # seconds (a brief detector miss/occlusion mid-sprint shouldn't split one sprint into two
+  # events) — see src/events/segments.py::find_threshold_segments for the exact boundary semantics.
+  min_track_boxes: 5 # a track shorter than this has too few samples for a trustworthy speed
+  # series at all (the moving-average window itself is 5) — skipped outright, not scored at 0.
+  uncalibrated_confidence_penalty: 0.5 # multiplicative penalty applied to EVERY sprint's
+  # confidence because it is a pixel-unit, not metric, speed estimate (ADR-6) — never allowed to
+  # read as confidently as a calibrated measurement would.
 
 shot:
-  # heuristic: ball moving fast toward goal + player proximity; refined once ball tracking is solid
-  ball_speed_threshold_mps: 15.0
-  goal_proximity_m: 25.0
-  min_confidence: 0.4
+  # Heuristic ONLY, from `ball_detections.parquet` (src/detect/ball.py) — there is no goal-position
+  # model or pitch homography on this footage (ADR-3), so "toward a goal" is approximated as "the
+  # ball moves fast and consistently toward one horizontal side of the frame for a sustained
+  # window". This is a coarse stand-in that will also fire on a hard clearance, a long cross-field
+  # pass, or a fast dribble toward either touchline end — expect LOW PRECISION (documented, not
+  # papered over, in the Stage 4 report: see src/events/shots.py module docstring).
+  # unit = "frame-widths per second": ball centroid displacement (px) / dt, divided by the
+  # decoded frame's own width in pixels — self-scaling across clips at different decode
+  # resolutions, still never a metric unit (ADR-6).
+  smoothing_window_frames: 3 # the ball moves faster/more erratically than a player; a shorter
+  # smoothing window than sprint's so a genuine fast strike isn't smeared away.
+  ball_speed_threshold: 0.12 # ball must exceed this many frame-widths/second, sustained, to be a
+  # shot candidate — informal calibration: crossing the whole frame width in under ~8s of play is
+  # unremarkable ball movement; sustained motion faster than ~1 frame-width per 8s window is not.
+  min_duration_s: 0.3 # a real strike's fast phase is brief — do not require sprint-length sustain
+  merge_gap_s: 0.3 # merge candidate windows separated by a short ball-tracking gap (occlusion,
+  # SAHI miss) under this many seconds — see configs/detect.yaml ball_interpolation.max_gap_frames
+  # for the (separate) raw-detection gap-filling knob this compounds with.
+  direction_consistency_ratio: 0.7 # of all frame-to-frame x-steps inside a candidate window, at
+  # least this fraction must share the sign of the window's own net x-displacement — rejects a
+  # window where the ball merely jittered fast (bouncing, being contested) rather than travelling
+  # in one sustained direction, which is the whole "toward a goal end" proxy this heuristic relies on.
+  # ⚠️ MEASURED 2026-08-25 on clip2: 4 candidate windows cleared `ball_speed_threshold` (peaks
+  # 4.46-8.30 frame-widths/s) but their direction consistency was only 0.31-0.61 — NONE cleared
+  # 0.7, so clip2 emits ZERO shot events. This was left AS-IS rather than lowered to manufacture a
+  # result (Golden Rule 5: the honest response to a weak signal is fewer/no events) — see the
+  # Stage 4-6 run report for the full "is this heuristic meaningful signal or noise" discussion.
+  min_ball_conf: 0.3 # ignore ball detections below this confidence when building the speed series
+  # — this also softly deweights long interpolated stretches, since
+  # configs/detect.yaml:ball_interpolation.interpolated_conf_penalty already knocks an
+  # interpolated BallDetection's own confidence down before it ever reaches this filter.
+  max_confidence: 0.4 # HARD CEILING (Golden Rule 5): this is a coarse ball-motion heuristic with
+  # no goal-position awareness, not a shot detector — never allowed to read as more certain than
+  # "worth a human glance".
+  min_confidence: 0.15 # floor for a qualifying window's OWN computed confidence (see
+  # src/events/shots.py) — combined with configs/events.yaml confidence.min_emit_confidence below
+  # as the final emit gate.
 
 goal:
-  scoreboard_ocr_fps_sample: 1 # cadence for scoreboard-delta detection (matches configs/shots.yaml ocr)
-  # CLAUDE.md §3.2(3): the current single-camera footage has no scoreboard anywhere, so this
-  # detector is N/A on it. It stays wired for broadcast input; on scoreboard-less footage it must
-  # emit "not available", never a guessed goal (Golden Rule 5).
+  # Dead code on this project's current input (CLAUDE.md §3.2(3): no scoreboard anywhere in this
+  # footage) — kept wired for a future broadcast source. See src/events/goals.py.
+  scoreboard_ocr_fps_sample: 1 # cadence the (unimplemented) scoreboard-delta path would use,
+  # matching configs/shots.yaml ocr.gated_on_broadcast_profile's cadence.
+  scoreboard_region_relative: [0.0, 0.0, 0.25, 0.12] # matches configs/shots.yaml's own scoreboard
+  # region — kept duplicated (not cross-referenced) since the two stages are independently
+  # runnable/debuggable per CLAUDE.md §10, and this key is never actually read on this footage.
 
 confidence:
-  min_emit_confidence: 0.3 # events below this confidence are dropped, not emitted (logged via DropCounter)
+  min_emit_confidence: 0.15 # ANY event (sprint or shot) scoring below this after its own
+  # type-specific formula is dropped outright, not emitted — logged via DropCounter, never
+  # silently lowered to make something appear (Golden Rule 5).
+  continuity_weight: 0.5 # sprint confidence = continuity_weight * track_continuity +
+  # (1 - continuity_weight) * mean_detection_confidence, BEFORE the uncalibrated penalty above —
+  # see src/events/sprints.py::_segment_confidence for the exact formula.

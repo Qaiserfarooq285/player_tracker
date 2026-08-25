@@ -1,4 +1,72 @@
-# Stage 6 — highlights (CLAUDE.md §5 Stage 6). Rank, dedupe, cut, and export the reel.
+# Stage 5/6 — highlights (CLAUDE.md §5 Stage 5/6). Auto target selection (human seam intact),
+# rank, dedupe, cut, and export the reel.
+
+selection:
+  # Stage 5 target-player selection (CLAUDE.md Golden Rule 4/7, §3.2 consequence 1): the arrow
+  # prior + within-take geometric/temporal fragment stitching, NEVER a jersey number.
+  arrow_match_tolerance_s: 0.15 # match an arrow-hinted frame to a track's own box within this
+  # many seconds — arrow hints and tracks are both sampled at ~configs/hardware.yaml
+  # stages.detect.fps_sample=10 (~0.1s apart), so 0.15s covers one sample step of slop.
+  arrow_match_max_dist_px: 200 # MEASURED 2026-08-24 on clip2 (this task, see run report): the
+  # arrow's tip sits 51-129px from its actual target track's centroid across all 30 hinted frames
+  # (it marks the player's head/shoulder area, not the detection box's own centre) — 200px is a
+  # generous margin above the largest observed gap while staying well under typical player-to-
+  # player spacing at this camera's wide framing, so it won't accidentally snap to a neighbour.
+  arrow_min_vote_share: 0.4 # ⚠️ MEASURED 2026-08-25 on clip4 (this task's own Stage 5 build): the
+  # arrow signal is NOT uniformly reliable across every take. take 2's votes were dominated by one
+  # track (23/30 = 0.77 share) and take 3's by another (23/38 = 0.61) — both look like genuine
+  # arrows (clip4 is a 4-venue COMPILATION, CLAUDE.md §3.2 — each source sub-clip plausibly had
+  # its own intro arrow). But take 0's 148 "hits" were scattered almost evenly across 5+ different
+  # tracks (top share only 0.20) — almost certainly a recurring false-positive red object the
+  # existing arrow_max_area_px/arrow_min_height_width_ratio guards didn't fully catch, not a real
+  # target-marking arrow. Below this share, a take's arrow evidence is treated as unreliable and
+  # `select_targets` falls back to the heuristic seed instead of reporting a falsely-confident
+  # `arrow_vote` (0.4 sits cleanly between the rejected 0.20 and the accepted 0.61/0.77).
+  stitch_max_gap_s: 1.5 # join two SAME-take fragments only if the time gap between the timeline's
+  # nearest end and the candidate is under this many seconds — a fragment reappearing later than
+  # this is left unstitched (ambiguous re-acquisition is a Phase-2 Re-ID problem, not this).
+  stitch_max_dist: 3.0 # spatial-jump cap, same "bbox-heights" unit as configs/events.yaml sprint
+  # (pixel distance between the timeline's last known centroid and the candidate's first centroid,
+  # divided by their mean bbox height). Not derived from sprint_speed_threshold * stitch_max_gap_s
+  # on purpose (that product is ~6) — kept independently tunable since a lost-then-reacquired
+  # track's real path is rarely a straight line at that speed.
+  team_match_confidence_threshold: 0.5 # team agreement is used ONLY as a stitching TIEBREAKER
+  # (never a hard filter — ADR-12: team labels can be low-confidence/unbalanced on some takes),
+  # and only when BOTH candidate fragments' team_confidence clear this bar.
+  join_retention_factor: 0.92 # each additional fragment stitched into a timeline multiplies its
+  # running confidence by this factor — every join is itself an inference on top of the raw
+  # tracker output (not ground truth), so a heavily-fragmented, heavily-stitched timeline reads as
+  # less certain than one long unbroken track, without making stitching pointless.
+  heuristic_fallback_confidence_ceiling: 0.35 # HARD CEILING when a take has no arrow evidence at
+  # all (`selection_method: heuristic_fallback`) — always visibly less confident than an
+  # arrow-anchored pick, never silently blended with it (CLAUDE.md task spec).
+  manual_override_confidence: 1.0 # confidence recorded when a human supplies `--track-id` (the
+  # actual Phase-1 human-in-the-loop seam, Golden Rule 4) — the one case allowed to read as fully
+  # certain, because a human, not an inference, made the call.
+  heuristic:
+    # No-arrow fallback scoring (CLAUDE.md task spec: "longest-lived track with highest mean
+    # detection confidence nearest frame centre"). Each raw signal is min-max normalised across
+    # that take's own candidate tracks before weighting, so the three terms stay comparable
+    # regardless of each signal's raw scale.
+    min_track_duration_s: 0.5 # ignore tracks shorter than this when picking a fallback seed —
+    # too little evidence to trust as "the" target over a longer-lived alternative.
+    duration_weight: 0.4
+    confidence_weight: 0.3
+    center_weight: 0.3 # closer to frame centre scores higher — a broadcast/wide-shot framing
+    # convention (the camera operator tends to keep the ball/play, and often the tracked player,
+    # near the middle), a weak but free prior when there is no arrow to anchor on.
+
+attribution:
+  # A SHOT event carries no `player_track_id` (src/events/shots.py — it's a ball-only heuristic),
+  # so Stage 6 ranking must decide whether it belongs to the SELECTED target timeline before it
+  # can count toward that player's reel/stats (never silently credited — Golden Rule 5).
+  shot_proximity_bbox_heights: 4.0 # attribute a shot to the timeline only if the timeline's own
+  # nearest-in-time position is within this many (timeline-local) bbox-heights of the ball at the
+  # event's t_start — generous enough to allow for the ball being played away from the striker's
+  # exact centroid, tight enough to exclude a shot clearly taken by some other player on screen.
+  max_time_gap_s: 1.0 # timeline-position lookup tolerance for the proximity check above — beyond
+  # this the timeline's own position is considered unknown at that instant, and the shot is left
+  # unattributed rather than guessed.
 
 clip:
   pre_roll_s: 3.0 # seconds of context included before an event's t_start
@@ -6,11 +74,14 @@ clip:
   snap_to_take_boundaries: true # never let a clip cross a camera cut (Golden Rule 3)
 
 dedupe:
-  iou_over_time_threshold: 0.6 # clips overlapping this much in time are considered duplicates
+  iou_over_time_threshold: 0.6 # two candidate clips whose TIME RANGES overlap (intersection over
+  # union of the two [t_start, t_end) ranges, after pre/post-roll + take-snapping) by MORE than
+  # this fraction are considered duplicates — only the higher-ranked one is kept.
 
 rank:
   # Higher weight = ranked earlier in the reel, per CLAUDE.md §5 Stage 6 priority order:
-  # goal > assist > shot > dribble > key_pass > sprint > pass.
+  # goal > assist > shot > dribble > key_pass > sprint > pass. Only goal/shot/sprint exist in
+  # Phase 1; the rest are reserved keys for when Phase 2+ adds those event types.
   weights:
     goal: 100
     assist: 80
@@ -19,8 +90,11 @@ rank:
     key_pass: 30
     sprint: 20
     pass: 10
-  confidence_weight: 0.5 # how much an event's own confidence scales its final rank_score
+  confidence_weight: 0.5 # rank_score = weight[type] * (1 + confidence_weight * event.confidence)
+  # — confidence nudges ordering within/across types without ever letting a low-value type
+  # outrank a high-value one on confidence alone (see src/highlights/ranking.py).
 
 export:
   max_clips: 15
-  target_reel_seconds: null # null = no cap; otherwise trims lowest-ranked clips to fit
+  target_reel_seconds: null # null = no cap; otherwise the lowest-ranked tail clips are trimmed
+  # (best-first order preserved) until the remaining total fits.
