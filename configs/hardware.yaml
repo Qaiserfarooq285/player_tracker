@@ -7,7 +7,9 @@ precision: fp16 # mixed precision everywhere (CLAUDE.md §11 fit-in-12GB rules)
 # VRAM budget the pipeline targets per stage. CLAUDE.md §11.1 measured an unrelated process
 # (Downloads/Ad Blocker/.venv) holding 6.0 GB at scaffold time, leaving ~5.2 GB free — so the
 # default budget below is conservative (5 GB), not the full 12 GB card.
-vram_budget_mb: 5000
+vram_budget_mb: 10000 # raised 5000 -> 10000 on 2026-08-24: the contending process (PID 10393,
+# Downloads/Ad Blocker) exited, freeing the card (11481 MiB free measured). If another
+# process reclaims VRAM, drop this back to ~5000 and the preflight will warn accordingly.
 vram_total_mb: 12282 # measured total VRAM of the RTX A2000 12 GB (CLAUDE.md §11.1)
 preflight_warn: true # warn (not fail) when free VRAM < stage budget before a stage starts
 
