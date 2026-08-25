@@ -1,16 +1,57 @@
-# Stage 3 — team assignment (CLAUDE.md §5 Stage 3). SigLIP embeddings -> UMAP -> KMeans.
+# Stage 3 — team assignment (CLAUDE.md §5 Stage 3).
 # batch_size/image_size/fps_sample for this stage live in configs/hardware.yaml (stages.team).
 
-embedding:
-  model: google/siglip-base-patch16-224 # Apache-2.0 weights via `transformers` (CLAUDE.md §7; verify weight card)
+# ⚠️ CHANGED 2026-08-24 (second correction — see src/team/classifier.py module docstring for the
+# full history): default method switched from SigLIP embeddings to torso-COLOUR clustering
+# (CIELAB, median-aggregated per track). The coordinator ran a controlled experiment on clip2's
+# cached tracks — torso band + Lab + median + KMeans(k=2) directly on per-track colour vectors —
+# and got a 24/15 split with L*=97 vs. L*=146 (a large, physically meaningful separation matching
+# dark-blue vs. white kits), decisively better than every SigLIP-embedding variant tried on the
+# same data (see git history: full-bbox SigLIP -> 48/3 degenerate; torso-crop SigLIP -> still put
+# jersey #22 (blue) and #77 (white) in the SAME cluster even after multiple rounds of tuning).
+# SigLIP is kept as a fallback (`method: siglip`), not deleted — real broadcast footage with
+# larger/cleaner crops may favour it; switching is one line here, not a code change.
+method: colour # "colour" (default) | "siglip"
 
-reduce:
-  method: umap
-  n_components: 8
-  n_neighbors: 15
-  min_dist: 0.1
+embedding:
+  # Only read when method: siglip.
+  model: google/siglip-base-patch16-224 # Apache-2.0 weights via `transformers` (CLAUDE.md §7; verify weight card)
 
 cluster:
   method: kmeans
   n_clusters: 2 # two outfield teams; goalkeepers/refs are already separated by DetectionClass
   random_state: 0 # fixed seed for reproducible team-id assignment across resumed runs
+  min_team_balance_ratio: 0.25 # ⚠️ ADDED 2026-08-24: measured a degenerate 48/3 track split on
+  # clip2 before the torso-crop fixes. min(cluster size)/total below this ratio does NOT
+  # necessarily mean the split is wrong (a short clip can genuinely show mostly one team), but it
+  # is always logged loudly (`src/team/classifier.py::balance_ratio`) and confidence is capped —
+  # never allowed to pass silently as fully confident either way (CLAUDE.md §10).
+  low_confidence_cap: 0.3 # when the split is below min_team_balance_ratio, every track's
+  # team_confidence this take is capped here instead of reporting the raw (possibly 1.0) value —
+  # a lopsided split must never read as fully confident downstream (Golden Rule 5).
+
+sampling:
+  crops_per_track: 5 # cap on how many crops per tracklet get sampled (evenly spaced by frame)
+  min_box_height_px: 25 # ⚠️ CHANGED 2026-08-24 (was an area/side check on the torso CROP itself;
+  # now a height check on the ORIGINAL detection bbox, before cropping — simpler and matches what
+  # was actually verified: skip a box outright if it's shorter than this, rather than compute a
+  # torso crop from it and then separately check the crop's own dimensions). CLAUDE.md §3.2: far
+  # players run as short as ~30-60px tall; below 25px there is essentially no reliable per-pixel
+  # kit-colour signal left once cropped down to just the torso band.
+  torso_top_frac: 0.15 # ⚠️ CHANGED 2026-08-24 (was 0.40/0.55/0.25 — narrower band, wider inset;
+  torso_bottom_frac: 0.50 # see git history for that attempt). The coordinator's controlled
+  # experiment used this taller band (15%-50% of bbox height — shoulders to waist, not just a
+  # thin chest strip) + a smaller inset and got a measurably better, more balanced split (24/15
+  # vs. 27/2) with a clean CIELAB L* separation. Re-verified against the acceptance check below.
+  torso_x_inset_frac: 0.18 # shave this fraction of the bbox WIDTH off each side, so the crop
+  # excludes some background grass / neighbouring-player pixels at the box edges without cutting
+  # so tight that arm-swing motion still contaminates it (a risk at the narrower band tried first).
+  # Acceptance check (CLAUDE.md task spec / coordinator): clip2 @ t~1.0s, jersey #22 (blue) vs #77
+  # (white) MUST land in different clusters — verified with these exact fractions, method=colour.
+
+fallback:
+  # Only read when method: siglip. UMAP was tried and dropped from that path too (measured
+  # unreliable — a UMAP-space silhouette self-inflates vs. one measured in a fixed reference
+  # space, see git history); the siglip fallback is now a direct KMeans on L2-normalised
+  # embeddings. min_samples_for_umap is kept only as a historical/potential-future knob.
+  min_samples_for_umap: 16

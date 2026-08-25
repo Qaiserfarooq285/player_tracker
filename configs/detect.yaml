@@ -10,14 +10,45 @@ model:
   # ADR-9's open items. ADR-10: do not trust its published 0.857 mAP on our footage (domain gap,
   # youth/amateur Veo vs. pro broadcast) — measure on our labeled slice instead (configs/eval.yaml).
   name: rfdetr-soccernet
-  checkpoint: julianzu9612/RFDETR-Soccernet
+  checkpoint: julianzu9612/RFDETR-Soccernet # HF provenance; the actual weights loaded are local:
+  local_checkpoint: models/rfdetr-soccernet/checkpoint_best_regular.pth
   classes: [ball, player, referee, goalkeeper] # already 1:1 with DetectionClass — no remapping needed
+  # ⚠️ MEASURED 2026-08-24 (Stage 2 build): the checkpoint's OWN training args declare
+  # num_classes=4 and 4 class_names, but its saved `class_embed.bias` tensor has shape (4,) =
+  # 3 foreground classes + 1 background slot, not 4+1. `rfdetr` itself warns "Checkpoint has 3
+  # classes but model is configured for 4" when constructed with num_classes=4, and silently
+  # *keeps* model_config.num_classes=4 while the real head only has 3 output slots — a latent
+  # footgun (see src/detect/detector.py docstring). Loading with num_classes=3, as rfdetr's own
+  # warning recommends, removes the warning entirely. Empirically (real frame, clip2 @ t=5s,
+  # several thresholds/resolutions) the checkpoint never once emits class_id=3 ("goalkeeper") —
+  # confirming the dropped slot is goalkeeper, not one of the other three. DetectionClass.
+  # GOALKEEPER is therefore never produced by this checkpoint; goalkeepers fall through as
+  # "player" (a benign degradation — CLAUDE.md §5's class table treats goalkeeper as a nicety,
+  # not load-bearing for Phase 1). Flagged loudly, not silently patched over (Golden Rule 5/6).
+  measured_num_classes: 3
+  declared_num_classes: 4 # what args/model card say — kept for the discrepancy note above
+  # Architecture facts inferred from the checkpoint's own training args (measured, not assumed):
+  # this checkpoint was trained under RF-DETR's *pre-2026* "Large" config (patch14, hidden_dim
+  # 384, dinov2_windowed_base) — the `rfdetr` package's *current* `RFDETRLarge` symbol has since
+  # been repointed at a different (patch16, hidden_dim 256) 2026 architecture with the same
+  # `pretrain_weights="rf-detr-large.pth"` filename, so `RFDETR.from_checkpoint()`'s
+  # filename-based auto-detection resolves to the WRONG (2026) class and fails with a patch-size
+  # mismatch. Loading must go through `rfdetr.RFDETRLargeDeprecated` explicitly, constructed
+  # directly (bypassing `from_checkpoint`'s auto-detection) with `pretrain_weights` pointed at
+  # local_checkpoint above. See src/detect/detector.py for the full account.
+  variant: RFDETRLargeDeprecated
+  patch_size: 14
+  num_windows: 4 # predict()'s `shape` must be a multiple of patch_size * num_windows = 56px
   fallback:
     # RF-DETR-COCO per ADR-2(b): Apache-2.0 clean, no training, used if the soccer checkpoint is
     # unavailable/fails to load, or once ADR-9's licensing question forces dropping it for a ship.
     name: rfdetr-base
     checkpoint: coco
-    classes: [person, sports_ball] # COCO classes; mapped to DetectionClass in src/detect
+    variant: RFDETRNano # small/inference-friendly (CLAUDE.md §11), and NOT one of the deprecated
+    # rfdetr symbols (unlike RFDETRBase / RFDETRLargeDeprecated) — auto-downloads COCO-pretrained
+    # weights on first use via `rfdetr.RFDETRNano()`.
+    classes: [person, sports_ball] # COCO class *names* used by rfdetr's own class_name output;
+    # mapped person -> DetectionClass.PLAYER, "sports ball" -> DetectionClass.BALL in src/detect
 
 inference:
   conf_threshold: 0.35
@@ -25,17 +56,84 @@ inference:
   # CLAUDE.md §3.2(5): at image_size 1280 far players are ~30px tall (marginal) on this footage;
   # plan to try 1536-1920 and measure via configs/eval.yaml before changing the hardware.yaml
   # default (stages.detect.image_size) — not yet an adopted change.
+  # MEASURED 2026-08-24 (clip2 @ t=5s, single frame): default res 560x560 -> 24 dets (20 player /
+  # 3 referee / 1 ball); requested hardware.yaml image_size 1280 snapped to the nearest multiple
+  # of patch_size*num_windows=56 (1288x1288, see src/detect/detector.py) -> 18 dets (16 player /
+  # 1 referee / 1 ball) — FEWER, not more, at the higher resolution on this single sample. Kept
+  # as an honest measurement, not acted on (CLAUDE.md task: "do NOT silently change image_size
+  # without reporting before/after numbers") — see the Stage 2/3 run report for the full picture.
 
 sahi:
   enabled_for: [ball] # SAHI tiling only where small-object detail matters (CLAUDE.md §3.1)
   tile_conf_threshold: 0.25
+  tile_nms_iou_threshold: 0.3 # cross-tile merge NMS (src/detect/ball.py) — tighter than the main
+  # pass's 0.5 because overlapping tiles legitimately re-detect the same ball near tile borders
   # tile_size / overlap_ratio live in configs/hardware.yaml (stages.ball.sahi)
   # CLAUDE.md §3.2(5) also floats SAHI for players on this footage ("plan to... and measure") —
   # not yet adopted; enabled_for stays [ball] until that's evaluated.
 
+ball_interpolation:
+  max_gap_frames: 15 # fill a ball-detection gap up to this many *sampled* frames by linear
+  # interpolation between the nearest observed detections either side; longer gaps are left
+  # unfilled rather than fabricated (Golden Rule 5). At stages.ball.fps_sample=30 this is 0.5s.
+  interpolated_conf_penalty: 0.5 # multiplicative confidence penalty applied to interpolated
+  # BallDetection rows (blended from the two bracketing observed confidences, then penalised) so
+  # an interpolated point never reads as equally trustworthy as an observed one.
+
 masking:
   # CLAUDE.md §3.2(1): clip2/clip4 carry a burned-in red arrow graphic marking the target player
   # in the opening seconds — an editorial overlay that both spuriously detects and occludes the
-  # target. "Tracked as a task, not yet implemented" in CLAUDE.md — left disabled here as a stub
-  # until src/detect wires the mask/ignore logic.
-  ignore_burned_in_graphics: false
+  # target. Implemented in src/detect/overlay_mask.py.
+  ignore_burned_in_graphics: true
+  arrow_hsv:
+    # MEASURED 2026-08-24 on input/clip2 77.mp4 (CLAUDE.md §3.2(1)): at t=3.0s the arrow is one
+    # connected component of ~7,055px at the pipeline's 1920-wide decode scale (~27.7k px at
+    # native 4K) at bbox ~(1010,131,155,303); every other component on that frame is <=41px. By
+    # t=4.0s only ~300px of red remain scattered in tiny (<100px) specks — the arrow is a
+    # transient opening-seconds graphic, not a persistent one.
+    h_low_max: 10 # hue <= this OR >= h_high_min counts as "red" (hue wraps at 0/180 in OpenCV HSV)
+    h_high_min: 170
+    s_min: 120
+    v_min: 90
+  arrow_min_area_px: 2000 # measured largest true-positive component (~7k @ 1920w) vs. largest
+  # false-positive speck (~41px) on clip2 @ t=3.0s — 2000 sits cleanly in the gap either way.
+  arrow_max_area_px: 20000 # ⚠️ ADDED 2026-08-24, found running Stage 2 on clip4: clip4's t~50-110s
+  # "turf-with-running-track"/infield venues (CLAUDE.md §3.2 "4-venue compilation") have a large
+  # red-orange track/infield surface that also passes the HSV threshold — measured one such
+  # component at t=65.0s spanning almost the full frame width, area=128,345px @ 1920w (~18x the
+  # largest genuine arrow observed, ~6% of the whole frame). Without a ceiling, `find_arrow` was
+  # returning "arrow" hits scattered across nearly the whole clip (496 of ~1110 sampled frames),
+  # not just the documented opening seconds, which would have both fed Stage 5 a nonsense
+  # target-player prior AND spuriously rejected real player detections near the track via
+  # `arrow_overlap_reject`. 20000px sits well above every genuine arrow measurement (~7k @ 1920w)
+  # and well below the running-track false positive (128k) — components larger than this are
+  # treated as "not the arrow" (some other bulk red surface), not as a bigger/closer arrow.
+  arrow_min_height_width_ratio: 1.0 # ⚠️ ADDED 2026-08-24, found running Stage 2 on clip4 a second
+  # time: even with arrow_max_area_px, a distant RED-BRICK HOUSE in the background of clip4's
+  # t~90-110s venue (small enough to clear the area ceiling, ~5k px) was still being read as an
+  # arrow. Measured every real arrow component found so far (clip2 @ t=0.9s/3.0s, clip4 @ t=2.8s):
+  # all are mostly-vertical curved strokes, height:width ratios 1.44-1.96. Both measured false
+  # positives are WIDER than tall: the running-track surface ~0.09, the house ~0.62. Rejecting
+  # anything with height < 1.0x its own width (a generous margin below the lowest real ratio,
+  # 1.44) cleanly separates all 5 measured points either way — see the run report for the numbers.
+  arrow_head_probe_radius_frac: 0.09 # ⚠️ CORRECTED 2026-08-24: tip selection used to be "extreme
+  # point furthest from centroid" — measured WRONG on clip2 @ t=0.9s (picked the tail, ~300px
+  # from the player, not the arrowhead pointing at them; the earlier "measured" t=3.0s frame that
+  # justified it happened to have the opposite shaft/head mass balance — the relationship isn't
+  # reliably one-directional across frames). Fixed to disambiguate the two principal-axis extreme
+  # points by LOCAL PIXEL DENSITY instead: the arrowhead is a short, solid, filled triangular
+  # blob; the shaft/tail is a thin curved stroke. A disc of radius
+  # `arrow_head_probe_radius_frac * max(component_width, component_height)` centred on each
+  # candidate end counts foreground pixels inside it — the denser end is the head. See
+  # src/detect/overlay_mask.py::_find_tip.
+  arrow_head_tie_margin: 0.15 # if the two ends' local pixel counts are within this relative
+  # margin of each other, break the tie by density (count / actually-in-bounds disc area) instead
+  # of raw count, so a disc clipped by the frame border isn't mistaken for "thin".
+  arrow_overlap_reject: 0.3 # a detection whose bbox overlap with the arrow's mask/bbox exceeds
+  # this fraction is dropped as `dropped_arrow_overlap` (DropCounter) rather than kept — the
+  # arrow both spuriously detects on its own and occludes/deforms the boxes of real players
+  # under its curve.
+  watermark_roi_relative: [0.85, 0.90, 1.0, 1.0] # [x1,y1,x2,y2] as a fraction of frame size —
+  # measured 2026-08-24: the "veo" watermark sits in the bottom-right corner on every clip
+  # (CLAUDE.md §3.2). Detections whose box centre falls inside this ROI are dropped as
+  # `dropped_watermark`.

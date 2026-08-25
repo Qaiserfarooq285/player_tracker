@@ -9,11 +9,13 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import math
 import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
+import numpy as np
 import pandas as pd
 import yaml
 from pydantic import BaseModel
@@ -87,10 +89,31 @@ def save_models_parquet(models: list[BaseModel], path: str | Path) -> None:
     logger.info("saved %d row(s) -> %s", len(models), path)
 
 
+def _sanitize_nans(obj: Any) -> Any:
+    """Recursively replace pandas/numpy `NaN` scalars with `None`.
+
+    A pydantic *nullable* field (e.g. an `int | None` like `Track.team`/`jersey_number`) that has
+    both `None` and real values across rows gets upcast by pandas to a `float64` column with
+    `NaN` standing in for `None` when written through :func:`save_models_parquet` and read back —
+    `NaN` then fails pydantic validation for an `int | None` field (it's a float, not `None`).
+    Recurses into the nested lists/dicts that `df.to_dict(orient="records")` can produce for a
+    parquet column holding a list of nested models (e.g. `Track.boxes: list[TrackBox]`).
+    """
+    if isinstance(obj, dict):
+        return {k: _sanitize_nans(v) for k, v in obj.items()}
+    if isinstance(obj, np.ndarray):
+        obj = obj.tolist()
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_nans(v) for v in obj]
+    if isinstance(obj, float) and math.isnan(obj):
+        return None
+    return obj
+
+
 def load_models_parquet(path: str | Path, model_cls: type[ModelT]) -> list[ModelT]:
     """Read a parquet file written by :func:`save_models_parquet` back into pydantic models."""
     df = pd.read_parquet(path)
-    records = df.to_dict(orient="records")
+    records = [_sanitize_nans(r) for r in df.to_dict(orient="records")]
     return [model_cls.model_validate(r) for r in records]
 
 

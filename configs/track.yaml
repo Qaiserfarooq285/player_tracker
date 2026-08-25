@@ -2,9 +2,32 @@
 # (AGPL-3.0, Golden Rule 6).
 
 bytetrack:
-  track_activation_threshold: 0.25 # confidence required to start a new track
+  # ⚠️ TUNED 2026-08-24 against measured fragmentation on clip2 (13.4s, single take, ~15 players/
+  # frame): the ORIGINAL defaults (track_activation_threshold=0.25, minimum_matching_threshold=0.8)
+  # produced 56 tracks for ~15-20 visibly distinct players — 15 of those 56 lived under 0.5s,
+  # i.e. real players' IDs were fragmenting into multiple short-lived tracks, not 56 genuine
+  # objects. Swept each parameter independently on the SAME cached detections before changing
+  # anything (never tuned blindly): `lost_track_buffer` had negligible effect (56-57 tracks across
+  # 10-90); `track_activation_threshold` 0.25->0.55 monotonically cut both track count (56->38)
+  # and short-track count (14->5) — detection confidence on this footage ranges 0.35-0.89 (mean
+  # 0.70), so raising the floor drops only the noisiest low-confidence starts, not real
+  # detections; `minimum_matching_threshold` 0.8->0.95 similarly cut fragmentation (56->42,
+  # 14->6) — counterintuitively HIGHER, not lower, reduces fragmentation for this parameter
+  # (verified empirically, not assumed from the name). Landed on a moderate combination (not the
+  # most aggressive values swept, to avoid over-fitting to this one clip): 0.25->0.35 (still at/
+  # below the observed confidence floor) and 0.8->0.85. Measured combined effect on clip2:
+  # 56->47 tracks, 15->8 short-lived (<0.5s) tracks. ⚠️ Verified only on clip2 so far — re-check
+  # against clip4 (different venues/player density) before tuning further.
+  track_activation_threshold: 0.35 # confidence required to start a new track
   lost_track_buffer: 30 # frames to keep a lost track alive before dropping it
-  minimum_matching_threshold: 0.8 # IoU threshold for associating detections to existing tracks
+  minimum_matching_threshold: 0.85 # threshold for associating detections to existing tracks
   frame_rate: 10 # must match configs/hardware.yaml stages.detect.fps_sample
 
 reset_ids_at_cuts: true # Golden Rule 3: track only within a take; reset IDs at every camera cut
+
+# Object classes fed into ByteTrack (src/track/tracker.py). Ball is deliberately excluded — a
+# single, often-occluded small object is handled by src/detect/ball.py's own detect+interpolate
+# stream, not general-purpose multi-object tracking; the `Track` contract (CLAUDE.md §4) has no
+# ball fields. Referees/goalkeepers ARE tracked (so a human could still select their track / see
+# them in the overlay) but excluded later from the 2-team clustering (configs/team.yaml).
+tracked_classes: [player, goalkeeper, referee]

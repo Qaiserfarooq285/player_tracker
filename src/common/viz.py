@@ -36,6 +36,23 @@ _MINIMAP_POINT_COLOR = (0, 215, 255)
 _MINIMAP_POINT_RADIUS_PX = 3
 _MINIMAP_BORDER_THICKNESS_PX = 1
 
+_BALL_COLOR_OBSERVED = (0, 165, 255)  # orange, matches DetectionClass.BALL's viz.py convention
+_BALL_COLOR_INTERPOLATED = (0, 215, 255)  # yellow-orange — visually distinct from an observed ball
+_BALL_MARKER_RADIUS_PX = 6
+_BALL_MARKER_THICKNESS_PX = 2
+
+_ARROW_OUTLINE_COLOR = (60, 60, 220)  # red-ish, echoes the arrow graphic's own colour
+_ARROW_OUTLINE_THICKNESS_PX = 2
+_ARROW_TIP_COLOR = (0, 255, 0)
+_ARROW_TIP_RADIUS_PX = 7
+
+_BANNER_BG_COLOR = (20, 20, 20)
+_BANNER_TEXT_COLOR = (255, 255, 255)
+_BANNER_FONT = cv2.FONT_HERSHEY_SIMPLEX
+_BANNER_FONT_SCALE = 0.8
+_BANNER_FONT_THICKNESS = 2
+_BANNER_HEIGHT_PX = 40
+
 _box_annotator = sv.BoxAnnotator()
 _label_annotator = sv.LabelAnnotator()
 
@@ -137,4 +154,57 @@ def draw_hud(frame: np.ndarray, frame_index: int, t: float, stage: str) -> np.nd
             _HUD_FONT_THICKNESS,
             cv2.LINE_AA,
         )
+    return out
+
+
+def draw_ball(frame: np.ndarray, bbox: BBox, conf: float, interpolated: bool) -> np.ndarray:
+    """Draw a Stage 2 ball detection as a small circle at its bbox centre.
+
+    `interpolated` (CLAUDE.md Golden Rule 5: never present interpolated as observed) picks a
+    visually distinct colour so a filled-gap ball position never looks identical to an observed
+    one in the overlay.
+    """
+    out = frame.copy()
+    color = _BALL_COLOR_INTERPOLATED if interpolated else _BALL_COLOR_OBSERVED
+    center = (int(round(bbox.cx)), int(round(bbox.cy)))
+    cv2.circle(out, center, _BALL_MARKER_RADIUS_PX, color, _BALL_MARKER_THICKNESS_PX)
+    label = f"ball {conf:.2f}" + (" (interp)" if interpolated else "")
+    cv2.putText(
+        out,
+        label,
+        (center[0] + _BALL_MARKER_RADIUS_PX + 2, center[1]),
+        _HUD_FONT,
+        _HUD_FONT_SCALE,
+        color,
+        _HUD_FONT_THICKNESS,
+        cv2.LINE_AA,
+    )
+    return out
+
+
+def draw_arrow_outline(frame: np.ndarray, bbox: BBox, tip: tuple[float, float]) -> np.ndarray:
+    """Outline a Stage 2 `ArrowHint`'s bbox and mark its tip (CLAUDE.md §3.2 consequence 1)."""
+    out = frame.copy()
+    p1 = (int(bbox.x1), int(bbox.y1))
+    p2 = (int(bbox.x2), int(bbox.y2))
+    cv2.rectangle(out, p1, p2, _ARROW_OUTLINE_COLOR, _ARROW_OUTLINE_THICKNESS_PX)
+    cv2.circle(out, (int(tip[0]), int(tip[1])), _ARROW_TIP_RADIUS_PX, _ARROW_TIP_COLOR, -1)
+    return out
+
+
+def draw_banner(frame: np.ndarray, text: str) -> np.ndarray:
+    """Draw a full-width top banner (e.g. "CUT -> take 2") across `frame`."""
+    out = frame.copy()
+    height, width = out.shape[:2]
+    cv2.rectangle(out, (0, 0), (width, _BANNER_HEIGHT_PX), _BANNER_BG_COLOR, -1)
+    cv2.putText(
+        out,
+        text,
+        (_HUD_MARGIN_PX, int(_BANNER_HEIGHT_PX * 0.7)),
+        _BANNER_FONT,
+        _BANNER_FONT_SCALE,
+        _BANNER_TEXT_COLOR,
+        _BANNER_FONT_THICKNESS,
+        cv2.LINE_AA,
+    )
     return out

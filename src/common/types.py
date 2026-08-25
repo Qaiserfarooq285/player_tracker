@@ -80,20 +80,32 @@ class Frame(BaseModel):
 
 
 class Detection(BaseModel):
-    """A single Stage 2 player/goalkeeper/referee detection in one frame."""
+    """A single Stage 2 player/goalkeeper/referee detection in one frame.
+
+    ``frame_index`` is the *sampled*-sequence index (0, 1, 2, ... in decode order at the stage's
+    own `fps_sample`), not a native-video frame number — ``t`` (seconds, from the same decode
+    call) is what downstream stages must use to relate a detection to a `Take`'s `t_start`/`t_end`
+    (native-frame-numbered) or to another stage sampled at a different fps.
+    """
 
     bbox: BBox
     cls: DetectionClass
     conf: float
     frame_index: int
+    t: float
 
 
 class BallDetection(BaseModel):
-    """A single Stage 2 ball detection, possibly filled in by interpolation."""
+    """A single Stage 2 ball detection, possibly filled in by interpolation.
+
+    See `Detection.frame_index`/`t` docstring — the same sampled-index-vs-timestamp distinction
+    applies here.
+    """
 
     bbox: BBox
     conf: float
     frame_index: int
+    t: float
     interpolated: bool = False
 
 
@@ -148,12 +160,20 @@ class TrackBox(BaseModel):
 
 
 class Track(BaseModel):
-    """A within-take multi-object track (CLAUDE.md §4); IDs reset at every cut."""
+    """A within-take multi-object track (CLAUDE.md §4); IDs reset at every cut.
+
+    `dominant_class` is the majority-vote `DetectionClass` across the track's own detections
+    (Stage 3, src/track/tracker.py) — the only per-track signal Stage 3's team classifier has for
+    excluding referees/goalkeepers from the 2-team outfield clustering (CLAUDE.md §5 Stage 3).
+    `None` only for a track with zero boxes (should not occur in practice).
+    """
 
     id: int
     take_id: int
     boxes: list[TrackBox]
     team: int | None = None
+    team_confidence: float = 0.0
+    dominant_class: DetectionClass | None = None
     jersey_number: int | None = None
     id_confidence: float = 0.0
     path_pitch_xy: list[tuple[float, float]] = Field(default_factory=list)

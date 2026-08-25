@@ -14,7 +14,7 @@ from src.common.io import (
     save_models_parquet,
     work_dir_for,
 )
-from src.common.types import BBox, Detection, DetectionClass
+from src.common.types import BBox, Detection, DetectionClass, Track, TrackBox
 
 # ---------------------------------------------------------------------------
 # config_hash
@@ -71,6 +71,7 @@ def test_save_json_serializes_pydantic_models(tmp_path: Path):
         cls=DetectionClass.PLAYER,
         conf=0.8,
         frame_index=0,
+        t=0.0,
     )
     path = tmp_path / "det.json"
     save_json(det, path)
@@ -91,6 +92,7 @@ def test_parquet_round_trip_detections(tmp_path: Path):
             cls=DetectionClass.PLAYER if i % 2 == 0 else DetectionClass.BALL,
             conf=0.5 + i * 0.01,
             frame_index=i,
+            t=float(i) * 0.1,
         )
         for i in range(5)
     ]
@@ -163,3 +165,22 @@ def test_stage_cache_get_or_compute_skips_recompute(tmp_path: Path):
     second = cache2.get_or_compute(compute, save_json, load_json)
     assert second == {"result": 1}  # not recomputed
     assert calls["n"] == 1
+
+
+def test_parquet_round_trip_nullable_int_field_mixed_with_none(tmp_path: Path):
+    """Regression test (found 2026-08-24 running Stage 3 for real): a nullable `int | None` field
+    (e.g. `Track.team`) that has BOTH `None` and real int values across rows gets upcast by pandas
+    to a float64 column with `NaN` standing in for `None` when round-tripped through parquet —
+    `NaN` used to fail pydantic validation for an `int | None` field (a float, not `None`).
+    """
+
+    def _track(track_id: int, team: int | None) -> Track:
+        box = TrackBox(frame_index=0, t=0.0, bbox=BBox(x1=0, y1=0, x2=1, y2=1), conf=0.5)
+        return Track(id=track_id, take_id=0, boxes=[box], team=team)
+
+    tracks = [_track(1, 0), _track(2, None), _track(3, 1)]
+    path = tmp_path / "tracks.parquet"
+    save_models_parquet(tracks, path)
+
+    loaded = load_models_parquet(path, Track)
+    assert [t.team for t in loaded] == [0, None, 1]

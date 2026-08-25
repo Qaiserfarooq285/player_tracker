@@ -102,6 +102,7 @@ def test_detection_round_trip():
         cls=DetectionClass.PLAYER,
         conf=0.91,
         frame_index=12,
+        t=1.2,
     )
     restored = _round_trip(d)
     assert restored.cls == DetectionClass.PLAYER
@@ -112,6 +113,7 @@ def test_ball_detection_round_trip():
         bbox=BBox(x1=100, y1=100, x2=110, y2=110),
         conf=0.4,
         frame_index=30,
+        t=3.0,
         interpolated=True,
     )
     _round_trip(bd)
