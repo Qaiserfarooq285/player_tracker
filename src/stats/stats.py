@@ -12,6 +12,16 @@ from statistics import mean
 from src.common.io import save_json
 from src.common.types import Clip, Event, EventType, PlayerStats
 
+
+def _format_timestamp(seconds: float) -> str:
+    """``M:SS.s`` rendering for the human-readable timeline (e.g. ``11.8`` -> ``"0:11.8"``,
+    ``73.63`` -> ``"1:13.6"``) -- zero-padded seconds so entries line up when scanned top to
+    bottom."""
+    minutes = int(seconds // 60)
+    secs = seconds - minutes * 60
+    return f"{minutes}:{secs:04.1f}"
+
+
 SPEED_UNIT = "bbox_heights_per_second"
 DISTANCE_UNIT = "bbox_heights"
 UNCALIBRATED_NOTE = (
@@ -111,6 +121,26 @@ def write_stat_card(
         )
     )
 
+    # Chronological timeline (CLAUDE.md task spec): the SAME attributed events as `events` above,
+    # re-sorted by `t_start` instead of rank_score -- "what happened, in order", separate from
+    # "what to watch first". Built from `event_rows` (not re-derived from `events`), so every
+    # field is guaranteed to already be Golden-Rule-5-clean (real clip_path or explicit `None`,
+    # never fabricated) -- this is a view, not a new computation.
+    timeline = sorted(
+        (
+            {
+                "t_start": row["t_start"],
+                "t_end": row["t_end"],
+                "type": row["type"],
+                "confidence": row["confidence"],
+                "take_id": events_by_id[row["event_id"]].take_id,
+                "clip_path": row["clip_path"],
+            }
+            for row in event_rows
+        ),
+        key=lambda r: r["t_start"],
+    )
+
     card = {
         "player_ref": stats.player_ref,
         "target_jersey": target_jersey,
@@ -128,6 +158,7 @@ def write_stat_card(
             "peak_sprint_speed": peak_sprint_speed(events_for(stats, events_by_id)),
         },
         "events": event_rows,
+        "timeline": timeline,
     }
 
     json_path = out_dir / "stat_card.json"
@@ -165,6 +196,19 @@ def write_stat_card(
         f"{DISTANCE_UNIT}** (UNCALIBRATED)",
         f"- Peak sprint speed: **{card['speed']['peak_sprint_speed']:.2f} "
         f"{SPEED_UNIT}** (UNCALIBRATED)",
+        "",
+        "## Timeline (chronological)",
+        "",
+    ]
+    if timeline:
+        for row in timeline:
+            md_lines.append(
+                f"- {_format_timestamp(row['t_start'])} – {_format_timestamp(row['t_end'])} "
+                f"— {row['type']} (conf {row['confidence']:.2f})"
+            )
+    else:
+        md_lines.append("_(no attributed events on this timeline)_")
+    md_lines += [
         "",
         "## Events (click-to-clip)",
         "",

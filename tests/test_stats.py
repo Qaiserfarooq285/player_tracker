@@ -180,6 +180,79 @@ def test_write_stat_card_is_well_formed_and_internally_consistent(tmp_path: Path
     assert str(clip.path) in md_text
 
 
+def test_write_stat_card_timeline_is_sorted_and_round_trips(tmp_path: Path):
+    """`timeline` is a chronological (t_start-sorted) view of the SAME attributed events as
+    `events`, with `t_start`/`t_end`/`type`/`confidence`/`take_id`/`clip_path` round-tripping
+    exactly -- the field this task adds alongside the pre-existing `events` list (never a
+    replacement/rename, CLAUDE.md task spec)."""
+    # deliberately built OUT of chronological order: h1 (t_start=10.0) before s1 (t_start=0.0)
+    # before s2 (t_start=2.0) -- the timeline must still come out sorted 0.0, 2.0, 10.0.
+    events = [
+        _shot("h1", confidence=0.3),
+        _sprint("s1", mean_speed=5.0, peak_speed=6.0, t0=0.0, t1=1.0, confidence=0.4),
+        _sprint("s2", mean_speed=7.0, peak_speed=8.0, t0=2.0, t1=3.0, confidence=0.6),
+    ]
+    stats = build_player_stats("clip2_77#jersey_77", [16], events)
+    clip_s1 = Clip(
+        event_id="s1",
+        t_start=0.0,
+        t_end=1.0,
+        take_id=0,
+        rank_score=20.0,
+        path=Path("output/clip2_77/clips/clip_000.mp4"),
+    )
+    clips_by_event_id = {"s1": clip_s1}  # s2/h1 never cut -- clip_path must be None for both
+
+    import json
+
+    json_path, md_path = write_stat_card(
+        stats,
+        events,
+        clips_by_event_id,
+        tmp_path,
+        target_jersey=77,
+        selection_summary={"method": "arrow_vote", "confidence": 0.62},
+        goal_reason="not available (no scoreboard detected in this footage)",
+    )
+    card = json.loads(json_path.read_text())
+
+    # the pre-existing `events` field is untouched, still present
+    assert len(card["events"]) == 3
+    assert "timeline" in card
+    timeline = card["timeline"]
+    assert len(timeline) == 3
+
+    # sorted by t_start, ascending
+    t_starts = [row["t_start"] for row in timeline]
+    assert t_starts == sorted(t_starts)
+    assert t_starts == [0.0, 2.0, 10.0]
+
+    # every entry carries exactly the required fields, and they round-trip against the source
+    # Event/Clip objects (never fabricated -- Golden Rule 5)
+    events_by_id = {ev.id: ev for ev in events}
+    by_start = {row["t_start"]: row for row in timeline}
+
+    s1_row = by_start[0.0]
+    assert set(s1_row.keys()) == {"t_start", "t_end", "type", "confidence", "take_id", "clip_path"}
+    assert s1_row["t_end"] == events_by_id["s1"].t_end
+    assert s1_row["type"] == "sprint"
+    assert s1_row["confidence"] == events_by_id["s1"].confidence
+    assert s1_row["take_id"] == events_by_id["s1"].take_id
+    assert s1_row["clip_path"] == str(clip_s1.path)
+
+    s2_row = by_start[2.0]
+    assert s2_row["type"] == "sprint"
+    assert s2_row["clip_path"] is None  # never cut -- must stay explicitly None, not fabricated
+
+    h1_row = by_start[10.0]
+    assert h1_row["type"] == "shot"
+    assert h1_row["clip_path"] is None
+
+    md_text = md_path.read_text()
+    assert "## Timeline (chronological)" in md_text
+    assert "0:00.0" in md_text and "0:10.0" in md_text  # both ends present somewhere in the list
+
+
 def test_write_stat_card_handles_zero_events(tmp_path: Path):
     stats = PlayerStats(player_ref="p", track_ids=[], counts={}, confidences={}, events=[])
     json_path, md_path = write_stat_card(
@@ -196,4 +269,5 @@ def test_write_stat_card_handles_zero_events(tmp_path: Path):
     card = json.loads(json_path.read_text())
     assert card["counts"] == {}
     assert card["events"] == []
+    assert card["timeline"] == []
     assert card["target_jersey"] is None
