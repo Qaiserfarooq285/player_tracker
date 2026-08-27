@@ -86,6 +86,59 @@ def test_aggregate_low_confidence_agreement_still_gated_by_min_verified_confiden
 
 
 # ---------------------------------------------------------------------------
+# aggregate_take_identity -- ADR-18 (1): human-confirmed jersey override (Golden Rule 4)
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_human_override_verifies_on_a_single_supporting_read():
+    # normally a single frame is NOT enough (see test_aggregate_unverified_on_single_frame_only
+    # above) -- a human-confirmed number needs only ONE supporting read (Golden Rule 4).
+    reads = [_read(0.0, 0, "ocr", "9", 0.6)]
+    result = aggregate_take_identity(reads, AGG_CFG, human_confirmed_jersey=9)
+    assert result["status"] == "verified"
+    assert result["jersey_number"] == 9
+    assert result["evidence_frames"] == [0]
+    assert "accepted" in result["human_override_note"]
+    assert "DESPITE" not in result["human_override_note"]
+
+
+def test_aggregate_human_override_wins_despite_a_contradicting_majority_but_flags_it():
+    # 3 independent reads all say "7" -- a real automated majority -- but the human watched the
+    # footage and confirmed "9", which only has ONE supporting read. Golden Rule 4: human
+    # authority wins regardless; Golden Rule 5: the disagreement must be visible, never hidden.
+    reads = [
+        _read(0.0, 0, "ocr", "7", 0.9),
+        _read(0.5, 1, "ocr", "7", 0.9),
+        _read(1.0, 2, "vlm", "7", 0.9),
+        _read(1.5, 3, "ocr", "9", 0.6),
+    ]
+    result = aggregate_take_identity(reads, AGG_CFG, human_confirmed_jersey=9)
+    assert result["status"] == "verified"
+    assert result["jersey_number"] == 9
+    assert "DESPITE" in result["human_override_note"]
+    assert "7" in result["human_override_note"]
+
+
+def test_aggregate_human_override_with_zero_supporting_reads_falls_back_to_automated_vote():
+    # the human's number was never actually read anywhere in this take -- the override cannot
+    # fabricate evidence, so it falls back to the normal automated vote (which here verifies "7").
+    reads = [_read(0.0, 0, "ocr", "7", 0.9), _read(0.5, 1, "ocr", "7", 0.9)]
+    result = aggregate_take_identity(reads, AGG_CFG, human_confirmed_jersey=42)
+    assert result["status"] == "verified"
+    assert result["jersey_number"] == 7  # NOT 42 -- never fabricated
+    assert "ZERO" in result["human_override_note"]
+
+
+def test_aggregate_human_override_none_is_a_pure_no_op():
+    # human_confirmed_jersey=None (the default) must behave IDENTICALLY to calling without it.
+    reads = [_read(0.0, 0, "ocr", "7", 0.8), _read(0.5, 1, "ocr", "7", 0.9)]
+    result = aggregate_take_identity(reads, AGG_CFG, human_confirmed_jersey=None)
+    assert result["status"] == "verified"
+    assert result["jersey_number"] == 7
+    assert result["human_override_note"] is None
+
+
+# ---------------------------------------------------------------------------
 # jersey_ocr.read_jersey_digits (mocked EasyOCR reader)
 # ---------------------------------------------------------------------------
 

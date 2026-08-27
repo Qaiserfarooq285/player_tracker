@@ -407,26 +407,32 @@ def render_full_annotated_video(
                 x1, y1 = box.bbox.x1 * scale_x, box.bbox.y1 * scale_y
                 x2, y2 = box.bbox.x2 * scale_x, box.bbox.y2 * scale_y
                 if tr.id in target_ids:
+                    # ADR-18 (3): track ID and jersey identity are DIFFERENT concepts (a Track.id
+                    # is a within-take tracker artifact that resets at every cut; a jersey number
+                    # is a verified identity) -- show BOTH explicitly so no viewer ever reads
+                    # "Track ID 10" as if it meant "Jersey #10".
                     _draw_box_with_label(
                         frame,
                         x1,
                         y1,
                         x2,
                         y2,
-                        f"#{identity.jersey_number} | TARGET",
+                        f"#{identity.jersey_number} | TARGET | ID: {tr.id}",
                         _RED,
                         _RED_THICKNESS,
                         _LABEL_FONT_SCALE_TARGET,
                         _LABEL_THICKNESS_TARGET,
                     )
                 else:
+                    # ADR-18 (3): "ID: {n}" (not a bare "#{n}") -- a bare "#10" visually reads as a
+                    # jersey number, which this is NOT (it is only ever a raw, per-take Track.id).
                     _draw_box_with_label(
                         frame,
                         x1,
                         y1,
                         x2,
                         y2,
-                        f"#{tr.id}",
+                        f"ID: {tr.id}",
                         _GREEN,
                         _GREEN_THICKNESS,
                         _LABEL_FONT_SCALE_OTHER,

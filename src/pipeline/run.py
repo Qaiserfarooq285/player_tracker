@@ -46,7 +46,7 @@ from src.common.types import (
 )
 from src.common.video import probe
 from src.detect.overlay_mask import ArrowHint
-from src.events.goals import check_goal_availability
+from src.events.goals import GoalDetectionResult, detect_goals_for_video
 from src.events.shots import detect_shots
 from src.events.sprints import detect_sprints
 from src.highlights.cutting import cut_clips
@@ -255,14 +255,61 @@ def run_pipeline_for_video(
         events_cache.write_meta()
     _merge_dropped("events", event_drops.report())
 
-    goal_result = check_goal_availability(profile, configs["events"]["goal"])
-    events = events + goal_result.events  # always [] on this footage -- see src/events/goals.py
     timings.append(
         StageTiming(
             stage="events",
             wall_seconds=round(time.time() - t0, 2),
             vram_peak_mb=None,
-            notes=f"n_events={len(events)} (sprint/shot only; goals={goal_result.reason})",
+            notes=f"n_events={len(events)} (sprint/shot)",
+        )
+    )
+
+    # --- Stage 4b: goals + assists (ADR-17, cached) --------------------------------------------
+    # Real detection now (see src/events/goals.py) -- still correctly reports "not available" on
+    # this footage (measured, CLAUDE.md §3.2(3)), just for a specific, auditable reason instead of
+    # an unconditional stub. Cached like `events` above: cheap (low-fps decode + corner-crop OCR
+    # only, no detector/tracker rerun), but resumable per CLAUDE.md §10.
+    t0 = time.time()
+    goals_path = work_dir / "events" / "goals.json"
+    goals_cache_config = {
+        "goal_cfg": configs["events"]["goal"],
+        "assist_cfg": configs["events"]["assist"],
+        "n_tracks": len(tracks),
+        "n_balls": len(balls),
+        "n_takes": len(takes),
+    }
+    goals_cache = StageCache(goals_path, goals_cache_config, stage="goals")
+    if goals_cache.hit():
+        cached = load_json(goals_path)
+        goal_result = GoalDetectionResult(
+            available=cached["available"],
+            reason=cached["reason"],
+            events=[Event.model_validate(d) for d in cached["events"]],
+        )
+    else:
+        tracks_by_take_for_goals: dict[int, list[Track]] = defaultdict(list)
+        for tr in tracks:
+            tracks_by_take_for_goals[tr.take_id].append(tr)
+        balls_by_take_for_goals = _bucket_by_take(balls, takes)
+        goal_result = detect_goals_for_video(
+            video_path,
+            takes,
+            tracks_by_take_for_goals,
+            balls_by_take_for_goals,
+            configs["events"],
+            identity_of_by_take=None,
+            ocr_cfg=configs["shots"]["ocr"],
+            use_nvdec=use_nvdec,
+        )
+        save_json(goal_result.model_dump(mode="json"), goals_path)
+        goals_cache.write_meta()
+    events = events + goal_result.events
+    timings.append(
+        StageTiming(
+            stage="goals",
+            wall_seconds=round(time.time() - t0, 2),
+            vram_peak_mb=None,
+            notes=f"goals={goal_result.reason}",
         )
     )
 
@@ -449,6 +496,21 @@ def main(
             "multi-take clip. Only meaningful when exactly one video is being processed."
         ),
     ),
+    target_jersey: int | None = typer.Option(
+        None,
+        "--target-jersey",
+        help=(
+            "ADR-18 (1) human-in-the-loop seam (CLAUDE.md Golden Rule 4), for a FILENAME-LESS "
+            "video (no `clip<N> <jersey>.mp4` name for the source profiler to parse a jersey "
+            "number from, e.g. a broadcast download): tell the pipeline the jersey number you "
+            "watched and confirmed in the footage yourself. Threaded into Stage 5.5's identity "
+            "verification, where a human-confirmed number needs only ONE supporting OCR/VLM "
+            "frame to verify (vs. the normal multi-frame vote) -- see "
+            "src/identity/verify.py::aggregate_take_identity. Only meaningful when exactly one "
+            "filename-less video is being processed; a video that already has a filename-parsed "
+            "jersey number is unaffected (that flow has no identity-verification stage at all)."
+        ),
+    ),
 ) -> None:
     """Run the full Stage 0.5-6 pipeline (CLAUDE.md §5/§6) for video(s), writing
     `output/<slug>/{reel.mp4, stat_card.json, stat_card.md, run_report.json}` for each.
@@ -481,6 +543,16 @@ def main(
             len(refs),
         )
 
+    filenameless_refs = [r for r in refs if r.target_jersey is None]
+    if target_jersey is not None and len(filenameless_refs) > 1:
+        logger.warning(
+            "--target-jersey was given but %d filename-less videos are being processed -- "
+            "applying the same human-confirmed jersey number to all of them is almost certainly "
+            "not what you want. Pass a single filename-less video path to target the override "
+            "correctly.",
+            len(filenameless_refs),
+        )
+
     for ref in refs:
         console.rule(f"[bold]{ref.path.name}[/bold]")
         if ref.target_jersey is None:
@@ -491,7 +563,11 @@ def main(
             from src.pipeline.extended_output import run_extended_pipeline_for_video
 
             summary = run_extended_pipeline_for_video(
-                ref.path, configs, work_root=work_root, output_root=output_root
+                ref.path,
+                configs,
+                work_root=work_root,
+                output_root=output_root,
+                human_confirmed_jersey=target_jersey,
             )
             console.print(summary)
             continue

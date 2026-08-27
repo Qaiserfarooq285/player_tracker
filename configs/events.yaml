@@ -81,13 +81,77 @@ shot:
   # as the final emit gate.
 
 goal:
-  # Dead code on this project's current input (CLAUDE.md §3.2(3): no scoreboard anywhere in this
-  # footage) — kept wired for a future broadcast source. See src/events/goals.py.
-  scoreboard_ocr_fps_sample: 1 # cadence the (unimplemented) scoreboard-delta path would use,
-  # matching configs/shots.yaml ocr.gated_on_broadcast_profile's cadence.
-  scoreboard_region_relative: [0.0, 0.0, 0.25, 0.12] # matches configs/shots.yaml's own scoreboard
-  # region — kept duplicated (not cross-referenced) since the two stages are independently
-  # runnable/debuggable per CLAUDE.md §10, and this key is never actually read on this footage.
+  # ADR-17 (2026-08-27) — REAL scoreboard-OCR-delta goal detection, no longer dead code. Still
+  # reports "not available" on all 5 original clip<N>.mp4 + jordan_thomas_highlight_video (§3.2(3):
+  # none of them has a scoreboard graphic anywhere) -- verified by an actual run against their own
+  # cached work/<slug>/ artifacts (this task), not just inferred. See src/events/goals.py.
+  #
+  # ⚠️ Every default in this block is a REASONED-BUT-UNMEASURED placeholder, same epistemic
+  # status as `save.save_gk_proximity_px` above: this project's own footage has NO scoreboard to
+  # measure real digit-transition timing/OCR-stability statistics against (unlike sprint/shot/
+  # touch/possession/pass, which all cite a real measured distribution from clip2/clip4). Revisit
+  # the moment real scoreboard footage (e.g. the in-progress SoccerNet broadcast clip, §3.4) is
+  # available to check these against.
+  scoreboard_ocr_fps_sample: 1 # whole-take decode cadence for this stage (own budget, matches
+  # configs/shots.yaml ocr's own cadence choice for the same reason: a scoreboard digit does not
+  # change faster than a human can read it, so 1 fps is ample and cheap).
+  candidate_regions: # [x1,y1,x2,y2] as fraction of frame -- a SMALL set, per ADR-17: score bugs
+    # are essentially never bottom-corner, so only the two realistic corners are scanned. Tried in
+    # this order; `scan_candidate_regions` returns the FIRST one whose reading is measured stable
+    # (see min_stable_frames below) -- never a hardcoded assumption that one specific corner is
+    # "the" scoreboard for a given source (ADR-11's own lesson: read the measured signal).
+    - [0.0, 0.0, 0.25, 0.12] # top-left
+    - [0.75, 0.0, 1.0, 0.12] # top-right
+  activation_frames_count: 8 # how many of a take's OWN early low-fps samples (at
+  # scoreboard_ocr_fps_sample=1, i.e. ~8 seconds of footage) are checked per candidate region for
+  # the self-activation test below -- long enough to see several independent reads, short enough
+  # to stay "early in the take" per ADR-17's own wording.
+  min_stable_frames: 5 # a candidate region "activates" only when the SAME parsed digit-pair
+  # reading appears in AT LEAST this many of its activation_frames_count samples -- deliberately a
+  # clear MAJORITY (5/8) rather than a bare plurality, since a real scoreboard reads identically
+  # frame after frame during a scoreboard-stable early window, whereas a false-positive crop
+  # (grass/sky/a sponsor board) reading the same two-digit pattern that often is far less likely.
+  increment_debounce_samples: 2 # ADR-17's own debounce rule: a reading increment must hold at the
+  # NEW (higher) value for at least this many SUBSequent samples before being trusted as a real
+  # goal, not a single-frame OCR misread flickering back down on the next sample.
+  occurrence_confidence: 0.75 # ADR-17: the HIGHEST-confidence step in the goal/assist chain (a
+  # literal, activated, stable, debounced scoreboard digit transition is strong evidence) --
+  # attribution steps below only ever multiply this DOWN, never up (Golden Rule 5: confidence
+  # stacks down at each inference step).
+  team_unknown_confidence_penalty: 0.5 # applied to occurrence_confidence when NO team-confident
+  # possession run exists in the lookback window (team/scorer stay unattributed, player_track_id
+  # None) -- still a real goal (worth keeping in the report), just materially less certain who it
+  # belongs to.
+  scorer_confidence_multiplier: 0.8 # applied on top of occurrence_confidence once a team+scorer
+  # ARE determined -- one step down the chain (ADR-17 step 3), never as certain as the occurrence
+  # itself since it additionally trusts the possession heuristic's own team-lookup.
+  possession_lookback_s: 8.0 # how far back from the observed digit-increment to look for which
+  # team held the ball (ADR-17 step 2: "the window immediately before the digit changed").
+  # Reasoned, not measured (no real goal footage exists on this project, see block-level note
+  # above): long enough to span a short passing buildup at `pass.pass_max_gap_s`=2.0s per pass
+  # (covers ~3-4 successive passes), short enough to stay "immediately before", not "at some point
+  # earlier in the take".
+  max_confidence: 0.8 # HARD CEILING (Golden Rule 5) -- defensive clamp; occurrence_confidence
+  # itself already sits under this, kept as an explicit ceiling for consistency with every other
+  # category in this file.
+  min_confidence: 0.1
+
+assist:
+  # ADR-17 step 4 -- owner's own rule, verbatim: "if the target pass the ball and the other score
+  # goal should be assist". Credited to the PASSER (src/events/goals.py::find_assist_event).
+  assist_window_seconds: 15.0 # how far back from the goal's own end time a qualifying PASS event
+  # (src/events/possession.py::detect_passes, evidence["receiver_identity"] == the credited
+  # scorer) may have ended and still count as the assist. Reasoned, not measured (same footage
+  # ceiling as `goal` above): generous enough to cover a genuine "played the final ball" pass even
+  # through a short dribble/touch phase between the pass and the finish, short enough to exclude
+  # an unrelated much-earlier pass in the same possession sequence.
+  assist_confidence_multiplier: 0.6 # stacks BELOW the goal's own scorer-level confidence (ADR-17:
+  # confidence stacks down at each step) -- an assist additionally depends on the pass heuristic's
+  # own already-capped confidence (configs/events.yaml: pass.max_confidence=0.35) on top of the
+  # goal attribution it is chained to.
+  max_confidence: 0.35 # HARD CEILING -- matches `pass.max_confidence` (Golden Rule 5: an assist
+  # can never read more certain than the pass heuristic it is built on).
+  min_confidence: 0.1
 
 confidence:
   min_emit_confidence: 0.15 # ANY event (sprint, shot, or any of the ADR-13/14 heuristics below)

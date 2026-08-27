@@ -1,29 +1,63 @@
-"""Stage 4 — goal detection (CLAUDE.md §5 Stage 5 goals row; §3.2 consequence 3, Golden Rule 5).
+"""Stage 4 — REAL goal + assist detection (ADR-17, CLAUDE.md §5.1/§3.2 consequence 3, Golden
+Rule 5).
 
-Two code paths, deliberately kept apart:
+Supersedes the earlier dead-code stub: `detect_goals_scoreboard_delta` used to raise
+`NotImplementedError` unconditionally, and `check_goal_availability` used to return a hardcoded
+"not available" regardless of input. Both are now real, and — measured, not assumed — still
+correctly report "not available" on all 5 original `clip<N> <jersey>.mp4` clips plus
+`jordan_thomas_highlight_video`, because none of them has a scoreboard graphic anywhere
+(CLAUDE.md §3.2(3)). ADR-17's own design, in four steps:
 
-- `detect_goals_scoreboard_delta` — the eventual BROADCAST-path detector (OCR a scoreboard
-  region, watch for either side's digit incrementing). This is DEAD CODE on this project's
-  current input: it is never called from `src/pipeline/run.py` for the owner's clips, and it
-  intentionally stops short of a real OCR/parsing implementation (raises `NotImplementedError`)
-  rather than guessing at goal-detection behaviour against a scoreboard we already know does not
-  exist in any of this footage (CLAUDE.md §3.2(3)). It exists so the broadcast branch is present
-  in code per CLAUDE.md §5's stage table, ready to be finished once real broadcast/scoreboard
-  input is available to validate it against.
-- `check_goal_availability` — the ACTUAL Phase-1 entry point `src/pipeline/run.py` calls. It
-  reports the already-established fact (§3.2(3): no scoreboard anywhere in this footage) directly,
-  rather than running a doomed OCR pass for the sole purpose of getting a "no digits found" result
-  we could have predicted for free. Golden Rule 5 forbids fabricating a goal count from absent
-  evidence, so this returns an explicit "not available", never a guessed/heuristic one.
+1. **Occurrence** (`detect_goals_scoreboard_delta`) — scan a SMALL set of candidate scoreboard
+   corner regions (`configs/events.yaml: goal.candidate_regions`) across several early sampled
+   frames of a take with the project's existing EasyOCR engine. A region only "activates" if it
+   yields the SAME stable `digit [separator] digit` reading across multiple frames (a MEASURED
+   self-check — `scan_candidate_regions` — never a hardcoded ROI guess, and never a trust in
+   `RunProfile.profile`; ADR-11's own lesson in this codebase applies identically here: read the
+   measured signal, not the label). Once activated, the region is watched across the whole take
+   for a DEBOUNCED score increment (`find_score_increments`) — a reading must climb by exactly one
+   and then STAY there for a couple of subsequent samples before it counts as a real goal, so a
+   single OCR misread can never fire a phantom one.
+2. **Scoring team** (`attribute_goal_team_and_scorer`) — deliberately sidesteps mapping the
+   scoreboard's own left/right digit to home/away. Instead, whichever of OUR OWN two
+   colour-clustered teams (`src/events/possession.py`, ADR-12) held the ball for the most
+   cumulative time in the `possession_lookback_s` window immediately before the digit changed is
+   credited.
+3. **Scorer** (same function) — the identity with the LAST possession run in that window, gated to
+   the credited team.
+4. **Assist** (`find_assist_event`) — the owner's own rule, verbatim: "if the target pass the ball
+   and the other score goal should be assist". The nearest PRECEDING `PASS` event whose
+   `evidence['receiver_identity']` equals the credited scorer, from a teammate, within
+   `assist_window_seconds`, credited to the PASSER.
+
+Confidence stacks DOWN at each step (`goal_cfg['occurrence_confidence']` is the ceiling; each
+attribution step only ever multiplies it further down) and every emitted `Event.evidence` carries
+enough to audit it — which region/frames the OCR locked onto and its raw text, the possession
+scores considered, and which `Event.id` supported an assist (Golden Rule 5: no black-box
+confidence).
+
+No visual ball-crosses-the-goal-line detection is built here (no goal-post/net detector exists,
+and ADR-17 explicitly scoped that out as deferred, not part of this task).
+
+`detect_goals_for_video` is the shared entrypoint both `src.pipeline.run` (the 5 original clips)
+and `src.pipeline.extended_output` (ADR-15's filename-less flow) call identically.
 """
 
 from __future__ import annotations
+
+import re
+import uuid
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 from pydantic import BaseModel
 
 from src.common.logging import get_logger
-from src.common.types import Event, RunProfile
+from src.common.types import BallDetection, Event, EventType, Take, Track
+from src.common.video import decode_frames
+from src.events.possession import detect_passes, detect_possession, possession_runs_for_take
+from src.identity.jersey_ocr import free_easyocr_reader, load_easyocr_reader
 
 logger = get_logger(__name__)
 
@@ -39,45 +73,583 @@ class GoalDetectionResult(BaseModel):
     events: list[Event] = []
 
 
+# ---------------------------------------------------------------------------
+# OCR text -> (left, right) parsing (pure)
+# ---------------------------------------------------------------------------
+
+_SCORE_PATTERN = re.compile(r"(\d{1,2})\s*[-:]\s*(\d{1,2})")
+
+
+def parse_scoreboard_text(joined_text: str | None) -> tuple[int, int] | None:
+    """Extract a plausible `digit [separator] digit` scoreboard reading (e.g. ``"1 - 0"``,
+    ``"2:1"``) from a joined EasyOCR text string. `None` when no such pattern is present — the
+    conservative, no-fabrication default (Golden Rule 5); EasyOCR frequently returns several
+    fragments per crop (e.g. ``"1"``, ``"-"``, ``"0"``) or none at all.
+    """
+    if not joined_text:
+        return None
+    match = _SCORE_PATTERN.search(joined_text)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _bbox_x1(bbox: Any) -> float:
+    """Best-effort left-x of an EasyOCR result box — real EasyOCR boxes are 4 `[x, y]` points, so
+    ``bbox[0][0]`` is the top-left corner's x. Defensive against a test double's dummy bbox shape
+    (e.g. the `(0, 0, 0, 0)` tuple `tests/test_identity.py` already uses for the sibling
+    `jersey_ocr` module) — falls back to `0.0` rather than crashing on an unexpected shape.
+    """
+    try:
+        return float(bbox[0][0])
+    except (TypeError, IndexError):
+        return 0.0
+
+
+def _crop_region(
+    frame: np.ndarray, region_relative: tuple[float, float, float, float]
+) -> np.ndarray:
+    """Crop `region_relative` (`[x1, y1, x2, y2]` as a fraction of frame width/height) out of
+    `frame`."""
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = region_relative
+    return frame[int(y1 * h) : int(y2 * h), int(x1 * w) : int(x2 * w)]
+
+
+def _ocr_region_text(reader: Any, crop: np.ndarray) -> str:
+    """Run EasyOCR over `crop` with NO digit allowlist (unlike `src/identity/jersey_ocr.py`'s
+    jersey-number OCR — a scoreboard reading needs the separator character too) and join every
+    detected text fragment left-to-right into one string for `parse_scoreboard_text`."""
+    if crop.size == 0:
+        return ""
+    raw = reader.readtext(crop)
+    ordered = sorted(raw, key=lambda r: _bbox_x1(r[0]))
+    return " ".join(str(text) for _bbox, text, _conf in ordered)
+
+
+# ---------------------------------------------------------------------------
+# step 1a: which (if any) candidate region is a real, stable scoreboard
+# ---------------------------------------------------------------------------
+
+
+def scan_candidate_regions(
+    reader: Any, frames: list[np.ndarray], goal_cfg: dict
+) -> tuple[tuple[float, float, float, float] | None, dict]:
+    """Self-check WHICH (if any) of `goal_cfg['candidate_regions']` is a real scoreboard, from
+    MEASURED OCR stability across `frames` — never a hardcoded ROI guess, never a trust in
+    `RunProfile.profile` (ADR-11's own lesson: read the measured signal, not the label).
+
+    A region "activates" when the SAME parsed `(left, right)` reading appears in at least
+    `goal_cfg['min_stable_frames']` of `frames` — a real scoreboard graphic reads the same score
+    frame after frame over a short early window (barring an implausibly fast kickoff goal), so
+    stability across several samples is exactly the self-check that separates "this is a
+    scoreboard" from "this crop of grass/sky/a sponsor board happened to OCR a plausible-looking
+    digit pair once or twice".
+
+    Returns `(activated_region_or_None, debug)` — `debug` always carries every candidate region's
+    own reading tally (Golden Rule 5: auditable even when nothing activates), checked in
+    `goal_cfg['candidate_regions']`'s own order and returning the FIRST region that activates.
+    """
+    candidates = goal_cfg["candidate_regions"]
+    min_stable = goal_cfg["min_stable_frames"]
+    debug: dict = {"candidates": [], "activated_region": None}
+
+    for region in candidates:
+        region_t = tuple(float(v) for v in region)
+        readings: dict[tuple[int, int], int] = {}
+        raw_texts: list[str] = []
+        for frame in frames:
+            text = _ocr_region_text(reader, _crop_region(frame, region_t))
+            raw_texts.append(text)
+            parsed = parse_scoreboard_text(text)
+            if parsed is not None:
+                readings[parsed] = readings.get(parsed, 0) + 1
+
+        best_reading = max(readings.items(), key=lambda kv: kv[1]) if readings else None
+        debug["candidates"].append(
+            {
+                "region": list(region_t),
+                "raw_texts": raw_texts,
+                "readings": {f"{k[0]}-{k[1]}": v for k, v in readings.items()},
+                "best_count": best_reading[1] if best_reading else 0,
+            }
+        )
+        if best_reading is not None and best_reading[1] >= min_stable:
+            debug["activated_region"] = list(region_t)
+            debug["activated_reading"] = list(best_reading[0])
+            return region_t, debug
+
+    return None, debug
+
+
+# ---------------------------------------------------------------------------
+# step 1b: debounced score-increment detection over one take's own low-fps series
+# ---------------------------------------------------------------------------
+
+
+def find_score_increments(samples: list[tuple[float, int]], goal_cfg: dict) -> list[dict]:
+    """Walk a time-sorted `(t, total_score)` series (already parsed+summed from an activated
+    region's own readings — gaps where OCR produced nothing are simply absent, never zero-filled)
+    and return every DEBOUNCED `+1` increment as
+    `{t_before, t_after, score_before, score_after}`.
+
+    Debounce (`goal_cfg['increment_debounce_samples']`): a candidate `+1` step must hold at the
+    NEW value for that many SUBSEQUENT samples before being trusted — a single-sample spike that
+    reverts is OCR noise, not a goal. A jump of more than `+1`, or any decrease, is ambiguous (an
+    OCR misread, or — if it turns out to persist — a real change this heuristic cannot tell how
+    many goals it represents) and is never turned into a goal event (Golden Rule 5: no guessing);
+    if such a reading itself proves debounce-stable, the baseline silently resyncs to it (so a
+    later, cleaner `+1` from that new baseline can still be detected) without ever emitting an
+    event for the ambiguous jump itself.
+    """
+    debounce = goal_cfg["increment_debounce_samples"]
+    increments: list[dict] = []
+    if not samples:
+        return increments
+
+    baseline_t, baseline_score = samples[0]
+    i = 1
+    while i < len(samples):
+        t, score = samples[i]
+        if score == baseline_score:
+            i += 1
+            continue
+
+        window = samples[i : i + debounce]
+        stable = len(window) == debounce and all(s == score for _, s in window)
+
+        if score == baseline_score + 1 and stable:
+            increments.append(
+                {
+                    "t_before": baseline_t,
+                    "t_after": t,
+                    "score_before": baseline_score,
+                    "score_after": score,
+                }
+            )
+            baseline_t, baseline_score = t, score
+            i += debounce
+            continue
+
+        if stable:
+            # An ambiguous (non-+1) but persistent change -- resync without emitting a goal.
+            baseline_t, baseline_score = t, score
+            i += debounce
+            continue
+
+        # Not stable across the debounce window -- a stray misread, ignore this one sample only.
+        i += 1
+
+    return increments
+
+
+# ---------------------------------------------------------------------------
+# step 1: occurrence detector (real implementation -- no longer NotImplementedError)
+# ---------------------------------------------------------------------------
+
+
 def detect_goals_scoreboard_delta(
+    reader: Any,
     frames: list[np.ndarray],
     times: list[float],
+    take_id: int | None,
     goal_cfg: dict,
-) -> list[Event]:
-    """Broadcast-path scoreboard-delta goal detector — **DEAD CODE**, never invoked on this
-    project's current (single-camera, scoreboard-less) input. See module docstring.
+) -> tuple[list[Event], dict]:
+    """ADR-17 step 1 — the real scoreboard-OCR-delta goal-OCCURRENCE detector.
 
-    Would OCR `goal_cfg["scoreboard_region_relative"]` on each frame (EasyOCR, matching
-    `configs/shots.yaml: ocr`'s cadence/engine), parse each side's digit, and emit a `GOAL` event
-    whenever a reading increments between two OCR passes. Stops at a `NotImplementedError` rather
-    than a real (untestable, on this footage) OCR/parsing implementation — CLAUDE.md §3.2(3)
-    established there is no scoreboard anywhere in this project's footage to validate the parsing
-    logic against, so writing more of it now would be guessing at goal-post behaviour with zero
-    ground truth to check it against.
+    `frames`/`times` are a LOW-FPS, time-sorted series spanning one take (`detect_goals_for_take`
+    decodes them via `configs/events.yaml: goal.scoreboard_ocr_fps_sample`); this function itself
+    is decode-agnostic, so it is independently testable against synthetic frames + a mocked
+    EasyOCR `reader` (no GPU/video I/O needed).
+
+    Team/scorer/assist attribution is a SEPARATE, later step (`attribute_goal_team_and_scorer` /
+    `find_assist_event`) — every `Event` returned here has `player_track_id=None` and
+    `confidence=goal_cfg['occurrence_confidence']` (ADR-17: the highest-confidence step in the
+    chain; attribution only ever multiplies it further down), so this function stays a pure,
+    auditable "did a goal OCCUR" detector.
+
+    Returns `(occurrence_events, debug)`; `debug` is `scan_candidate_regions`'s own audit trail,
+    plus (when a region activated) the raw per-sample score series and the increments found.
     """
-    raise NotImplementedError(
-        "scoreboard-delta goal detection is a deliberately unfinished broadcast-path seam "
-        "(CLAUDE.md §3.2(3)) -- it is never invoked on this project's single-camera, "
-        "scoreboard-less input. See check_goal_availability() for what Stage 4 actually emits "
-        "for goals on this footage."
+    n_activation = min(len(frames), goal_cfg["activation_frames_count"])
+    activated_region, debug = scan_candidate_regions(reader, frames[:n_activation], goal_cfg)
+    if activated_region is None:
+        return [], debug
+
+    samples: list[tuple[float, int]] = []
+    for t, frame in zip(times, frames, strict=True):
+        crop = _crop_region(frame, activated_region)
+        parsed = parse_scoreboard_text(_ocr_region_text(reader, crop))
+        if parsed is not None:
+            samples.append((t, parsed[0] + parsed[1]))
+
+    increments = find_score_increments(samples, goal_cfg)
+    debug["score_samples"] = samples
+    debug["increments"] = increments
+
+    events: list[Event] = []
+    for inc in increments:
+        events.append(
+            Event(
+                id=str(uuid.uuid4()),
+                type=EventType.GOAL,
+                t_start=inc["t_before"],
+                t_end=inc["t_after"],
+                player_track_id=None,
+                take_id=take_id,
+                confidence=goal_cfg["occurrence_confidence"],
+                source="scoreboard_ocr_delta",
+                evidence={
+                    "activated_region": list(activated_region),
+                    "score_before": inc["score_before"],
+                    "score_after": inc["score_after"],
+                    "t_before": inc["t_before"],
+                    "t_after": inc["t_after"],
+                },
+            )
+        )
+    return events, debug
+
+
+# ---------------------------------------------------------------------------
+# steps 2-3: scoring team + scorer attribution
+# ---------------------------------------------------------------------------
+
+
+def attribute_goal_team_and_scorer(
+    goal_event: Event,
+    possession_events: list[Event],
+    tracks_by_id: dict[int, Track],
+    goal_cfg: dict,
+) -> Event:
+    """ADR-17 steps 2-3. Deliberately sidesteps mapping the scoreboard's own left/right digit to
+    home/away — instead credits whichever of OUR OWN two colour-clustered teams (`Track.team`,
+    ADR-12) held ball possession for the most cumulative time in the
+    `goal_cfg['possession_lookback_s']` window immediately before the digit changed
+    (`goal_event.evidence['t_after']`), via the already-computed `POSSESSION` events
+    (`src/events/possession.py::detect_possession`). The SCORER is then the identity with the
+    LAST such possession run in that window, gated to the credited team.
+
+    Returns a NEW `Event` (never mutates `goal_event` in place — Golden Rule 5: every attribution
+    step's own evidence must stay independently auditable) with `player_track_id` set to the
+    scorer's identity id when determinable; when no team-confident possession exists in the
+    window, `player_track_id` stays `None` and `confidence` is penalised, never guessed.
+    """
+    lookback = goal_cfg["possession_lookback_s"]
+    window_end = goal_event.evidence.get("t_after", goal_event.t_end)
+    window_start = window_end - lookback
+
+    in_window = [
+        ev
+        for ev in possession_events
+        if ev.type == EventType.POSSESSION and ev.t_end >= window_start and ev.t_start <= window_end
+    ]
+
+    def _team_of(ev: Event) -> int | None:
+        raw_ids = ev.evidence.get("raw_track_ids") or []
+        if not raw_ids:
+            return None
+        tr = tracks_by_id.get(raw_ids[-1])
+        return tr.team if tr is not None else None
+
+    team_duration: dict[int, float] = {}
+    for ev in in_window:
+        team = _team_of(ev)
+        if team is None:
+            continue
+        team_duration[team] = team_duration.get(team, 0.0) + (ev.t_end - ev.t_start)
+
+    def _clamp(value: float) -> float:
+        return min(goal_cfg["max_confidence"], max(goal_cfg["min_confidence"], value))
+
+    if not team_duration:
+        new_evidence = {
+            **goal_event.evidence,
+            "team_attribution": (
+                f"undetermined -- no team-confident POSSESSION event found in the {lookback}s "
+                "lookback window before the goal"
+            ),
+            "possession_lookback_s": lookback,
+        }
+        return goal_event.model_copy(
+            update={
+                "evidence": new_evidence,
+                "confidence": _clamp(
+                    goal_event.confidence * goal_cfg["team_unknown_confidence_penalty"]
+                ),
+            }
+        )
+
+    credited_team = max(team_duration, key=lambda k: team_duration[k])
+    team_events = [ev for ev in in_window if _team_of(ev) == credited_team]
+    scorer_event = max(team_events, key=lambda ev: ev.t_end)
+    scorer_identity = scorer_event.player_track_id
+
+    new_evidence = {
+        **goal_event.evidence,
+        "credited_team": credited_team,
+        "team_duration_seconds": team_duration,
+        "scorer_identity": scorer_identity,
+        "supporting_possession_event_id": scorer_event.id,
+        "possession_lookback_s": lookback,
+    }
+    return goal_event.model_copy(
+        update={
+            "player_track_id": scorer_identity,
+            "evidence": new_evidence,
+            "confidence": _clamp(goal_event.confidence * goal_cfg["scorer_confidence_multiplier"]),
+        }
     )
 
 
-def check_goal_availability(profile: RunProfile | None, goal_cfg: dict) -> GoalDetectionResult:
-    """The real Phase-1 goal-detection entry point (CLAUDE.md §3.2(3), Golden Rule 5).
+# ---------------------------------------------------------------------------
+# step 4: assist
+# ---------------------------------------------------------------------------
 
-    CLAUDE.md §3.2(3) measured (2026-08-24) that NONE of the owner's Veo clips show a scoreboard
-    graphic anywhere. Running `detect_goals_scoreboard_delta` against a region we already know is
-    empty would only manufacture "no digits found" noise for zero benefit, so this does not even
-    attempt the OCR pass — it reports the *known* absence directly, unconditionally, for Phase 1's
-    actual input set. `profile.profile == SourceProfile.BROADCAST` is the intended future trigger
-    for calling `detect_goals_scoreboard_delta` for real; that branch is not exercised here since
-    none of this project's clips are broadcast source.
+
+def find_assist_event(
+    goal_event: Event, pass_events: list[Event], assist_cfg: dict
+) -> Event | None:
+    """ADR-17 step 4 — the owner's own rule, verbatim: "if the target pass the ball and the other
+    score goal should be assist". The nearest PRECEDING `PASS` event
+    (`src/events/possession.py::detect_passes`) whose `evidence['receiver_identity']` equals
+    `goal_event`'s own credited scorer, ending within `assist_cfg['assist_window_seconds']` of the
+    goal, becomes an `ASSIST` `Event` credited to the PASSER (`player_track_id` = the pass event's
+    own `player_track_id`). Returns `None` — never fabricated — when the scorer itself is unknown
+    (`goal_event.player_track_id is None`) or no qualifying pass exists.
     """
-    reason = (
-        "not available (no scoreboard detected in this footage -- CLAUDE.md §3.2(3): these are "
-        "single-camera Veo youth-match clips with no broadcast scoreboard graphic anywhere; goal "
-        "detection was not attempted rather than guessed, per Golden Rule 5)"
+    scorer = goal_event.player_track_id
+    if scorer is None:
+        return None
+
+    window_start = goal_event.t_end - assist_cfg["assist_window_seconds"]
+    candidates = [
+        ev
+        for ev in pass_events
+        if ev.type == EventType.PASS
+        and ev.evidence.get("receiver_identity") == scorer
+        and window_start <= ev.t_end <= goal_event.t_end
+    ]
+    if not candidates:
+        return None
+    supporting_pass = max(candidates, key=lambda ev: ev.t_end)
+
+    confidence = min(
+        assist_cfg["max_confidence"],
+        max(
+            assist_cfg["min_confidence"],
+            goal_event.confidence * assist_cfg["assist_confidence_multiplier"],
+        ),
     )
-    logger.info("goal detection: %s", reason)
-    return GoalDetectionResult(available=False, reason=reason, events=[])
+    return Event(
+        id=str(uuid.uuid4()),
+        type=EventType.ASSIST,
+        t_start=supporting_pass.t_start,
+        t_end=supporting_pass.t_end,
+        player_track_id=supporting_pass.player_track_id,
+        take_id=goal_event.take_id,
+        confidence=confidence,
+        source="goal_preceding_pass_heuristic",
+        evidence={
+            "goal_event_id": goal_event.id,
+            "supporting_pass_event_id": supporting_pass.id,
+            "passer_identity": supporting_pass.player_track_id,
+            "receiver_identity": scorer,
+            "assist_window_seconds": assist_cfg["assist_window_seconds"],
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# per-take orchestration (does its own decode; lazily computes possession/pass only if needed)
+# ---------------------------------------------------------------------------
+
+
+def detect_goals_for_take(
+    reader: Any,
+    video_path: str | Path,
+    take: Take,
+    take_tracks: list[Track],
+    take_balls: list[BallDetection],
+    events_cfg: dict,
+    identity_of: dict[int, int] | None,
+    use_nvdec: bool = True,
+) -> tuple[list[Event], dict]:
+    """Full ADR-17 pipeline for ONE take: decode a low-fps frame series spanning it, run the
+    occurrence scan, and — ONLY when at least one occurrence event is actually found — lazily
+    compute this take's own possession runs + passes (`src/events/possession.py`) purely to
+    attribute team/scorer/assist. A take with no scoreboard activation or no increment never pays
+    that extra cost, which is what keeps this cheap on scoreboard-less footage (measured true for
+    every take of all 5 original clips + `jordan_thomas_highlight_video`, this task's own
+    verification run).
+
+    `identity_of` is the SAME `build_take_identities` partition the caller's own event pipeline
+    uses for this take (`None` for the original Phase-1 flow, which has no identity-stitching
+    step at all and uses raw `Track.id`s directly, exactly like `detect_sprints` already does).
+    """
+    goal_cfg = events_cfg["goal"]
+    assist_cfg = events_cfg["assist"]
+
+    times: list[float] = []
+    frames: list[np.ndarray] = []
+    for _idx, t, frame in decode_frames(
+        video_path,
+        fps=goal_cfg["scoreboard_ocr_fps_sample"],
+        start=take.t_start,
+        end=take.t_end,
+        scale_width=None,
+        use_nvdec=use_nvdec,
+    ):
+        times.append(t)
+        frames.append(frame.copy())
+
+    occurrence_events, debug = detect_goals_scoreboard_delta(
+        reader, frames, times, take.id, goal_cfg
+    )
+    if not occurrence_events:
+        return [], debug
+
+    tracks_by_id = {tr.id: tr for tr in take_tracks}
+    runs = possession_runs_for_take(take_balls, take_tracks, events_cfg, identity_of)
+    possession_events = detect_possession(runs, take.id, events_cfg)
+    pass_events = detect_passes(runs, take_tracks, take.id, events_cfg)
+    debug["n_possession_runs"] = len(runs)
+
+    events: list[Event] = []
+    for occ in occurrence_events:
+        attributed = attribute_goal_team_and_scorer(occ, possession_events, tracks_by_id, goal_cfg)
+        events.append(attributed)
+        assist_event = find_assist_event(attributed, pass_events, assist_cfg)
+        if assist_event is not None:
+            events.append(assist_event)
+    return events, debug
+
+
+# ---------------------------------------------------------------------------
+# final reporting step (pure decision table)
+# ---------------------------------------------------------------------------
+
+
+def check_goal_availability(
+    scan_attempted: bool,
+    activated_any_region: bool,
+    events: list[Event],
+    goal_cfg: dict,
+) -> GoalDetectionResult:
+    """The final Golden-Rule-5 reporting step (ADR-17): turns a scan's own OUTCOME into an honest
+    `GoalDetectionResult`. Never does I/O itself — `detect_goals_for_video` is responsible for
+    actually running the scan; this stays a pure, trivially-unit-testable decision table, so its
+    result is provably driven by real input rather than a hardcoded "not available" regardless of
+    what was actually found (the exact defect ADR-17 fixes).
+    """
+    if not scan_attempted:
+        return GoalDetectionResult(
+            available=False,
+            reason="not available (goal detection was not attempted -- this video has no takes)",
+            events=[],
+        )
+
+    if not activated_any_region:
+        return GoalDetectionResult(
+            available=False,
+            reason=(
+                "not available (no legible scoreboard found by the region-activation scan -- "
+                "CLAUDE.md ADR-17: EasyOCR was run over each candidate corner region across "
+                "multiple sampled frames per take and none yielded a stable digit-separator-digit "
+                "reading; this is the measured, per-video result, never an assumption from the "
+                "source profile label)"
+            ),
+            events=[],
+        )
+
+    goal_events = [e for e in events if e.type == EventType.GOAL]
+    if not goal_events:
+        return GoalDetectionResult(
+            available=False,
+            reason=(
+                "not available (a scoreboard region activated on this footage, but no debounced "
+                "score increment was ever observed across the video)"
+            ),
+            events=events,
+        )
+
+    assist_events = [e for e in events if e.type == EventType.ASSIST]
+    return GoalDetectionResult(
+        available=True,
+        reason=(
+            f"{len(goal_events)} goal(s) detected via scoreboard-OCR delta "
+            f"({len(assist_events)} with an assist credited) -- see each Event.evidence for the "
+            "full audit trail (activated region, before/after reading, possession-window scores, "
+            "supporting pass id), Golden Rule 5"
+        ),
+        events=events,
+    )
+
+
+# ---------------------------------------------------------------------------
+# whole-video orchestration (shared by src.pipeline.run and src.pipeline.extended_output)
+# ---------------------------------------------------------------------------
+
+
+def detect_goals_for_video(
+    video_path: str | Path,
+    takes: list[Take],
+    tracks_by_take: dict[int, list[Track]],
+    balls_by_take: dict[int, list[BallDetection]],
+    events_cfg: dict,
+    identity_of_by_take: dict[int, dict[int, int]] | None = None,
+    ocr_cfg: dict | None = None,
+    use_nvdec: bool = True,
+) -> GoalDetectionResult:
+    """ADR-17's real, per-video goal+assist detector — the single entrypoint both
+    `src.pipeline.run` (the 5 original filename-based clips) and `src.pipeline.extended_output`
+    (ADR-15's filename-less flow) call identically. Loads ONE EasyOCR reader for the whole video
+    (CLAUDE.md §11: never reload per-take), matching `src/identity/verify.py`'s own
+    load-once/free-in-`finally` convention.
+
+    Never trusts `RunProfile.profile` (ADR-11's own lesson): every take gets the SAME measured
+    region-activation scan regardless of what the source profiler labeled the video.
+    """
+    goal_cfg = events_cfg["goal"]
+    if not takes:
+        return check_goal_availability(
+            scan_attempted=False, activated_any_region=False, events=[], goal_cfg=goal_cfg
+        )
+
+    reader = load_easyocr_reader(ocr_cfg or {"gpu": True})
+    all_events: list[Event] = []
+    activated_any = False
+    try:
+        for take in takes:
+            take_tracks = tracks_by_take.get(take.id, [])
+            take_balls = balls_by_take.get(take.id, [])
+            identity_of = (identity_of_by_take or {}).get(take.id)
+            events, debug = detect_goals_for_take(
+                reader,
+                video_path,
+                take,
+                take_tracks,
+                take_balls,
+                events_cfg,
+                identity_of,
+                use_nvdec=use_nvdec,
+            )
+            if debug.get("activated_region") is not None:
+                activated_any = True
+            all_events.extend(events)
+    finally:
+        free_easyocr_reader(reader)
+
+    any_goal = any(e.type == EventType.GOAL for e in all_events)
+    logger.info(
+        "goal detection: %s (%d take(s) scanned, region activated=%s)",
+        "available" if any_goal else "not available",
+        len(takes),
+        activated_any,
+    )
+    return check_goal_availability(
+        scan_attempted=True,
+        activated_any_region=activated_any,
+        events=all_events,
+        goal_cfg=goal_cfg,
+    )

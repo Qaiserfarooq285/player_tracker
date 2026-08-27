@@ -45,12 +45,14 @@ from src.events.aggregate import (
     compute_take_all_events,
     target_identity_id,
 )
+from src.events.goals import detect_goals_for_video
 from src.events.key_moments import classify_candidate_windows, find_candidate_windows
 from src.events.possession import compute_distance_covered
 from src.identity.verify import IdentityReport, verify_identities_for_video
 from src.pipeline.annotated_video import render_full_annotated_video
 from src.pipeline.player_output import write_player_output
 from src.pipeline.profiler import build_run_profile
+from src.track.continuity import build_take_identities
 from src.track.run import run_track_stage
 from src.track.tracker import assign_take_id
 
@@ -92,10 +94,17 @@ def run_extended_pipeline_for_video(
     work_root: str | Path = "work",
     output_root: str | Path = "output",
     use_nvdec: bool = True,
+    human_confirmed_jersey: int | None = None,
 ) -> dict:
     """Run the full ADR-15 extended pipeline for one filename-less video end to end. Deletes any
     stale prior output at `output/<slug>/` first (CLAUDE.md task spec: never mix a new run with a
-    previous partial one)."""
+    previous partial one).
+
+    `human_confirmed_jersey` (ADR-18 (1)) is `src/pipeline/run.py::main()`'s optional
+    `--target-jersey` human-in-the-loop override, threaded straight into Stage 5.5's identity
+    verification (`src.identity.verify.verify_identities_for_video`) -- see that module's own
+    docstring for the exact semantics.
+    """
     video_path = Path(video_path)
     work_dir = work_dir_for(video_path, root=work_root)
     output_dir = Path(output_root) / work_dir.name
@@ -160,6 +169,10 @@ def run_extended_pipeline_for_video(
         "n_tracks": len(tracks),
         "n_takes": len(takes),
         "n_arrow_hints": len(arrow_hints),
+        # ADR-18 (1): part of the cache key -- changing (or adding/removing) the human-confirmed
+        # override between runs must invalidate a stale cached identity result, never silently
+        # reuse a pre-override verification.
+        "human_confirmed_jersey": human_confirmed_jersey,
     }
     identity_cache = StageCache(identity_path, identity_cache_config, stage="identity")
     if identity_cache.hit():
@@ -177,6 +190,7 @@ def run_extended_pipeline_for_video(
             configs["identity"],
             gemini_api_key,
             use_nvdec=use_nvdec,
+            human_confirmed_jersey=human_confirmed_jersey,
         )
         save_json(identity_report, identity_path)
         identity_cache.write_meta()
@@ -211,6 +225,32 @@ def run_extended_pipeline_for_video(
     attribution_cfg = configs["highlights"]["attribution"]
     key_moment_cfg = configs["key_moments"]
 
+    # --- ADR-17: goals + assists, once for the whole video ------------------------------------
+    # `identity_of_by_take` reuses the SAME `build_take_identities` partition
+    # `compute_take_all_events` computes per-take below (cheap, pure arithmetic on tracks -- no
+    # OCR/decode) so goal/assist attribution lands in the identical identity id-space every other
+    # extended-pipeline event already uses, rather than raw track ids.
+    t0 = time.time()
+    identity_of_by_take: dict[int, dict[int, int]] = {
+        take.id: build_take_identities(tracks_by_take.get(take.id, []), selection_cfg)[0]
+        for take in takes
+    }
+    goal_result = detect_goals_for_video(
+        video_path,
+        takes,
+        dict(tracks_by_take),
+        dict(balls_by_take),
+        events_cfg,
+        identity_of_by_take=identity_of_by_take,
+        ocr_cfg=configs["shots"]["ocr"],
+        use_nvdec=use_nvdec,
+    )
+    logger.info("goal detection: %s (%.1fs)", goal_result.reason, time.time() - t0)
+    goal_assist_by_take: dict[int, list[Event]] = defaultdict(list)
+    for ev in goal_result.events:
+        if ev.take_id is not None:
+            goal_assist_by_take[ev.take_id].append(ev)
+
     drops = DropCounter("extended_events")
     events_by_number: dict[int, list[Event]] = defaultdict(list)
     takes_used_by_number: dict[int, list[tuple[int, list[int]]]] = defaultdict(list)
@@ -234,6 +274,7 @@ def run_extended_pipeline_for_video(
             fps_sample,
             drops=drops,
         )
+        all_events = all_events + goal_assist_by_take.get(take.id, [])
         target_events = attribute_events_to_target(
             all_events,
             take_tracks,
@@ -279,6 +320,32 @@ def run_extended_pipeline_for_video(
     if dropped:
         logger.info("extended-event drops: %s", dropped)
 
+    # --- §13.1: full-resolution annotated original video ----------------------------------------
+    # ADR-18 (2): rendered BEFORE the per-player loop below (not after, as originally wired) so
+    # that `write_player_output` -> `_cut_category_reel` -> `cut_clips` cuts each player's
+    # highlight clips from THIS annotated video (red/green boxes, ball marker, live panel, CUT
+    # banners already burned in) rather than from the raw, unannotated source -- CLAUDE.md §13.4
+    # is explicit that highlight clips must show "the same red/green boxes + ball tracking +
+    # captions as the main video". Total render cost is unchanged (same work, just reordered);
+    # `cut_clips`/ffmpeg cutting a pre-rendered mp4 works identically to cutting the raw source
+    # (it is still just a video file on disk).
+    t0 = time.time()
+    final_video_path = output_dir / "original_annotated_video.mp4"
+    render_full_annotated_video(
+        video_path,
+        work_dir,
+        final_video_path,
+        takes,
+        tracks,
+        balls,
+        identity_by_take,
+        dict(events_by_number),
+        frame_width,
+        frame_height,
+        use_nvdec=use_nvdec,
+    )
+    logger.info("annotated video render: %.1fs -> %s", time.time() - t0, final_video_path)
+
     # --- Stage 6-ext: per-player output -----------------------------------------------------------
     takes_by_id = {t.id: t for t in takes}
     for number in verified_numbers:
@@ -310,8 +377,13 @@ def run_extended_pipeline_for_video(
             possession_seconds,
             distance_result,
             takes_by_id,
-            video_path,
+            # ADR-18 (2): the ANNOTATED video (rendered above), not the raw `video_path` -- every
+            # category highlight clip must show the same red/green boxes + ball marker + live
+            # panel as the primary output (CLAUDE.md §13.4), which cutting from the raw source
+            # would silently fail to do.
+            final_video_path,
             configs["highlights"],
+            goal_result.reason,
         )
         logger.info(
             "player_%d: %d event(s) across %d take(s) -- statcard/highlights written",
@@ -327,24 +399,6 @@ def run_extended_pipeline_for_video(
             len(takes),
             video_path.name,
         )
-
-    # --- §13.1: full-resolution annotated original video -----------------------------------------
-    t0 = time.time()
-    final_video_path = output_dir / "original_annotated_video.mp4"
-    render_full_annotated_video(
-        video_path,
-        work_dir,
-        final_video_path,
-        takes,
-        tracks,
-        balls,
-        identity_by_take,
-        dict(events_by_number),
-        frame_width,
-        frame_height,
-        use_nvdec=use_nvdec,
-    )
-    logger.info("annotated video render: %.1fs -> %s", time.time() - t0, final_video_path)
 
     return {
         "video": str(video_path),

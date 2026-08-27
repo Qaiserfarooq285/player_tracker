@@ -31,21 +31,23 @@ _TIMELINE_EVENT_TYPES = {
     EventType.SHOT: "Shot",
     EventType.TACKLE: "Tackle",
     EventType.GOAL: "Goal",
+    EventType.ASSIST: "Assist",  # ADR-17: real detector now exists (src/events/goals.py) --
+    # previously omitted since EventType.ASSIST didn't exist at all.
     # EventType.KEY_MOMENT splits into "Celebration"/"Other Key Moment" via _key_moment_label —
     # the owner's template distinguishes the two but this project's single Gemini prompt (ADR-14)
     # classifies both together; the split below is a light, honestly-documented text heuristic on
     # Gemini's own reasoning sentence, not a second detector.
 }
 
-# CLAUDE.md §13.4's highlight-reel categories and which EventType feeds each. "assists"/"goals"
-# are included for completeness of the directory layout but their EventType lists are always
-# empty on this project (no ASSIST EventType exists at all -- structurally impossible per ADR-13;
-# GOAL is never emitted, §3.2(3)) -- both therefore ALWAYS come out absent, exactly as CLAUDE.md
-# §13.4 expects ("expect assists.mp4 and goals.mp4 to always be empty on this footage").
+# CLAUDE.md §13.4's highlight-reel categories and which EventType feeds each. "goals"/"assists"
+# are expected to be empty/absent on THIS footage (§3.2(3): no scoreboard anywhere to verify a
+# goal against) -- but that is now a measured data ceiling (ADR-17's own real detector genuinely
+# finds nothing here), not a structural absence of the EventType/detector the way it was before
+# ASSIST existed at all.
 _HIGHLIGHT_CATEGORIES: dict[str, list[EventType]] = {
     "ball_possession": [EventType.POSSESSION],
     "dribbles": [EventType.DRIBBLE],
-    "assists": [],  # no ASSIST EventType exists in this codebase -- see module docstring
+    "assists": [EventType.ASSIST],
     "goals": [EventType.GOAL],
     "key_moments": [EventType.KEY_MOMENT],
 }
@@ -99,11 +101,30 @@ def render_statcard_markdown(
     possession_seconds: float,
     distance_result: dict,
     timeline_rows: list[dict],
+    goal_reason: str | None = None,
 ) -> str:
     """The owner's EXACT `statcard.md` template (CLAUDE.md §13.2, revised 2026-08-27), filled with
-    real computed values. `Goals`/`Assists` are always `not available` on this footage (§3.2(3):
-    no scoreboard anywhere to verify against) — a data ceiling, not a missing feature.
+    real computed values. `Goals`/`Assists` are REAL computed counts (ADR-17) when the scoreboard
+    detector actually found something for this run; otherwise the existing "not available" text,
+    now carrying `goal_reason`'s specific, auditable explanation (Golden Rule 5) instead of a bare
+    unconditional string. `goal_reason` (when unavailable) is `GoalDetectionResult.reason` VERBATIM
+    -- it already reads as a complete "not available (...)" sentence (`src/events/goals.py`), so
+    it is used as-is here rather than re-wrapped in a second "not available (...)" layer. On this
+    project's own footage `goal_reason` measurably explains "not available" every time (§3.2(3):
+    no scoreboard anywhere) -- a data ceiling, not a missing feature.
     """
+    goals_count = counts.get("goal", 0)
+    assists_count = counts.get("assist", 0)
+    goals_line = (
+        f"**Goals:** {goals_count}"
+        if goals_count > 0
+        else f"**Goals:** {goal_reason}" if goal_reason else "**Goals:** not available"
+    )
+    assists_line = (
+        f"**Assists:** {assists_count}"
+        if assists_count > 0
+        else f"**Assists:** {goal_reason}" if goal_reason else "**Assists:** not available"
+    )
     lines = [
         "# Player Statistics",
         "",
@@ -114,8 +135,8 @@ def render_statcard_markdown(
         f"**Touches:** {counts.get('touch', 0)}",
         f"**Passes:** {counts.get('pass', 0)}",
         f"**Sprints/Runs:** {counts.get('sprint', 0)}",
-        "**Goals:** not available",
-        "**Assists:** not available",
+        goals_line,
+        assists_line,
         f"**Shots:** {counts.get('shot', 0)}",
         f"**Tackles:** {counts.get('tackle', 0)}",
         f"**Saves:** {counts.get('save', 0)}",
@@ -182,9 +203,15 @@ def write_player_output(
     takes_by_id: dict[int, Take],
     video_path,
     highlights_cfg: dict,
+    goal_reason: str | None = None,
 ) -> None:
     """Write one verified player's complete `output/<slug>/players/player_<N>/` tree
-    (CLAUDE.md §13.5)."""
+    (CLAUDE.md §13.5). `goal_reason` (ADR-17) is the whole-video
+    `src.events.goals.GoalDetectionResult.reason` -- a per-video property (scoreboard
+    availability), threaded through so `statcard.md`'s Goals/Assists lines carry the SPECIFIC
+    reason (Golden Rule 5) instead of a bare "not available" whenever this player's own counts
+    are genuinely zero.
+    """
     player_dir.mkdir(parents=True, exist_ok=True)
     (player_dir / "events").mkdir(parents=True, exist_ok=True)
     (player_dir / "highlights").mkdir(parents=True, exist_ok=True)
@@ -197,7 +224,7 @@ def write_player_output(
     save_json(timeline_rows, player_dir / "events" / "event_timeline.json")
 
     markdown = render_statcard_markdown(
-        jersey_number, counts, possession_seconds, distance_result, timeline_rows
+        jersey_number, counts, possession_seconds, distance_result, timeline_rows, goal_reason
     )
     (player_dir / "statcard.md").write_text(markdown)
 

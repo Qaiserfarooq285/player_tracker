@@ -15,7 +15,6 @@ import pytest
 from src.common.io import load_yaml
 from src.common.types import BBox, EventType, Track, TrackBox
 from src.events import shots, sprints
-from src.events.goals import check_goal_availability
 from src.events.segments import find_threshold_segments, moving_average
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -259,20 +258,7 @@ def test_shot_confidence_floors_at_min_confidence():
 
 
 # ---------------------------------------------------------------------------
-# goals -- must be an explicit "not available", never guessed (Golden Rule 5)
+# goals/assists (ADR-17) -- real logic now lives in src/events/goals.py, covered by
+# tests/test_goals.py. See that file for the "still explicitly not available on this footage"
+# coverage (Golden Rule 5) plus the new occurrence/attribution/assist unit tests.
 # ---------------------------------------------------------------------------
-
-
-def test_goal_availability_is_explicitly_not_available_on_this_footage():
-    cfg = _events_config()["goal"]
-    result = check_goal_availability(profile=None, goal_cfg=cfg)
-    assert result.available is False
-    assert result.reason.startswith("not available")
-    assert result.events == []
-
-
-def test_detect_goals_scoreboard_delta_is_dead_code():
-    from src.events.goals import detect_goals_scoreboard_delta
-
-    with pytest.raises(NotImplementedError):
-        detect_goals_scoreboard_delta([], [], _events_config()["goal"])

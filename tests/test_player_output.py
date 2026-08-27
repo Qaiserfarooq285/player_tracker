@@ -90,6 +90,41 @@ def test_render_statcard_markdown_uses_exact_template_headers():
     assert "## Event Timeline" in md
 
 
+def test_render_statcard_markdown_shows_real_goal_and_assist_counts_when_present():
+    # ADR-17: real detector found something for THIS run -- must show the real number, not
+    # "not available".
+    md = render_statcard_markdown(
+        jersey_number=10,
+        counts={"goal": 1, "assist": 1},
+        possession_seconds=0.0,
+        distance_result={"distance": 0.0, "unit": "bbox_heights"},
+        timeline_rows=[],
+        goal_reason="1 goal(s) detected via scoreboard-OCR delta (1 with an assist credited)",
+    )
+    assert "**Goals:** 1" in md
+    assert "**Assists:** 1" in md
+    assert "not available" not in md
+
+
+def test_render_statcard_markdown_not_available_carries_the_specific_reason():
+    # ADR-17: the OLD behaviour was a bare, unconditional "not available" -- now it must carry
+    # the specific, auditable reason from GoalDetectionResult.reason (Golden Rule 5).
+    reason = (
+        "not available (no legible scoreboard found by the region-activation scan -- CLAUDE.md "
+        "ADR-17: ...)"
+    )
+    md = render_statcard_markdown(
+        jersey_number=10,
+        counts={},
+        possession_seconds=0.0,
+        distance_result={"distance": 0.0, "unit": "bbox_heights"},
+        timeline_rows=[],
+        goal_reason=reason,
+    )
+    assert f"**Goals:** {reason}" in md
+    assert f"**Assists:** {reason}" in md
+
+
 def test_render_statcard_markdown_never_pads_timeline_to_look_complete():
     md = render_statcard_markdown(
         jersey_number=9,

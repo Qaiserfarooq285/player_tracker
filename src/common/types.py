@@ -202,7 +202,8 @@ class Track(BaseModel):
 class EventType(str, Enum):  # noqa: UP042 -- (str, Enum) is the spec'd contract (CLAUDE.md §4)
     """Kinds of events the pipeline can emit (CLAUDE.md §5, Stage 5; §13.3/ADR-13/ADR-14 add
     SAVE and POSSESSION for the best-effort heuristic layer -- `src/events/{touches,possession,
-    tackles,saves}.py`)."""
+    tackles,saves}.py`; ADR-17 adds ASSIST alongside GOAL for the real scoreboard-OCR-delta
+    detector -- `src/events/goals.py`)."""
 
     GOAL = "goal"
     SHOT = "shot"
@@ -214,6 +215,7 @@ class EventType(str, Enum):  # noqa: UP042 -- (str, Enum) is the spec'd contract
     SAVE = "save"
     POSSESSION = "possession"
     KEY_MOMENT = "key_moment"
+    ASSIST = "assist"
 
 
 class Event(BaseModel):

@@ -86,6 +86,12 @@ class TakeIdentityResult(BaseModel):
     n_vlm_calls: int = 0
     n_vlm_failed: int = 0
     all_reads: list[FrameRead] = []
+    human_override_note: str | None = None  # ADR-18 (1): set whenever a `--target-jersey`
+    # human-confirmed number was supplied for this video and applied (or attempted) on this take
+    # -- always populated (never silently applied) so a human override is as auditable as any
+    # other verification path, including the case where it CONTRADICTS an OCR/VLM majority
+    # (Golden Rule 5: never hide contradicting evidence, even though Golden Rule 4 has the human's
+    # own authority win).
 
 
 class IdentityReport(BaseModel):
@@ -101,20 +107,79 @@ class IdentityReport(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def aggregate_take_identity(reads: list[FrameRead], agg_cfg: dict) -> dict:
-    """Reduce one take's `FrameRead`s to `{jersey_number, status, confidence, evidence_frames}`.
+def aggregate_take_identity(
+    reads: list[FrameRead],
+    agg_cfg: dict,
+    human_confirmed_jersey: int | None = None,
+) -> dict:
+    """Reduce one take's `FrameRead`s to
+    `{jersey_number, status, confidence, evidence_frames, human_override_note}`.
 
-    Requires >= `agg_cfg['min_agreeing_frames']` reads (any mix of OCR/VLM) agreeing on the SAME
-    digit string, with that count STRICTLY the unique maximum among all digit strings seen (a tie
-    for the top count is `"unverified"`, never broken arbitrarily — owner's explicit rule).
-    `confidence` blends how much of the total evidence agrees with the mean confidence of the
-    agreeing reads themselves; a verified result additionally must clear
-    `agg_cfg['min_verified_confidence']`.
+    Normal (no human override) path: requires >= `agg_cfg['min_agreeing_frames']` reads (any mix
+    of OCR/VLM) agreeing on the SAME digit string, with that count STRICTLY the unique maximum
+    among all digit strings seen (a tie for the top count is `"unverified"`, never broken
+    arbitrarily — owner's explicit rule). `confidence` blends how much of the total evidence
+    agrees with the mean confidence of the agreeing reads themselves; a verified result
+    additionally must clear `agg_cfg['min_verified_confidence']`.
+
+    ADR-18 (1) — human-in-the-loop override (CLAUDE.md Golden Rule 4): when
+    `human_confirmed_jersey` is given AND at least one read in `reads` actually matches it, a
+    SINGLE supporting read is enough to verify (a human who watched the actual footage is
+    stronger evidence than an automated multi-frame vote — the normal `min_agreeing_frames` bar
+    does not apply). If the OTHER evidence has a contradicting digit string with STRICTLY MORE
+    supporting reads than the human's own number, the human's number still wins (Golden Rule 4:
+    human authority), but `human_override_note` records the disagreement in full instead of
+    silently accepting it (Golden Rule 5: never hide contradicting evidence). When
+    `human_confirmed_jersey` is given but has ZERO supporting reads in this take, the override
+    cannot manufacture evidence that was never read — it falls back to the normal automated vote
+    below, with a note explaining why.
     """
     by_digits: dict[str, list[FrameRead]] = defaultdict(list)
     for r in reads:
         if r.digits is not None:
             by_digits[r.digits].append(r)
+
+    human_note: str | None = None
+    if human_confirmed_jersey is not None:
+        human_digits = str(human_confirmed_jersey)
+        human_supporting = by_digits.get(human_digits, [])
+        if human_supporting:
+            other_counts = {d: len(v) for d, v in by_digits.items() if d != human_digits}
+            max_other = max(other_counts.values(), default=0)
+            if max_other > len(human_supporting):
+                top_other = max(other_counts, key=lambda d: other_counts[d])
+                human_note = (
+                    f"human-confirmed jersey #{human_confirmed_jersey} ACCEPTED (Golden Rule 4: "
+                    "human authority wins) DESPITE a contradicting OCR/VLM majority -- digit "
+                    f"'{top_other}' had {max_other} supporting read(s) vs "
+                    f"{len(human_supporting)} for '{human_digits}'; flagged here, never hidden "
+                    "(Golden Rule 5)"
+                )
+            else:
+                human_note = (
+                    f"human-confirmed jersey #{human_confirmed_jersey} accepted "
+                    f"({len(human_supporting)} supporting read(s), no contradicting majority)"
+                )
+            confidence = min(
+                1.0,
+                max(
+                    agg_cfg["min_verified_confidence"],
+                    sum(r.confidence for r in human_supporting) / len(human_supporting),
+                ),
+            )
+            return {
+                "jersey_number": human_confirmed_jersey,
+                "status": "verified",
+                "confidence": confidence,
+                "evidence_frames": sorted(r.frame_index for r in human_supporting),
+                "human_override_note": human_note,
+            }
+        human_note = (
+            f"human-confirmed jersey #{human_confirmed_jersey} was given, but this take had ZERO "
+            "supporting OCR/VLM reads for it -- falling back to the normal automated vote below "
+            "(the human override lowers the evidence bar, it never fabricates evidence that was "
+            "never read, Golden Rule 5)"
+        )
 
     if not by_digits:
         return {
@@ -122,6 +187,7 @@ def aggregate_take_identity(reads: list[FrameRead], agg_cfg: dict) -> dict:
             "status": "unverified",
             "confidence": 0.0,
             "evidence_frames": [],
+            "human_override_note": human_note,
         }
 
     max_count = max(len(v) for v in by_digits.values())
@@ -134,6 +200,7 @@ def aggregate_take_identity(reads: list[FrameRead], agg_cfg: dict) -> dict:
             "status": "unverified",
             "confidence": 0.0,
             "evidence_frames": [],
+            "human_override_note": human_note,
         }
 
     digits = top_digits[0]
@@ -148,6 +215,7 @@ def aggregate_take_identity(reads: list[FrameRead], agg_cfg: dict) -> dict:
             "status": "unverified",
             "confidence": confidence,
             "evidence_frames": [],
+            "human_override_note": human_note,
         }
 
     return {
@@ -155,6 +223,7 @@ def aggregate_take_identity(reads: list[FrameRead], agg_cfg: dict) -> dict:
         "status": "verified",
         "confidence": confidence,
         "evidence_frames": sorted(r.frame_index for r in supporting),
+        "human_override_note": human_note,
     }
 
 
@@ -300,9 +369,17 @@ def verify_identities_for_video(
     identity_cfg: dict,
     gemini_api_key: str | None,
     use_nvdec: bool = True,
+    human_confirmed_jersey: int | None = None,
 ) -> IdentityReport:
     """Run Stage 5.5 for one filename-less video end to end. Never invoked when the video HAS a
-    filename jersey number (`src/pipeline/run.py` gates this)."""
+    filename jersey number (`src/pipeline/run.py` gates this).
+
+    `human_confirmed_jersey` (ADR-18 (1), CLAUDE.md Golden Rule 4) is the optional
+    `--target-jersey` CLI override: a human who watched this specific filename-less video and
+    confirmed which number to look for. Threaded straight into `aggregate_take_identity` for
+    every take -- see that function's own docstring for the exact "one supporting read is enough,
+    but a contradicting majority is flagged, never hidden" semantics.
+    """
     video_path = Path(video_path)
     location = select_targets(
         str(video_path),
@@ -401,7 +478,9 @@ def verify_identities_for_video(
                 gemini_api_key,
                 identity_fps_sample,
             )
-            agg = aggregate_take_identity(reads, identity_cfg["aggregation"])
+            agg = aggregate_take_identity(
+                reads, identity_cfg["aggregation"], human_confirmed_jersey
+            )
             logger.info(
                 "take=%d: location=%s(%s) -> identity=%s number=%s conf=%.2f "
                 "(%d crop(s), %d ocr-confident, %d vlm call(s), %d vlm failure(s))",
@@ -426,6 +505,7 @@ def verify_identities_for_video(
                     location_method=sel.method,
                     location_track_ids=sel.track_ids,
                     all_reads=reads,
+                    human_override_note=agg.get("human_override_note"),
                     **counters,
                 )
             )
