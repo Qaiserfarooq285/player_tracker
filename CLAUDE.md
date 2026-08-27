@@ -210,6 +210,7 @@ compute; QA vs ground truth; optional provider-data adapter; active-learning loo
 | MMPose / MMOCR (ViTPose) | Apache-2.0 | ✅ |
 | PARSeq | Apache-2.0 | ✅ |
 | PaddleOCR / EasyOCR | Apache-2.0 | ✅ |
+| `requests` (ADR-15, `src/identity/jersey_vlm.py`'s Gemini HTTP calls) | Apache-2.0 | ✅ |
 | SigLIP weights (via `transformers`/`timm`) | Apache-2.0 | ✅ (verify weight card) |
 | TransNetV2 | MIT | ✅ |
 | TrackEval | MIT | ✅ |

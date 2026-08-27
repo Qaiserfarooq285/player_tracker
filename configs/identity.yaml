@@ -1,0 +1,60 @@
+# Stage 5.5 (ADR-15, CLAUDE.md §3.3/§5.1) — verified jersey-number identification for
+# filename-less input. Only ever runs when `target_jersey is None` (no `clip<N> <jersey>.mp4`
+# filename metadata) — never for the original 5 clips, whose Phase-1 human-selects-the-track flow
+# is untouched (CLAUDE.md §12 Don'ts). This is a narrow, owner-authorized pull-forward of a slice
+# of Phase 2 (jersey OCR) — never guesses a number from appearance/position/team/the arrow alone;
+# a number counts only when read from visible evidence with temporal agreement across multiple
+# independent frames (Golden Rule 5).
+
+crop:
+  # A box shorter than this (in NATIVE decode-resolution pixels — this stage decodes at native
+  # 4K, not Stage 2's downscaled 1920px-wide detect resolution, since legibility needs the
+  # sharpest pixels available, CLAUDE.md task spec) cannot possibly carry a legible 1-2 digit
+  # jersey number. MEASURED 2026-08-27 on this project's own footage (§3.2's "jerseys legible at
+  # 4K for mid/near players... even at 1280px" finding, extrapolated to native 4K): a jersey
+  # number glyph is roughly 12-18% of a player's own bbox height, and EasyOCR's own practical
+  # minimum reliable text height is ~15-20px — so a box needs to be tall enough that ~15% of it
+  # clears ~20px, i.e. at least ~135px tall at native 4K. Set with a small margin below that
+  # (120px) since digits sometimes sit larger within the torso silhouette than the 15% estimate.
+  min_crop_height_px: 120
+  identity_fps_sample: 2 # native-res decode cadence for THIS stage only (a separate budget from
+  # configs/hardware.yaml stages.team.fps_sample=2, which decodes at Stage 2's DOWNSCALED
+  # resolution) — CLAUDE.md §11 "team/jersey: 1-2 fps per tracklet" budget, at the higher end
+  # since native-4K frames are expensive to decode/hold even briefly.
+  torso_crop_expand: 0.08 # expand the candidate track's own bbox by this fraction on each side
+  # before cropping, so a jersey number sitting near the box edge (loose bbox, motion blur) isn't
+  # clipped off.
+
+ocr:
+  engine: easyocr # Apache-2.0 (CLAUDE.md §7), `ocr` extra
+  gpu: true
+  min_easyocr_confidence: 0.4 # EasyOCR's own per-result confidence; below this a read is treated
+  # as "ambiguous" (escalation-eligible to the VLM), never as a confident digit read on its own.
+  max_digits: 2 # a soccer jersey number is 1-2 digits; a 3+ digit "read" is almost certainly OCR
+  # noise (a sponsor logo, a background number/scoreboard-like graphic) and is discarded outright,
+  # never escalated to the VLM as if it were a plausible candidate.
+
+vlm:
+  provider: gemini
+  model: gemini-3.6-flash # CONFIRMED reachable 2026-08-27 — gemini-2.5-flash (ADR-14's implicit
+  # assumption) now 404s for new callers ("no longer available to new users"); see ADR-15.
+  api_url_template: "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+  timeout_s: 30
+  max_retries: 3
+  retry_backoff_base_s: 2.0 # exponential backoff (2s, 4s, 8s) — covers the transient 503
+  # "UNAVAILABLE" measured 2026-08-27 (ADR-15) plus ordinary network hiccups.
+  temperature: 0.0
+  jpeg_quality: 90
+  max_escalations_per_take: 6 # cost/latency control, mirrors ADR-14's own "cheap pre-filter, VLM
+  # only on survivors" pattern: at most this many OCR-ambiguous-or-silent crops per take are ever
+  # sent to Gemini. A take needing more than 6 VLM calls to resolve is ambiguous enough that a 7th
+  # call is unlikely to change the outcome — stays unverified rather than escalating indefinitely.
+
+aggregation:
+  min_agreeing_frames: 2 # ADR-15 / owner's explicit rule: never declare a jersey number
+  # "verified" off a single frame's read. At least this many INDEPENDENT frames (OCR and/or VLM,
+  # any mix of sources) must read the SAME digit string before a take counts as verified.
+  min_verified_confidence: 0.3 # a verified take's OWN computed confidence (agreement fraction *
+  # mean source confidence, see src/identity/verify.py::aggregate_take_identity) must still clear
+  # this floor — a bare 2-agreeing-frames-out-of-40-read-attempts result is technically "temporal
+  # agreement" but not something to present as reliable identification.

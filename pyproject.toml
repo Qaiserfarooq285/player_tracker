@@ -23,6 +23,10 @@ dependencies = [
     "tqdm",
     "python-dotenv",
     "scipy",
+    # src/identity/jersey_vlm.py (ADR-15): plain HTTP POST to the Gemini API for jersey-number
+    # cross-checking. Apache-2.0, already relied on transitively; made an explicit core dep since
+    # it's now load-bearing, not incidental.
+    "requests",
 ]
 
 [project.optional-dependencies]
