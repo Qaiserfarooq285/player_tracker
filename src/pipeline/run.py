@@ -423,6 +423,11 @@ def _load_all_configs() -> dict[str, dict]:
         "team": load_yaml("configs/team.yaml"),
         "events": load_yaml("configs/events.yaml"),
         "highlights": load_yaml("configs/highlights.yaml"),
+        # ADR-15/14: only ever consumed by src.pipeline.extended_output (target_jersey is None
+        # path, CLAUDE.md §3.3) -- loaded here unconditionally too since the original 5 clips'
+        # own run_pipeline_for_video simply never reads these two keys (no behavior change).
+        "identity": load_yaml("configs/identity.yaml"),
+        "key_moments": load_yaml("configs/key_moments.yaml"),
     }
 
 
@@ -478,6 +483,18 @@ def main(
 
     for ref in refs:
         console.rule(f"[bold]{ref.path.name}[/bold]")
+        if ref.target_jersey is None:
+            # ADR-15 (CLAUDE.md §3.3): no filename jersey number -> verified-identity extended
+            # pipeline, never the Phase-1 single-target flow below. Imported lazily so importing
+            # this module (e.g. from tests) never pulls the identity/events-aggregate/annotated-
+            # video stack unless this branch actually runs.
+            from src.pipeline.extended_output import run_extended_pipeline_for_video
+
+            summary = run_extended_pipeline_for_video(
+                ref.path, configs, work_root=work_root, output_root=output_root
+            )
+            console.print(summary)
+            continue
         report = run_pipeline_for_video(
             ref.path,
             configs,

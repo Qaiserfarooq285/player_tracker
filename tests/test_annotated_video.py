@@ -4,7 +4,8 @@ GPU/video I/O."""
 from __future__ import annotations
 
 from src.common.types import Event, EventType
-from src.pipeline.annotated_video import _nearest_by_time, _NumberProgress
+from src.identity.verify import TakeIdentityResult
+from src.pipeline.annotated_video import _nearest_by_time, _NumberProgress, red_box_track_ids
 
 
 def _event(etype: EventType, t: float) -> Event:
@@ -55,3 +56,36 @@ def test_nearest_by_time_outside_tolerance_returns_none():
 
 def test_nearest_by_time_empty_list_returns_none():
     assert _nearest_by_time([], 1.0, tolerance=1.0, key=lambda i: i) is None
+
+
+# ---------------------------------------------------------------------------
+# red_box_track_ids -- the verified-identity render gate (CLAUDE.md §13.1)
+# ---------------------------------------------------------------------------
+
+
+def _identity(
+    status: str, jersey_number: int | None, location_track_ids: list[int]
+) -> TakeIdentityResult:
+    return TakeIdentityResult(
+        take_id=0,
+        jersey_number=jersey_number,
+        status=status,
+        confidence=0.8,
+        evidence_frames=[1, 2],
+        location_method="arrow_vote",
+        location_track_ids=location_track_ids,
+    )
+
+
+def test_red_box_track_ids_verified_take_returns_its_location_ids():
+    identity = _identity("verified", 7, [10, 11, 12])
+    assert red_box_track_ids(identity) == {10, 11, 12}
+
+
+def test_red_box_track_ids_unverified_take_returns_empty_never_a_fallback():
+    identity = _identity("unverified", None, [10, 11])
+    assert red_box_track_ids(identity) == set()
+
+
+def test_red_box_track_ids_none_identity_returns_empty():
+    assert red_box_track_ids(None) == set()

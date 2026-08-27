@@ -94,6 +94,16 @@ def _nearest_by_time(items: list, t: float, tolerance: float, key):
     return items_sorted[best] if abs(keys[best] - t) <= tolerance else None
 
 
+def red_box_track_ids(identity: TakeIdentityResult | None) -> set[int]:
+    """The verified-identity GATE (CLAUDE.md §13.1): which raw track ids get the thick RED "target"
+    box this take. Empty for `None`/an unverified take -- those takes get green boxes for every
+    detected player and nothing else, never a fallback guess. Pure, so the render-time gate itself
+    is unit-testable without decoding a single frame (see `tests/test_annotated_video.py`)."""
+    if identity is None or identity.status != "verified":
+        return set()
+    return set(identity.location_track_ids)
+
+
 class _NumberProgress:
     """Running per-jersey-number event counts as rendering advances through time — a lightweight,
     render-local pointer over that number's own time-sorted events (advances forward only, never
@@ -343,11 +353,7 @@ def render_full_annotated_video(
             )
             identity = identity_by_take.get(take_id) if take_id is not None else None
             take_tracks = tracks_by_take.get(take_id, [])
-            target_ids = (
-                set(identity.location_track_ids)
-                if (identity and identity.status == "verified")
-                else set()
-            )
+            target_ids = red_box_track_ids(identity)
 
             for tr in take_tracks:
                 box = _nearest_by_time(tr.boxes, t, 0.3, key=lambda b: b.t)
