@@ -377,9 +377,16 @@ def render_full_annotated_video(
     video_only_path = work_dir / "debug" / "original_annotated_video_only.mp4"
 
     def frame_generator():
-        for _idx, t, frame in decode_frames(
+        for _idx, t, raw_frame in decode_frames(
             video_path, fps=None, scale_width=None, use_nvdec=use_nvdec
         ):
+            # decode_frames yields frames built via np.frombuffer(chunk, ...) -- a READ-ONLY view
+            # into the ffmpeg pipe's own bytes buffer. Every cv2 draw call below mutates in place,
+            # so this MUST be a writable copy (same convention scripts/overlay_target.py already
+            # follows via its own `annotated = frame.copy()`) or cv2.rectangle raises "img marked
+            # as output argument, but provided NumPy array marked as readonly" (caught for real on
+            # this exact video, CLAUDE.md task spec).
+            frame = raw_frame.copy()
             take_id = assign_take_id(t, takes)
             take = take_by_id.get(take_id) if take_id is not None else None
             identity = identity_by_take.get(take_id) if take_id is not None else None
