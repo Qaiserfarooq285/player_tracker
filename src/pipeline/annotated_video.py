@@ -365,9 +365,16 @@ def render_full_annotated_video(
     # Presort ONCE (see _SortedTimeIndex docstring) -- the naive per-call `_nearest_by_time` would
     # otherwise re-sort ball_detections (~7000 items for a whole 234s video) and every track's own
     # box list on EVERY one of ~7000 rendered native frames.
+    #
+    # ⚠️ Keyed by (take_id, track_id), NOT track_id alone: raw Track.id RESETS per take (Golden
+    # Rule 3), so a flat `{track_id: index}` dict silently collides two different takes' same-
+    # numbered tracks -- whichever is built last in this dict comprehension wins, corrupting the
+    # lookup for nearly every box in every earlier take. Caught for real on this exact video (a
+    # full render produced ZERO green boxes anywhere -- every `.nearest()` call was silently
+    # querying the wrong take's track).
     ball_index = _SortedTimeIndex(ball_detections, key=lambda b: b.t)
-    box_index_by_track: dict[int, _SortedTimeIndex] = {
-        tr.id: _SortedTimeIndex(tr.boxes, key=lambda b: b.t) for tr in tracks
+    box_index_by_track: dict[tuple[int, int], _SortedTimeIndex] = {
+        (tr.take_id, tr.id): _SortedTimeIndex(tr.boxes, key=lambda b: b.t) for tr in tracks
     }
 
     progress_by_number: dict[int, _NumberProgress] = {
@@ -394,7 +401,7 @@ def render_full_annotated_video(
             target_ids = red_box_track_ids(identity)
 
             for tr in take_tracks:
-                box = box_index_by_track[tr.id].nearest(t, 0.3)
+                box = box_index_by_track[(tr.take_id, tr.id)].nearest(t, 0.3)
                 if box is None:
                     continue
                 x1, y1 = box.bbox.x1 * scale_x, box.bbox.y1 * scale_y

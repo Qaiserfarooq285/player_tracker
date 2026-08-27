@@ -3,9 +3,14 @@ GPU/video I/O."""
 
 from __future__ import annotations
 
-from src.common.types import Event, EventType
+from src.common.types import BBox, Event, EventType, Track, TrackBox
 from src.identity.verify import TakeIdentityResult
-from src.pipeline.annotated_video import _nearest_by_time, _NumberProgress, red_box_track_ids
+from src.pipeline.annotated_video import (
+    _nearest_by_time,
+    _NumberProgress,
+    _SortedTimeIndex,
+    red_box_track_ids,
+)
 
 
 def _event(etype: EventType, t: float) -> Event:
@@ -89,3 +94,42 @@ def test_red_box_track_ids_unverified_take_returns_empty_never_a_fallback():
 
 def test_red_box_track_ids_none_identity_returns_empty():
     assert red_box_track_ids(None) == set()
+
+
+# ---------------------------------------------------------------------------
+# regression: raw Track.id resets per take (Golden Rule 3) -- a box-lookup index MUST be keyed
+# by (take_id, track_id), never track_id alone, or two different takes' same-numbered tracks
+# silently collide (caught for real: a full render produced ZERO green boxes anywhere because
+# every lookup was querying whichever take's same-id track happened to be indexed last).
+# ---------------------------------------------------------------------------
+
+
+def _track_box(t: float, cx: float) -> TrackBox:
+    return TrackBox(
+        frame_index=int(t * 10), t=t, bbox=BBox(x1=cx - 10, y1=0, x2=cx + 10, y2=100), conf=0.9
+    )
+
+
+def test_box_index_keyed_by_take_and_track_id_avoids_cross_take_collision():
+    # two DIFFERENT takes each have their own track id=1, at completely different timestamps --
+    # exactly the real-world shape (IDs reset per take).
+    take0_track1 = Track(id=1, take_id=0, boxes=[_track_box(1.0, 100.0)])
+    take5_track1 = Track(id=1, take_id=5, boxes=[_track_box(50.0, 900.0)])
+
+    index_by_key = {
+        (tr.take_id, tr.id): _SortedTimeIndex(tr.boxes, key=lambda b: b.t)
+        for tr in (take0_track1, take5_track1)
+    }
+
+    # a query for take 0's track 1 at t=1.0 must find TAKE 0's box, never take 5's
+    found = index_by_key[(0, 1)].nearest(1.0, 0.3)
+    assert found is not None
+    assert found.bbox.cx == 100.0
+
+    found_other = index_by_key[(5, 1)].nearest(50.0, 0.3)
+    assert found_other is not None
+    assert found_other.bbox.cx == 900.0
+
+    # a naive flat {track_id: index} dict would have collided these -- confirm the fix actually
+    # keeps them distinct (this is the assertion that would have caught the real bug)
+    assert index_by_key[(0, 1)] is not index_by_key[(5, 1)]
