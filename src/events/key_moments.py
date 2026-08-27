@@ -135,7 +135,7 @@ def classify_candidate_windows(
             logger.warning("key_moments: could not decode a frame near t=%.2f, skipping", mid_t)
             continue
 
-        text, error = call_gemini_vision(_PROMPT, frame, gemini_api_key, vlm_cfg)
+        text, error, model_used = call_gemini_vision(_PROMPT, frame, gemini_api_key, vlm_cfg)
         if error is not None:
             logger.warning("key_moments: gemini call failed at t=%.2f: %s", mid_t, error)
             continue
@@ -157,7 +157,7 @@ def classify_candidate_windows(
                     "peak_speed": peak_speed,
                     "unit": "bbox_heights_per_second",
                     "calibrated": False,
-                    "gemini_raw_response": raw,
+                    "gemini_raw_response": f"[model={model_used}] {raw}",
                     "classified_frame_t": mid_t,
                 },
             )

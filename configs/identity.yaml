@@ -36,8 +36,23 @@ ocr:
 
 vlm:
   provider: gemini
-  model: gemini-3.6-flash # CONFIRMED reachable 2026-08-27 — gemini-2.5-flash (ADR-14's implicit
-  # assumption) now 404s for new callers ("no longer available to new users"); see ADR-15.
+  # ⚠️ ORDERED FALLBACK LIST (added 2026-08-27, ADR-15), not a single model: `gemini-3.6-flash`
+  # (ADR-15's original choice, since gemini-2.5-flash 404s "no longer available to new users")
+  # turned out to carry a hard 20-REQUESTS-PER-DAY free-tier quota
+  # (quotaId="GenerateRequestsPerDayPerProjectPerModel-FreeTier") -- confirmed by direct API probe
+  # after a real run exhausted it partway through take 6 of 14, silently turning every later
+  # take's identity check into a false "unverified" (the crops were never actually looked at).
+  # `gemini-flash-lite-latest` and `gemini-3.1-flash-lite` were confirmed reachable with separate,
+  # unexhausted quota on the same key/day; `gemini-2.5-flash-lite`/`gemini-2.5-pro` are 404
+  # ("no longer available to new users"); `gemini-pro-latest` was ALSO exhausted. Tried in order;
+  # `src/common/gemini.py::call_gemini_vision` moves to the next model on a 429 whose body's
+  # `error.status` is `RESOURCE_EXHAUSTED` (daily quota -- retrying the same model is pointless
+  # until it resets) or any non-retryable HTTP error, and still retries-with-backoff on the SAME
+  # model for a transient 429/5xx first.
+  models:
+    - gemini-flash-lite-latest
+    - gemini-3.1-flash-lite
+    - gemini-3.6-flash
   api_url_template: "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
   timeout_s: 30
   max_retries: 3

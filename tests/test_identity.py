@@ -183,7 +183,7 @@ def test_parse_response_unparseable_is_tagged_call_failed():
 
 VLM_CFG = {
     "api_url_template": "https://example.invalid/{model}:generateContent",
-    "model": "gemini-3.6-flash",
+    "models": ["model-a", "model-b"],
     "timeout_s": 5,
     "max_retries": 3,
     "retry_backoff_base_s": 0.0,  # no real sleeping in tests
@@ -192,22 +192,32 @@ VLM_CFG = {
 }
 
 
+def _ok_response(text: str) -> MagicMock:
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {"candidates": [{"content": {"parts": [{"text": text}]}}]}
+    return resp
+
+
+def _quota_exhausted_response() -> MagicMock:
+    resp = MagicMock(status_code=429, text='{"error": {"status": "RESOURCE_EXHAUSTED"}}')
+    resp.json.return_value = {"error": {"status": "RESOURCE_EXHAUSTED", "code": 429}}
+    return resp
+
+
 def test_classify_jersey_number_retries_then_succeeds():
     import numpy as np
 
     crop = np.zeros((50, 50, 3), dtype=np.uint8)
-    ok_response = MagicMock(status_code=200)
-    ok_response.json.return_value = {
-        "candidates": [{"content": {"parts": [{"text": "NUMBER=9; visible"}]}}]
-    }
+    ok_response = _ok_response("NUMBER=9; visible")
     fail_response = MagicMock(status_code=503, text="temporarily unavailable")
 
     with patch("src.common.gemini.requests.post", side_effect=[fail_response, ok_response]):
         digits, conf, raw = classify_jersey_number(crop, "fake-key", VLM_CFG)
     assert digits == "9"
+    assert "[model=model-a]" in raw  # succeeded on the FIRST model after one retry
 
 
-def test_classify_jersey_number_exhausts_retries_and_reports_call_failed():
+def test_classify_jersey_number_exhausts_all_models_and_reports_call_failed():
     import numpy as np
 
     crop = np.zeros((50, 50, 3), dtype=np.uint8)
@@ -220,7 +230,7 @@ def test_classify_jersey_number_exhausts_retries_and_reports_call_failed():
     assert raw.startswith("CALL_FAILED")
 
 
-def test_classify_jersey_number_non_retryable_error_fails_fast():
+def test_classify_jersey_number_non_retryable_error_advances_to_next_model():
     import numpy as np
 
     crop = np.zeros((50, 50, 3), dtype=np.uint8)
@@ -230,4 +240,40 @@ def test_classify_jersey_number_non_retryable_error_fails_fast():
         digits, conf, raw = classify_jersey_number(crop, "fake-key", VLM_CFG)
     assert digits is None
     assert raw.startswith("CALL_FAILED")
-    mock_post.assert_called_once()  # never retried a non-retryable 401
+    # ONE call per model (never retried a non-retryable 401 on the SAME model), not one total
+    assert mock_post.call_count == len(VLM_CFG["models"])
+
+
+def test_classify_jersey_number_daily_quota_exhausted_falls_back_to_next_model():
+    """The exact scenario a real run hit 2026-08-27: model-a's daily quota is gone (429
+    RESOURCE_EXHAUSTED) -- must NOT retry model-a (no point until tomorrow), must fall back to
+    model-b immediately, and model-b's real answer must be trusted, not discarded."""
+    import numpy as np
+
+    crop = np.zeros((50, 50, 3), dtype=np.uint8)
+    quota_response = _quota_exhausted_response()
+    ok_response = _ok_response("NUMBER=14; clearly visible")
+
+    with patch(
+        "src.common.gemini.requests.post", side_effect=[quota_response, ok_response]
+    ) as mock_post:
+        digits, conf, raw = classify_jersey_number(crop, "fake-key", VLM_CFG)
+    assert digits == "14"
+    assert "[model=model-b]" in raw
+    # exactly 2 calls: ONE attempt on model-a (no retry burned on a quota exhaustion), then
+    # model-b succeeds on its first try
+    assert mock_post.call_count == 2
+
+
+def test_classify_jersey_number_all_models_quota_exhausted_is_call_failed_never_fabricated():
+    import numpy as np
+
+    crop = np.zeros((50, 50, 3), dtype=np.uint8)
+    with patch(
+        "src.common.gemini.requests.post", return_value=_quota_exhausted_response()
+    ) as mock_post:
+        digits, conf, raw = classify_jersey_number(crop, "fake-key", VLM_CFG)
+    assert digits is None
+    assert conf == 0.0
+    assert raw.startswith("CALL_FAILED")
+    assert mock_post.call_count == len(VLM_CFG["models"])  # one attempt per model, no retries

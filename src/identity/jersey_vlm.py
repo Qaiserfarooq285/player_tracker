@@ -70,13 +70,15 @@ def classify_jersey_number(
     """Ask Gemini to read the jersey number in `crop_bgr`.
 
     Returns `(digits_or_None, confidence, raw_response)`. `raw_response` is prefixed
-    `"CALL_FAILED:"` whenever the call never produced a usable answer (every retry exhausted, a
-    non-retryable HTTP error, a JPEG-encode failure, or an unparseable response) — the caller
-    (`src/identity/verify.py`) must check for this prefix and log/count it DISTINCTLY from a
-    genuine `NUMBER=UNKNOWN` abstention (CLAUDE.md task spec: "never treat a failed call as 'no
-    digit visible'").
+    `"CALL_FAILED:"` whenever the call never produced a usable answer (every model in
+    `vlm_cfg["models"]` exhausted, a non-retryable HTTP error, a JPEG-encode failure, or an
+    unparseable response) — the caller (`src/identity/verify.py`) must check for this prefix and
+    log/count it DISTINCTLY from a genuine `NUMBER=UNKNOWN` abstention (CLAUDE.md task spec:
+    "never treat a failed call as 'no digit visible'"). On success `raw_response` is prefixed
+    `"[model=<name>] "` recording which model in the fallback list actually answered.
     """
-    text, error = call_gemini_vision(_PROMPT, crop_bgr, api_key, vlm_cfg)
+    text, error, model_used = call_gemini_vision(_PROMPT, crop_bgr, api_key, vlm_cfg)
     if error is not None:
         return None, 0.0, f"CALL_FAILED: {error}"
-    return _parse_response(text or "")
+    digits, confidence, raw = _parse_response(text or "")
+    return digits, confidence, f"[model={model_used}] {raw}"
