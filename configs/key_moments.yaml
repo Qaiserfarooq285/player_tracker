@@ -1,0 +1,45 @@
+# ADR-14 (CLAUDE.md §13.3 "Celebration, Other key moment" row) — cheap motion pre-filter +
+# Gemini classification of surviving candidate windows only. Golden Rule 1: Gemini never touches
+# player/ball detection, which stays RF-DETR; it is ONE MORE specialized stage, gated behind a
+# cheap local pre-filter for cost control (never runs on every frame).
+#
+# Honest scope note: there is no dedicated "celebration" visual signature this project can detect
+# from bbox-only tracking at this camera distance (§3.2: players are 60-450px tall, no pose
+# model). The pre-filter below is deliberately WEAK/CHEAP — a burst of elevated, erratic motion in
+# the verified target's own track that ISN'T already explained by a counted sprint/dribble/
+# possession event — its only job is to bound how many (expensive) Gemini calls happen; Gemini
+# itself is the actual classifier, and MUST be free to say "no" on the great majority of windows
+# this pre-filter proposes (Golden Rule 5 — a low pre-filter precision is fine, a low classifier
+# precision would not be, so no candidate window is ever counted as a KEY_MOMENT without a
+# Gemini "yes").
+
+prefilter:
+  smoothing_window_frames: 5 # identical value/reasoning to configs/events.yaml sprint's own
+  # window -- same underlying track_speed_series signal (src/events/sprints.py), reused not
+  # reimplemented.
+  speed_threshold: 1.0 # bbox-heights/second -- reuses sprint.sprint_speed_threshold's own
+  # measured justification verbatim (CLAUDE.md task: "notably faster than typical movement, not
+  # exceptional" on this project's measured speed distribution). A celebratory burst (running to
+  # the corner flag, jumping, arm-raising motion of the tracked bbox) is at minimum this fast;
+  # so is an ordinary sprint, which is exactly why every window overlapping an ALREADY-counted
+  # sprint/dribble/possession event is excluded below -- this pre-filter is only looking for
+  # elevated motion the rest of the pipeline did NOT already explain.
+  min_duration_s: 0.5 # shorter than sprint's 1.0s -- a celebration burst (jump, quick turn) can
+  # be briefer than a sustained running sprint and still be worth a Gemini look.
+  merge_gap_s: 0.5 # identical reasoning to configs/events.yaml sprint.sprint_merge_gap_s.
+  max_candidates_per_take: 6 # cost control (mirrors identity.yaml vlm.max_escalations_per_take):
+  # at most this many candidate windows per take are ever proposed to Gemini, ranked by peak
+  # speed (the pre-filter's own strongest signal) when more than this many segments qualify.
+
+vlm:
+  provider: gemini
+  model: gemini-3.6-flash # see src/identity/jersey_vlm.py module docstring (ADR-15) for why.
+  api_url_template: "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+  timeout_s: 30
+  max_retries: 3
+  retry_backoff_base_s: 2.0
+  temperature: 0.0
+  jpeg_quality: 90
+  min_confidence: 0.2 # a "yes" from Gemini below this (see src/events/key_moments.py's fixed
+  # confidence bands) is dropped rather than emitted -- mirrors every other ADR-13/14 category's
+  # own min_emit-style floor (CLAUDE.md Golden Rule 5).

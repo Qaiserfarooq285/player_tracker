@@ -202,7 +202,7 @@ def test_classify_jersey_number_retries_then_succeeds():
     }
     fail_response = MagicMock(status_code=503, text="temporarily unavailable")
 
-    with patch("src.identity.jersey_vlm.requests.post", side_effect=[fail_response, ok_response]):
+    with patch("src.common.gemini.requests.post", side_effect=[fail_response, ok_response]):
         digits, conf, raw = classify_jersey_number(crop, "fake-key", VLM_CFG)
     assert digits == "9"
 
@@ -213,7 +213,7 @@ def test_classify_jersey_number_exhausts_retries_and_reports_call_failed():
     crop = np.zeros((50, 50, 3), dtype=np.uint8)
     fail_response = MagicMock(status_code=503, text="still unavailable")
 
-    with patch("src.identity.jersey_vlm.requests.post", return_value=fail_response):
+    with patch("src.common.gemini.requests.post", return_value=fail_response):
         digits, conf, raw = classify_jersey_number(crop, "fake-key", VLM_CFG)
     assert digits is None
     assert conf == 0.0
@@ -226,7 +226,7 @@ def test_classify_jersey_number_non_retryable_error_fails_fast():
     crop = np.zeros((50, 50, 3), dtype=np.uint8)
     bad_key_response = MagicMock(status_code=401, text="invalid api key")
 
-    with patch("src.identity.jersey_vlm.requests.post", return_value=bad_key_response) as mock_post:
+    with patch("src.common.gemini.requests.post", return_value=bad_key_response) as mock_post:
         digits, conf, raw = classify_jersey_number(crop, "fake-key", VLM_CFG)
     assert digits is None
     assert raw.startswith("CALL_FAILED")
