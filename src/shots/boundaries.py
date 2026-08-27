@@ -59,6 +59,17 @@ def takes_from_cut_frames(cut_frames: list[int], n_frames: int, fps: float) -> l
     return takes
 
 
+def resolve_scenedetect_threshold(sd_cfg: dict, slug: str) -> float:
+    """ADR-16: the `ContentDetector` threshold to use for one video, by its `work_dir_for()` slug.
+
+    A per-video entry in `sd_cfg["overrides"]` (keyed by slug) wins over `sd_cfg["threshold"]`
+    when present; every video without an entry (the original 5 `clip<N> <jersey>.mp4` clips as of
+    this writing) falls back to the global default unchanged. Pure/config-only so it's unit
+    testable without touching a real video file — see `tests/test_shots.py`.
+    """
+    return sd_cfg.get("overrides", {}).get(slug, sd_cfg["threshold"])
+
+
 def detect_takes(
     video_path: str | Path,
     shots_config: dict,
@@ -79,11 +90,25 @@ def detect_takes(
     meta = probe(video_path)
     fps = meta["fps"]
 
+    # ADR-16: a per-video override wins over the global default when the video's own slug (the
+    # same one work_dir_for() uses for work/output dirs) is present in `overrides` — absent for
+    # every one of the original 5 clips, so their behaviour is provably unchanged.
+    slug = work_dir.name
+    threshold = resolve_scenedetect_threshold(sd_cfg, slug)
+    if slug in sd_cfg.get("overrides", {}):
+        logger.info(
+            "shots: using per-video threshold override for slug=%s: %.1f (global default %.1f)",
+            slug,
+            threshold,
+            sd_cfg["threshold"],
+        )
+
     cache_config = {
         "video": str(video_path),
         "video_size": video_path.stat().st_size,
         "video_mtime": video_path.stat().st_mtime,
         **sd_cfg,
+        "resolved_threshold": threshold,
     }
     cache = StageCache(takes_path, cache_config, stage="shots.boundaries")
     if cache.hit():
@@ -92,7 +117,7 @@ def detect_takes(
     nvdec_ok = use_nvdec and _nvdec_supported(video_path)
 
     detector = ContentDetector(
-        threshold=sd_cfg["threshold"],
+        threshold=threshold,
         min_scene_len=sd_cfg["min_scene_len_frames"],
     )
     cut_events: list[FrameTimecode] = []

@@ -28,6 +28,20 @@ scenedetect:
   # predetermined cut *count* — see the profiler's docstring/report for the full investigation.
   threshold: 38.0
   min_scene_len_frames: 15 # ignore cuts shorter than this many frames (debounces flash/graphic cuts)
+  #
+  # ADR-16 (CLAUDE.md §5.1): a single fixed threshold does not generalize across a heterogeneous
+  # multi-match compilation. `Jordan Thomas Highlight Video.mp4` (§3.3) has real cuts scoring as
+  # low as ~21-27 (stable 13-cut set across thresholds 21.0/24.0/27.0), while clip4's three
+  # CONFIRMED FALSE-POSITIVE foreground-crossings (ADR-7) score up to 32.0 — no single global
+  # threshold keeps clip4's false positives out AND catches this video's real cuts. `overrides` is
+  # keyed by the exact slug `src.common.io.work_dir_for()` produces for the video's filename stem
+  # (lowercased, non-alphanumerics -> `_`); `detect_takes()` looks itself up here FIRST and falls
+  # back to `threshold` above when the slug isn't present, so the original 5 clips (no entry here)
+  # are provably unaffected. `jordan_thomas_highlight_video: 24.0` was verified by eyeballing a
+  # before/after contact-sheet frame pair at each of the 13 measured cut timestamps (same
+  # discipline ADR-7 used) before being locked in here.
+  overrides:
+    jordan_thomas_highlight_video: 24.0
 
 replay:
   # Broadcast-gated (profile == "broadcast" only, ADR-7). Heuristic replay/close-up flags;

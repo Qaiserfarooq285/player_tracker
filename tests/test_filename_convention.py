@@ -65,13 +65,26 @@ def test_target_jersey_default_is_null():
 
 def test_input_clips_present_and_match(pattern: re.Pattern):
     """Sanity-check the actual files in input/, if present (input/ is gitignored so this is
-    best-effort in environments where it's empty)."""
+    best-effort in environments where it's empty).
+
+    CLAUDE.md §3.3/ADR-15: as of `Jordan Thomas Highlight Video.mp4` (a deliberate filename-less
+    input, owner-authorized 2026-08-27), NOT every file in input/ is required to match the
+    `clip<N> <jersey>` convention any more — `find_videos`/`parse_filename` (src/ingest/discovery)
+    already handle a non-match by returning `target_jersey=None` rather than erroring. This test
+    therefore only requires the ORIGINAL 5 `clip<N> <jersey>.mp4` files (still expected to match,
+    unaffected by ADR-15) to match; any other filename found is logged, not asserted on, so this
+    stays a real sanity check without re-imposing a convention ADR-15 explicitly lifted.
+    """
     input_dir = REPO_ROOT / "input"
     if not input_dir.is_dir():
         pytest.skip("input/ not present in this environment")
     videos = [p for p in input_dir.iterdir() if p.suffix.lower() in {".mp4", ".mkv", ".mov"}]
     if not videos:
         pytest.skip("no video files in input/ in this environment")
-    for video in videos:
+    clip_convention_videos = [v for v in videos if re.match(r"^clip\d+ ", v.stem)]
+    for video in clip_convention_videos:
         match = pattern.match(video.stem)
         assert match is not None, f"input file {video.name!r} does not match the convention"
+    non_matching = [v.name for v in videos if pattern.match(v.stem) is None]
+    if non_matching:
+        print(f"input/ contains {len(non_matching)} filename-less (ADR-15) video(s): {non_matching}")
