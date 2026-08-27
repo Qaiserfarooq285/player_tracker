@@ -80,8 +80,10 @@ _PANEL_LABELS = {
 
 def _nearest_by_time(items: list, t: float, tolerance: float, key):
     """Bisect-based nearest-in-time lookup (identical technique to
-    `scripts/overlay_target.py::_nearest`) — O(log n) per call instead of a linear scan, needed
-    here since this runs once per track per rendered frame across a ~7000-frame video."""
+    `scripts/overlay_target.py::_nearest`) — O(log n) per call instead of a linear scan. Kept for
+    one-off lookups and its existing unit tests; the render hot loop below uses
+    `_SortedTimeIndex` instead, which sorts ONCE rather than on every one of ~7000 frame queries.
+    """
     if not items:
         return None
     items_sorted = sorted(items, key=key)
@@ -92,6 +94,30 @@ def _nearest_by_time(items: list, t: float, tolerance: float, key):
         return None
     best = min(candidates, key=lambda i: abs(keys[i] - t))
     return items_sorted[best] if abs(keys[best] - t) <= tolerance else None
+
+
+class _SortedTimeIndex:
+    """Presorted-once nearest-in-time index — the SAME lookup as `_nearest_by_time`, but sorting
+    happens once at construction instead of on every query. Matters here because the render loop
+    below queries `ball_detections` (~7000 items for a whole 234s video) and every track's own box
+    list once PER RENDERED FRAME (~7000 native frames) — re-sorting on every call, as a naive
+    `_nearest_by_time(items, ...)` would, turns an O(log n) lookup into an O(n log n) one repeated
+    thousands of times over, which measurably dominates render time at this frame count.
+    """
+
+    def __init__(self, items: list, key) -> None:
+        self._items = sorted(items, key=key)
+        self._keys = [key(it) for it in self._items]
+
+    def nearest(self, t: float, tolerance: float):
+        if not self._items:
+            return None
+        pos = bisect_left(self._keys, t)
+        candidates = [i for i in (pos - 1, pos) if 0 <= i < len(self._items)]
+        if not candidates:
+            return None
+        best = min(candidates, key=lambda i: abs(self._keys[i] - t))
+        return self._items[best] if abs(self._keys[best] - t) <= tolerance else None
 
 
 def red_box_track_ids(identity: TakeIdentityResult | None) -> set[int]:
@@ -334,6 +360,15 @@ def render_full_annotated_video(
     tracks_by_take: dict[int, list[Track]] = {}
     for tr in tracks:
         tracks_by_take.setdefault(tr.take_id, []).append(tr)
+    take_by_id = {tk.id: tk for tk in takes}
+
+    # Presort ONCE (see _SortedTimeIndex docstring) -- the naive per-call `_nearest_by_time` would
+    # otherwise re-sort ball_detections (~7000 items for a whole 234s video) and every track's own
+    # box list on EVERY one of ~7000 rendered native frames.
+    ball_index = _SortedTimeIndex(ball_detections, key=lambda b: b.t)
+    box_index_by_track: dict[int, _SortedTimeIndex] = {
+        tr.id: _SortedTimeIndex(tr.boxes, key=lambda b: b.t) for tr in tracks
+    }
 
     progress_by_number: dict[int, _NumberProgress] = {
         number: _NumberProgress(events) for number, events in events_by_number.items()
@@ -346,17 +381,13 @@ def render_full_annotated_video(
             video_path, fps=None, scale_width=None, use_nvdec=use_nvdec
         ):
             take_id = assign_take_id(t, takes)
-            take = (
-                next((tk for tk in takes if tk.id == take_id), None)
-                if take_id is not None
-                else None
-            )
+            take = take_by_id.get(take_id) if take_id is not None else None
             identity = identity_by_take.get(take_id) if take_id is not None else None
             take_tracks = tracks_by_take.get(take_id, [])
             target_ids = red_box_track_ids(identity)
 
             for tr in take_tracks:
-                box = _nearest_by_time(tr.boxes, t, 0.3, key=lambda b: b.t)
+                box = box_index_by_track[tr.id].nearest(t, 0.3)
                 if box is None:
                     continue
                 x1, y1 = box.bbox.x1 * scale_x, box.bbox.y1 * scale_y
@@ -388,7 +419,7 @@ def render_full_annotated_video(
                         _LABEL_THICKNESS_OTHER,
                     )
 
-            ball = _nearest_by_time(ball_detections, t, 0.2, key=lambda b: b.t)
+            ball = ball_index.nearest(t, 0.2)
             if ball is not None:
                 scaled_bbox = ball.bbox.model_copy(
                     update={
