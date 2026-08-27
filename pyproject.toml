@@ -49,6 +49,12 @@ team = [
 ocr = [
     "easyocr",
 ]
+# scripts/download_soccernet.py: pulls one labeled SoccerNet broadcast clip for eval/testing
+# (CLAUDE.md §9.1/§7). MIT-licensed package; the underlying *video data* is NDA-gated/research-
+# education-only regardless of this package's own license -- see the script's docstring.
+soccernet = [
+    "SoccerNet",
+]
 # Thin API serving the pipeline to apps/web.
 api = [
     "fastapi",

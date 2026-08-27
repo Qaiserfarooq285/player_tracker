@@ -145,6 +145,29 @@ official throughout and an "IDENTITY: unverified in this segment" panel + CUT ba
 exactly the honest, non-forced outcome CLAUDE.md's own accuracy rule requires when the evidence doesn't
 support a claim, not a build failure.
 
+### 3.4 Third input (pending): a SoccerNet broadcast clip, to isolate "does jersey OCR/VLM work at all
+on clear footage" from "this specific amateur footage has no legible numbers" (added 2026-08-27)
+
+§3.3's 0/14 result is well-evidenced, but it's a compound answer: it doesn't separate "the ADR-15
+verification *method* doesn't work" from "this *footage* (small/blurry/side-on players, wide fixed amateur
+camera) genuinely has nothing to read." Owner asked (2026-08-27) to test on **clear** footage to isolate
+which. Professional broadcast (SoccerNet) is the obvious control: tight camera work, players fill much more
+of the frame, HD. **Blocked on the owner completing SoccerNet's NDA form** (soccer-net.org — a Google Form
+tied to the requester's own identity, not something this pipeline can submit on their behalf); `.env`'s
+`SOCCERNET_PASSWORD` is empty until then. `scripts/download_soccernet.py` is built and ready (see §8) —
+listing available match names needs no password (the game-list JSON ships inside the `SoccerNet` pip
+package itself), only the actual video download does. Default target picked and verified real via that
+listing: `england_epl/2016-2017/2016-09-24 - 14-30 Manchester United 4 - 1 Leicester`, `1_720p.mkv`,
+trimmed to the first 5 minutes by default (§6's "validate on a short clip first," not a 45-minute half).
+
+**Important scope note, not yet resolved:** SoccerNet broadcast video carries no burned-in arrow (that
+graphic is specific to the owner's own Veo exports, §3.2 consequence 1) and this clip's filename won't carry
+a jersey number either (same filename-less path as §3.3, ADR-15 applies) — so there is no "the target
+player" for this clip, only "whichever track `heuristic_fallback_seed` locks onto." That's fine for
+answering the narrow legibility question this test exists to answer, but it means this run is a capability
+check on the OCR/VLM stage, not a meaningful end-to-end "did we correctly identify a named player" run —
+don't over-read a verified number here as validating the *selection* heuristic, only the *reading* one.
+
 ## 4. Data contracts (`src/common/types.py`, pydantic)
 Stages compose through these; intermediate artifacts cache to disk (parquet/JSON + video) so stages run independently.
 - `Frame(index, t, path)`
@@ -226,6 +249,7 @@ compute; QA vs ground truth; optional provider-data adapter; active-learning loo
 | PARSeq | Apache-2.0 | ✅ |
 | PaddleOCR / EasyOCR | Apache-2.0 | ✅ |
 | `requests` (ADR-15, `src/identity/jersey_vlm.py`'s Gemini HTTP calls) | Apache-2.0 | ✅ |
+| `SoccerNet` (pip package, `scripts/download_soccernet.py`) | MIT | ✅ package code only — the video *data* it downloads is the separate, NDA-gated row below |
 | SigLIP weights (via `transformers`/`timm`) | Apache-2.0 | ✅ (verify weight card) |
 | TransNetV2 | MIT | ✅ |
 | TrackEval | MIT | ✅ |
@@ -247,7 +271,10 @@ make run       # process the video in input/ → reel + stat card + report in ou
 make eval      # detection mAP + tracking HOTA (+ action mAP@1 later) on data/eval/
 make test      # unit tests (contracts, ranking, dedupe, speed calc)
 make lint      # ruff + black
-scripts/download_soccernet.py   # pulls SoccerNet subsets (needs NDA password in .env)
+scripts/download_soccernet.py   # --list (no password needed) or pulls one broadcast clip into
+                                 # input/ (needs SOCCERNET_PASSWORD in .env, from the NDA form at
+                                 # soccer-net.org) -- used 2026-08-27 to get a clear-broadcast test
+                                 # case for ADR-15's jersey-verification pipeline, see §3.4
 scripts/pull_roboflow.py        # pulls datasets + pretrained soccer weights (needs ROBOFLOW_API_KEY)
 scripts/prepare_eval.py         # ingest labeled slices into data/eval/
 ```
