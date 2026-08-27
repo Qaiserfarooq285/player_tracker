@@ -124,8 +124,8 @@ in the filename or run config). **Measured 2026-08-27:**
 | | |
 |---|---|
 | Resolution / fps / duration | 3840×2160, 30 fps, 234.16 s, audio AAC 44.1 kHz stereo |
-| Structure | title card (~0–17 s) → **8 camera takes across what look like several different matches/venues** (night turf, a stadium with an American-football-lined field, multiple day grass fields with different kits/lighting) → outro card |
-| Cuts (`ContentDetector`, `downscale_width=640`) | **threshold-dependent, unlike clip4.** 21.0/24.0/27.0 all agree on the same **13-cut** set: t≈3.7, 25.9, 43.0, 60.4, 78.0, 90.2, 105.3, 124.9, 169.2, 180.0, 198.0, 215.1, 229.0. The existing global `configs/shots.yaml` threshold (**38.0**, tuned on clip4 — ADR-7) only finds **7** of these — see **ADR-16**. |
+| Structure | title card (~0–3.7 s) → **14 camera takes across what look like several different matches/venues** (night turf under floodlights, a stadium with an American-football-lined field, several day grass fields with different kits/lighting/crowd size) → outro "Thank You For Watching" card (~229–234 s) |
+| Cuts (`ContentDetector`, `downscale_width=640`) | **threshold-dependent, unlike clip4.** 21.0/24.0/27.0 all agree on the same **13-cut** set: t≈3.7, 25.9, 43.0, 60.4, 78.0, 90.2, 105.3, 124.9, 169.2, 180.0, 198.0, 215.1, 229.0 ⇒ **14 takes**. The existing global `configs/shots.yaml` threshold (**38.0**, tuned on clip4 — ADR-7) only finds **7** of these ⇒ would wrongly report 8 takes. **All 13 confirmed real** by eyeballing a before/after frame pair at each timestamp (same discipline as ADR-7): every one shows a genuinely distinct venue/lighting/kit change or the intro/outro card boundary — none is a within-take pan/zoom false positive. `configs/shots.yaml` now carries `jordan_thomas_highlight_video: 24.0` as a per-video override — see **ADR-16**. |
 | Burned-in red arrow | present intermittently (measured via the existing `find_arrow`, `configs/detect.yaml` thresholds, 2 fps scan): **107 accepted hits** clustered in short bursts inside several takes (~t=30–33, 38–42, 47–49, 64–66, 79–82, 92–95, 107–109, 131–134, 152–155, 170–173, 182–190), not just the "opening seconds of one take" pattern seen on clip2/clip4. Same masking pipeline, no code change needed — it already generalises. |
 | Jersey number | **not given anywhere in run metadata.** The intro title card (t≈1 s) *does* show a crisp, unambiguous **"22"** on a club jersey (crest reads "…SOCCER, SINCE 1988") — but that is a **promo photo, not in-game footage**, and the contact-sheet survey (42 frames @ 1-per-6s) shows the player wearing visibly **different kits/colours across different takes** (this is a highlight reel stitched from multiple matches, the same pattern as clip4's 4-venue compilation but more extreme — 8+ segments). The "22" from the title card is logged as **contextual evidence only**; it is **not** auto-applied to any in-game take. See ADR-15. |
 
@@ -161,7 +161,7 @@ Anything here overrides the brief's default suggestion. Add a row whenever a rec
 
 | # | Decision | Why | Status |
 |---|---|---|---|
-| ADR-16 | **Cut detection: fixed-threshold `ContentDetector` does not generalize across a heterogeneous multi-match compilation; per-take identity now depends on getting this right** | §3.3 measured that `Jordan Thomas Highlight Video.mp4`'s real cuts sit at content-value scores as low as ~21–27, while clip4's three confirmed **false**-positive foreground-crossings score up to 32.0 (ADR-7). No single fixed threshold can keep clip4's false positives out *and* catch this new video's real cuts — 38.0 (clip4's tuned value) misses 6 of 13 real cuts here; lowering the global default to clip4's false-positive ceiling would corrupt clip4. This now matters more than it used to: ADR-15's per-take jersey verification is only as good as take segmentation — a missed cut means the tracker (and then the jersey-OCR/VLM step) runs straight across a real venue/match change, contaminating one take's "verified identity" with another game's frames. **Resolution:** evaluate PySceneDetect's `AdaptiveDetector` (same library, same BSD-3 license, no new dependency) as the default — it thresholds on a ratio to a rolling local average rather than one fixed absolute value, which is the right tool for content whose baseline "cutty-ness" varies across the video, not a per-video magic number. Validate against **both** clip4's known-good cut/no-cut set and this video's measured 13-cut set before switching the default in `configs/shots.yaml`; until validated, this video runs with an explicit per-video override, never a silent global change that could regress the original 5 clips. | 🔧 building 2026-08-27 |
+| ADR-16 | **Cut detection: fixed-threshold `ContentDetector` does not generalize across a heterogeneous multi-match compilation; per-take identity now depends on getting this right** | §3.3 measured that `Jordan Thomas Highlight Video.mp4`'s real cuts sit at content-value scores as low as ~21–27 (a 13-cut set, stable across thresholds 21.0/24.0/27.0 — the same "find the plateau" method ADR-7 used), while clip4's three confirmed **false**-positive foreground-crossings score up to 32.0. No single fixed threshold can keep clip4's false positives out *and* catch this new video's real cuts — the existing global default (38.0, tuned on clip4) misses 6 of the 13; lowering the global default to clip4's false-positive ceiling would corrupt clip4. This now matters more than it used to: ADR-15's per-take jersey verification is only as good as take segmentation — a missed cut means the tracker (and then the jersey-OCR/VLM step) runs straight across a real venue/match change, contaminating one take's "verified identity" with another game's frames. **Resolution (scoped, low-risk):** `configs/shots.yaml: scenedetect` gains an `overrides: {<video-slug>: <threshold>}` map, keyed by the same slug `work_dir_for()` already uses everywhere; `detect_takes()` looks itself up there and falls back to the existing global `threshold` when absent — so the original 5 clips' behaviour is provably unchanged (no entry for them). `jordan_thomas_highlight_video: 24.0` is the measured entry, verified by eyeballing contact-sheet frames either side of each of the 13 cut timestamps before locking it in (same verification discipline as ADR-7). PySceneDetect's `AdaptiveDetector` (same library/license, rolling-average threshold instead of one fixed number) would be the more general long-term fix for arbitrary future compilations, but is **deferred** — not evaluated here — to keep this change small and reviewable. | ✅ adopted 2026-08-27 (per-video override); AdaptiveDetector deferred |
 | ADR-15 | **Verified-jersey identification required when no filename jersey number exists; no verified number ⇒ no target identity ⇒ no target stats for that take** | Owner request (2026-08-27, full spec in chat): for a video with no `clip<N> <jersey>` filename metadata, the target player's jersey number must be **read from visual evidence and confirmed**, never guessed from appearance, position, team, or the burned-in arrow alone (the arrow is a *location* prior, not an identity — §3.2 consequence 1 already says this; it reads no digits). This is a deliberate, owner-authorized pull-forward of a narrow slice of **Phase 2** (§6) for this input only — Golden Rule 7's "no jersey auto-ID until Phase 1 done" is superseded here by an explicit owner instruction, the same pattern as ADR-13's exception, not a silent scope change. **Pipeline addition:** for each **take** (cuts matter more now — ADR-16), take the arrow-hint track (existing `selection.py` logic, generalized) as a **location candidate only**; crop that track's box across the take at native/high resolution wherever it's front/back-facing and large enough to plausibly read a number; run **EasyOCR** (Apache-2.0, already in `configs/shots.yaml`'s license-approved OCR row) plus **Gemini** (owner-supplied key, ADR-14) as a cross-check on the same crops; require **temporal agreement across multiple frames**, not a single read (owner's explicit "don't randomly pick one frame's answer" rule). A take's identity record is `{take_id, jersey_number: int|None, status: verified|unverified, confidence, evidence_frames[]}`. **Unverified take ⇒ no red box, no target stats for that take** — green boxes and ball tracking still render (those don't depend on identity), and the run report says plainly "target could not be reliably identified in take N," never a guessed fallback. **Output is grouped by verified jersey number, not by an assumed single continuous human identity**: because this compilation's segments come from different matches with visibly different kits (§3.3), two takes verified to *different* numbers are **not** merged into one player just because the same arrow-selection heuristic picked a person in both — that would itself be an appearance/position-based identity assumption, which the owner explicitly forbade. Each distinct verified number gets its own `output/<slug>/players/player_<N>/` folder (statcard, highlights, timeline); the single annotated video still shows one continuous red box per take, labeled with that take's own verified number. Gemini model note: `gemini-2.5-flash` (ADR-14's implicit assumption) now 404s for new callers ("no longer available to new users") — resolved to **`gemini-3.6-flash`** (confirmed reachable 2026-08-27), with retry-on-503 (measured transient `UNAVAILABLE` during testing). | 🔧 building, owner-authorized 2026-08-27 |
 | ADR-1 | **PyAV + ffmpeg CLI for decode; drop `decord`** | `decord` 0.6.0 has no cp311/cp312 wheels and is effectively unmaintained; building it from source is a needless risk. PyAV covers seeking/frame-accurate decode, and `ffmpeg -hwaccel cuda -c:v h264_cuvid` covers NVDEC bulk decode. Same capability, zero build risk. | ✅ adopted |
 | ADR-2 | **Roboflow's soccer player/pitch checkpoints are YOLOv8 → AGPL → cannot ship** | `roboflow/sports` is MIT *code*, but the released player-detection and field-keypoint **weights are Ultralytics YOLOv8**, which is AGPL-3.0. Using them violates Golden Rule 6. Resolution ladder: (a) an **Apache-2.0 RF-DETR** soccer checkpoint; (b) **RF-DETR COCO-pretrained** (`person` + `sports ball`); (c) optional overnight fine-tune. **No training in Phase 1 either way.** | ✅ **resolved → see ADR-8** |
@@ -323,16 +323,29 @@ UI copy. ❌ Feed raw 4K to a detector.
 > take. This does not relax Golden Rule 7 for the original §3.1 clips, which keep filename-metadata-only,
 > human-selects-the-track Phase 1 behaviour.
 
-## 13. Extended output spec (owner-authorized 2026-08-25 — ADR-14; supersedes prior output shape)
+## 13. Extended output spec (owner-authorized 2026-08-25 — ADR-14, revised 2026-08-27 — ADR-15;
+supersedes prior output shape)
+
+> **ADR-15 gating (2026-08-27):** on an input with **no filename jersey number** (§3.3), everything in this
+> section that names "the target player" is conditioned on that take's identity being **verified** (jersey
+> number read from visible evidence with temporal agreement — ADR-15), never on the arrow/track-selection
+> heuristic alone. An unverified take still gets full green-box + ball-tracking output; it just contributes
+> no red box and no target-player stats. On the original §3.1 clips (filename gives the number), nothing in
+> this section changes — the human-confirms-the-track Phase-1 flow is untouched.
 
 ### 13.1 Primary output: full-resolution annotated original video
 **`output/<slug>/original_annotated_video.mp4`** — the original input video, unchanged resolution/fps/
 duration, **original audio preserved**, with detections/tracking/events/stats drawn directly on top.
 Not a separate downscaled debug clip — the actual footage the owner uploaded. Draw:
-- **Red** box, thick, persistent label, around the **target player** — ID must not visibly reset when the
-  target overlaps another player or leaves/re-enters frame (best-effort continuity via the existing
-  within-take stitching logic, generalised to run continuously rather than gated to arrow-hint votes only;
-  this is still inference on top of raw tracks, not magic — flag it as approximate, never silently drop it).
+- **Red** box, thick, persistent label, around the **verified target player**, labeled with that take's own
+  verified jersey number (e.g. `#22 | TARGET`) — never a bare track ID standing in for a jersey identity
+  (ADR-15: a tracking ID and a jersey number are different concepts, never conflated). ID must not visibly
+  reset when the target overlaps another player or leaves/re-enters frame **within the same take**
+  (best-effort continuity via the existing within-take stitching logic, generalised to run continuously
+  rather than gated to arrow-hint votes only; this is still inference on top of raw tracks, not magic — flag
+  it as approximate, never silently drop it). A take with no verified identity gets **no red box at all** —
+  every detected player in that take renders green, plus a visible "IDENTITY: unverified in this segment"
+  note alongside that take's "CUT — take N" banner.
 - **Green** boxes, thin, around every other detected player, with a track ID where available.
 - A small distinct **ball marker** (already exists from Stage 2's SAHI ball detection) — solid when
   observed, visually distinct (e.g. hollow/dashed) when interpolated across a gap (Golden Rule 5: never
@@ -344,42 +357,53 @@ Not a separate downscaled debug clip — the actual footage the owner uploaded. 
 4K NVENC encode + audio mux is expensive (multi-minute per clip, large files) — that is an accepted cost,
 not a reason to substitute a downscaled render.
 
-### 13.2 `statcard.md` — exact template (owner-specified)
-```
-PLAYER STATISTICS
+### 13.2 `statcard.md` — exact template (owner-specified, **revised 2026-08-27 — ADR-15**)
+The owner restated the template on 2026-08-27 with an explicit **Identity Status** line and a **confidence
+column** on the timeline — this supersedes the plain-text 2026-08-25 version. One file per **verified**
+jersey number (§13.5), never one file blending two different verified numbers:
+```markdown
+# Player Statistics
 
-Player #<target_jersey>
+## Player #<jersey_number>
 
-Touches: [actual value]
-Passes: [actual value]
-Sprints/Runs: [actual value]
-Goals: [actual value]
-Assists: [actual value]
-Shots: [actual value]
-Tackles: [actual value]
-Saves: [actual value]
-Dribbles: [actual value]
-Possession Time: [actual value]
-Distance Covered: [actual value]
+**Identity Status:** Verified
 
-EVENT TIMELINE
+**Touches:** [actual value]
+**Passes:** [actual value]
+**Sprints/Runs:** [actual value]
+**Goals:** [actual value]
+**Assists:** [actual value]
+**Shots:** [actual value]
+**Tackles:** [actual value]
+**Saves:** [actual value]
+**Dribbles:** [actual value]
+**Possession Time:** [actual value]
+**Distance Covered:** [actual value]
 
-[Timestamp] — Touch
-[Timestamp] — Pass
-[Timestamp] — Sprint
-[Timestamp] — Dribble
-[Timestamp] — Shot
-[Timestamp] — Tackle
-[Timestamp] — Assist
-[Timestamp] — Goal
-[Timestamp] — Celebration
-[Timestamp] — Other Key Moment
+## Event Timeline
+
+| Time | Event | Confidence |
+|------|-------|------------|
+| [Timestamp] | Touch | [0-1] |
+| [Timestamp] | Pass | [0-1] |
+| [Timestamp] | Sprint | [0-1] |
+| [Timestamp] | Dribble | [0-1] |
+| [Timestamp] | Shot | [0-1] |
+| [Timestamp] | Tackle | [0-1] |
+| [Timestamp] | Assist | [0-1] |
+| [Timestamp] | Goal | [0-1] |
+| [Timestamp] | Celebration | [0-1] |
+| [Timestamp] | Other Key Moment | [0-1] |
 ```
 Only list events that actually fired; **never pad the timeline to look complete.** Wherever a value can't be
-reliably derived, write `uncertain` (owner's own words) rather than a number — this is Golden Rule 5 stated
-in the owner's own terms, not a new rule. `Distance Covered` and any speed-derived value are additionally
-suffixed `(uncalibrated)` per ADR-6 — never bare metres/km. `Goals`/`Assists` read `not available` on this
-footage specifically (no scoreboard, §3.2(3)) — that is a data ceiling, true regardless of build effort.
+reliably derived, write `uncertain` (owner's own words) rather than a number — Golden Rule 5 in the owner's
+own terms, not a new rule. `Distance Covered` and any speed-derived value are additionally suffixed
+`(uncalibrated)` per ADR-6 — never bare metres/km. `Goals`/`Assists` read `not available` when no scoreboard
+exists to verify against (§3.2(3), true for the original §3.1 clips; re-check per-video for new input — don't
+assume it transfers). If a take's identity is **unverified** (ADR-15), no `statcard.md` is written for it at
+all — the run report states plainly which takes/segments had no verified target and why, per the owner's own
+words: *"Target player could not be reliably identified. Statistics were not generated because jersey
+identity could not be verified."*
 
 ### 13.3 Event categories and their real status on this footage
 | Category | Status | Method |
@@ -392,24 +416,37 @@ footage specifically (no scoreboard, §3.2(3)) — that is a data ceiling, true 
 | Goal, Assist | ⛔ **not available on this footage** | no scoreboard exists to verify against (§3.2(3)) — true for every clip in `input/`, not a missing feature |
 
 ### 13.4 Highlight compilations (per clip, category-specific — not the single ranked reel)
-`output/<slug>/highlights/{ball_possession,dribbles,assists,goals}.mp4` — each a concatenation of every
-event in that category for the target player, a few seconds of context before/after each event (config
-knob, matches the existing `pre_seconds`/`post_seconds` pattern). **An empty/absent file, not a fabricated
-one, when a category has zero real events** (owner's rule, identical in spirit to Golden Rule 5) — expect
-`assists.mp4` and `goals.mp4` to always be empty on this footage (§13.3).
+`output/<slug>/players/player_<N>/highlights/{ball_possession,dribbles,assists,goals,key_moments}.mp4` —
+each a concatenation of every event in that category for **that verified player**, a few seconds of context
+before/after each event (config knob, matches the existing `pre_seconds`/`post_seconds` pattern). **An
+empty/absent file, not a fabricated one, when a category has zero real events** (owner's rule, identical in
+spirit to Golden Rule 5). Each highlight clip itself carries the same red/green/ball overlay plus an
+event-name + timestamp + jersey-number caption (owner spec §24) — it is a cut of the annotated video, not the
+raw footage.
 
-### 13.5 Required directory layout (per clip slug)
+### 13.5 Required directory layout (per input video)
+**When the filename gives the jersey number (§3.1 clips, Phase-1 human-confirms-the-track flow):** unchanged,
+one flat `output/<slug>/` per clip as before.
+
+**When the jersey number is not in the filename and must be verified (ADR-15, §3.3):** identity is
+per-*verified-number*, not per-video — a compilation can legitimately contain more than one, or none:
 ```
 output/<slug>/
-  original_annotated_video.mp4   # §13.1 — the primary deliverable
-  statcard.md                    # §13.2 — exact owner template
-  highlights/
-    ball_possession.mp4
-    dribbles.mp4
-    assists.mp4                  # expect empty on this footage
-    goals.mp4                    # expect empty on this footage
-  events/
-    event_timeline.json          # machine-readable form of §13.2's timeline
+  original_annotated_video.mp4     # §13.1 — ONE file, whole video, red box only in verified takes
+  players/
+    player_<N>/                    # one folder per DISTINCT verified jersey number found
+      statcard.md                  # §13.2 — exact owner template, this player's real values only
+      highlights/
+        ball_possession.mp4
+        dribbles.mp4
+        assists.mp4                # expect empty on most amateur footage (no scoreboard, §3.2(3))
+        goals.mp4                  # expect empty on most amateur footage (no scoreboard, §3.2(3))
+        key_moments.mp4            # celebrations / other key moments, Gemini-classified (§13.3)
+      events/
+        event_timeline.json        # machine-readable form of statcard.md's timeline, incl. confidence
+  identity_report.json             # every take's {take_id, jersey_number|null, status, confidence,
+                                    # evidence_frames} — including UNVERIFIED takes, so "why is there no
+                                    # player_7 folder for take 3" is always answerable from this file
 ```
 The pre-existing `reel.mp4` / `stat_card.json` / `stat_card.md` / `run_report.json` / `clips/` artifacts are
 kept alongside (other tooling/tests depend on them) — §13.5 is additive, not a replacement of the verified
