@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from src.shots.boundaries import resolve_scenedetect_threshold, takes_from_cut_frames
 
-
 # ---------------------------------------------------------------------------
 # takes_from_cut_frames
 # ---------------------------------------------------------------------------

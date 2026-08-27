@@ -25,7 +25,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.common.logging import get_logger
 from src.common.types import BBox, DetectionClass, Take, Track, TrackBox
@@ -52,6 +52,20 @@ class TakeSelection(BaseModel):
     # stitched timeline's own boxes
     take_duration_seconds: float
     vote_share: float | None = None  # arrow_vote only: seed's votes / total votes cast this take
+
+    # ADR-15 (CLAUDE.md §3.3/§5.1): populated ONLY for a filename-less video (`target_jersey is
+    # None`) by `src.identity.verify.verify_identities_for_video`, called from
+    # `src.pipeline.run` AFTER this take's own (location-only) selection above is already built —
+    # never for the original 5 `clip<N> <jersey>.mp4` clips, whose `identity_status` stays `None`
+    # forever (a real gate, not just an unused default: CLAUDE.md §13.1 renders NO red box for a
+    # take unless `identity_status == "verified"`). `jersey_number` here is a VERIFIED number read
+    # from visible evidence with temporal agreement across >= 2 independent frames — never the
+    # same thing as `seed_track_id`/`method` above, which are a pure LOCATION prior that never
+    # reads a digit (Golden Rule 7 / ADR-15).
+    jersey_number: int | None = None
+    identity_status: Literal["verified", "unverified"] | None = None
+    identity_confidence: float = 0.0
+    identity_evidence_frames: list[int] = Field(default_factory=list)
 
 
 class SelectionResult(BaseModel):

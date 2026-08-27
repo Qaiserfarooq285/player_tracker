@@ -90,6 +90,4 @@ def read_jersey_digits(reader: Any, crop_bgr: np.ndarray, ocr_cfg: dict) -> OcrR
     # (e.g. two candidate boxes on the same crop reading "7" and "17") -- never pick a winner here,
     # the caller escalates to the VLM instead.
     best = max(candidates, key=lambda c: c[1])
-    return OcrRead(
-        digits=best[0], confidence=best[1], is_confident=False, candidates=candidates
-    )
+    return OcrRead(digits=best[0], confidence=best[1], is_confident=False, candidates=candidates)

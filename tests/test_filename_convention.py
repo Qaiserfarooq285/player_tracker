@@ -87,4 +87,6 @@ def test_input_clips_present_and_match(pattern: re.Pattern):
         assert match is not None, f"input file {video.name!r} does not match the convention"
     non_matching = [v.name for v in videos if pattern.match(v.stem) is None]
     if non_matching:
-        print(f"input/ contains {len(non_matching)} filename-less (ADR-15) video(s): {non_matching}")
+        print(
+            f"input/ contains {len(non_matching)} filename-less (ADR-15) video(s): {non_matching}"
+        )
