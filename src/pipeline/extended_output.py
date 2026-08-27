@@ -40,7 +40,11 @@ from src.common.logging import DropCounter, get_logger
 from src.common.types import BallDetection, Event, EventType, Take, Track
 from src.common.video import probe
 from src.detect.overlay_mask import ArrowHint
-from src.events.aggregate import attribute_events_to_target, compute_take_all_events
+from src.events.aggregate import (
+    attribute_events_to_target,
+    compute_take_all_events,
+    target_identity_id,
+)
 from src.events.key_moments import classify_candidate_windows, find_candidate_windows
 from src.events.possession import compute_distance_covered
 from src.identity.verify import IdentityReport, verify_identities_for_video
@@ -250,10 +254,17 @@ def run_extended_pipeline_for_video(
         candidates = find_candidate_windows(
             virtual_track, key_moment_cfg["prefilter"], existing_windows
         )
+        # Event.player_track_id is a TRACK/IDENTITY id, never a jersey number (ADR-15: the two id
+        # spaces must never be conflated) -- resolve the target's own identity id the same way
+        # attribute_events_to_target does, falling back to its first raw location track id (still
+        # a real, traceable track id) on the rare miss where the identity partition disagrees.
+        key_moment_player_id = target_identity_id(tir.location_track_ids, identity_of)
+        if key_moment_player_id is None and tir.location_track_ids:
+            key_moment_player_id = tir.location_track_ids[0]
         key_events = classify_candidate_windows(
             video_path,
             take.id,
-            tir.jersey_number,
+            key_moment_player_id,
             candidates,
             gemini_api_key,
             key_moment_cfg["vlm"],
