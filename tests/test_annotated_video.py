@@ -6,6 +6,9 @@ from __future__ import annotations
 from src.common.types import BBox, Event, EventType, Track, TrackBox
 from src.identity.verify import TakeIdentityResult
 from src.pipeline.annotated_video import (
+    _ActiveEventIndex,
+    _event_caption_label,
+    _format_caption_timestamp,
     _nearest_by_time,
     _NumberProgress,
     _SortedTimeIndex,
@@ -133,3 +136,62 @@ def test_box_index_keyed_by_take_and_track_id_avoids_cross_take_collision():
     # a naive flat {track_id: index} dict would have collided these -- confirm the fix actually
     # keeps them distinct (this is the assertion that would have caught the real bug)
     assert index_by_key[(0, 1)] is not index_by_key[(5, 1)]
+
+
+# ---------------------------------------------------------------------------
+# _ActiveEventIndex / _event_caption_label / _format_caption_timestamp (ADR-19/20 event captions,
+# CLAUDE.md §13.1) -- pure, no I/O; the render loop itself stays untested, as today.
+# ---------------------------------------------------------------------------
+
+
+def test_format_caption_timestamp():
+    assert _format_caption_timestamp(65.0) == "1:05"
+    assert _format_caption_timestamp(5.0) == "0:05"
+    assert _format_caption_timestamp(0.0) == "0:00"
+
+
+def test_event_caption_label_uses_the_same_timeline_label_as_the_statcard():
+    touch = _event(EventType.TOUCH, 1.0)
+    assert _event_caption_label(touch) == "Touch"
+    turnover = _event(EventType.TURNOVER, 1.0)
+    assert _event_caption_label(turnover) == "Turnover"
+    out_of_bounds = _event(EventType.OUT_OF_BOUNDS, 1.0)
+    assert _event_caption_label(out_of_bounds) == "Out of bounds"
+
+
+def test_event_caption_label_key_moment_reads_action_phrase():
+    ev = Event(
+        id="km-1",
+        type=EventType.KEY_MOMENT,
+        t_start=1.0,
+        t_end=1.0,
+        player_track_id=1,
+        take_id=0,
+        confidence=0.5,
+        source="manual_annotation",
+        evidence={"action_phrase": "celebrates with the fans"},
+    )
+    assert _event_caption_label(ev) == "Celebration"
+
+
+def test_active_event_index_active_within_caption_window():
+    events_by_number = {2: [_event(EventType.TOUCH, 10.0)]}
+    index = _ActiveEventIndex(events_by_number, caption_duration_s=2.0)
+    assert index.active_at(10.0) == [(2, events_by_number[2][0])]
+    assert index.active_at(11.5) == [(2, events_by_number[2][0])]  # still within the window
+    assert index.active_at(9.9) == []  # before the event even starts
+    assert index.active_at(12.1) == []  # past the caption duration
+
+
+def test_active_event_index_multiple_simultaneous_events_across_numbers():
+    ev_a = _event(EventType.TOUCH, 10.0)
+    ev_b = _event(EventType.PASS, 10.0)
+    events_by_number = {2: [ev_a], 7: [ev_b]}
+    index = _ActiveEventIndex(events_by_number, caption_duration_s=1.0)
+    active = index.active_at(10.0)
+    assert sorted(active, key=lambda pair: pair[0]) == [(2, ev_a), (7, ev_b)]
+
+
+def test_active_event_index_empty_when_no_events():
+    index = _ActiveEventIndex({}, caption_duration_s=2.0)
+    assert index.active_at(0.0) == []

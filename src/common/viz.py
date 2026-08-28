@@ -163,14 +163,22 @@ def draw_ball(frame: np.ndarray, bbox: BBox, conf: float, interpolated: bool) ->
     `interpolated` (CLAUDE.md Golden Rule 5: never present interpolated as observed) picks a
     visually distinct colour so a filled-gap ball position never looks identical to an observed
     one in the overlay.
+
+    ⚠️ Mutates `frame` IN PLACE and returns it (changed from an earlier copy-returning contract --
+    consistent with `src/pipeline/annotated_video.py::_draw_box_with_label`'s own convention, and
+    the fix for a real bug: that module's own render loop called `draw_ball(frame, ...)` and
+    discarded the return, so on a COPY-returning `draw_ball` the ball marker was drawn onto a copy
+    that was then thrown away -- the ball was never drawn in ANY rendered output video. Every
+    OTHER call site (`scripts/overlay_tracks.py`, `scripts/overlay_target.py`) already does
+    `annotated = draw_ball(annotated, ...)`, which is unaffected by this change: reassigning the
+    same (now mutated) object back to itself is a no-op either way.
     """
-    out = frame.copy()
     color = _BALL_COLOR_INTERPOLATED if interpolated else _BALL_COLOR_OBSERVED
     center = (int(round(bbox.cx)), int(round(bbox.cy)))
-    cv2.circle(out, center, _BALL_MARKER_RADIUS_PX, color, _BALL_MARKER_THICKNESS_PX)
+    cv2.circle(frame, center, _BALL_MARKER_RADIUS_PX, color, _BALL_MARKER_THICKNESS_PX)
     label = f"ball {conf:.2f}" + (" (interp)" if interpolated else "")
     cv2.putText(
-        out,
+        frame,
         label,
         (center[0] + _BALL_MARKER_RADIUS_PX + 2, center[1]),
         _HUD_FONT,
@@ -179,7 +187,7 @@ def draw_ball(frame: np.ndarray, bbox: BBox, conf: float, interpolated: bool) ->
         _HUD_FONT_THICKNESS,
         cv2.LINE_AA,
     )
-    return out
+    return frame
 
 
 def draw_arrow_outline(frame: np.ndarray, bbox: BBox, tip: tuple[float, float]) -> np.ndarray:

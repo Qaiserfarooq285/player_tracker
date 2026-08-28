@@ -18,17 +18,18 @@ fast path already does — see `_stream_encode`.
 from __future__ import annotations
 
 import subprocess
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 from src.common.logging import get_logger
-from src.common.types import BallDetection, Event, Take, Track
+from src.common.types import BallDetection, Event, EventType, Take, Track
 from src.common.video import decode_frames, probe
 from src.common.viz import draw_ball
 from src.identity.verify import TakeIdentityResult
+from src.pipeline.player_output import _TIMELINE_EVENT_TYPES, _key_moment_label
 from src.track.tracker import assign_take_id
 
 logger = get_logger("annotated_video")
@@ -76,6 +77,24 @@ _PANEL_LABELS = {
     "save": "Saves",
     "dribble": "Dribbles",
 }
+
+# Event captions (ADR-19/20, CLAUDE.md §13.1): "a brief on-screen caption naming the event, the
+# jersey number, and the timestamp" -- burned in at every event's own instant regardless of
+# whether that event's player could be confidently red-boxed this frame (ADR-19's own
+# "caption-only, no red box" rule for a manual-mode association that couldn't be made
+# confidently), so the annotated video stays faithful to the underlying event stream even when
+# tracking/association is weak.
+_CAPTION_FONT = cv2.FONT_HERSHEY_SIMPLEX
+_CAPTION_FONT_SCALE = 1.1
+_CAPTION_FONT_THICKNESS = 3
+_CAPTION_TEXT_COLOR = (255, 255, 255)
+_CAPTION_BG_COLOR = (40, 40, 40)
+_CAPTION_PADDING_PX = 12
+_CAPTION_BOTTOM_MARGIN_PX = 30
+_CAPTION_LINE_HEIGHT_PX = 56
+_CAPTION_DURATION_S = 2.5  # how long ONE event's caption stays on screen after its own t_start --
+# long enough to be readable at a glance, short enough that two close-together events (e.g. a
+# touch immediately followed by a pass) don't visually smear into one incoherent caption.
 
 
 def _nearest_by_time(items: list, t: float, tolerance: float, key):
@@ -149,6 +168,87 @@ class _NumberProgress:
             self.counts[ev.type.value] = self.counts.get(ev.type.value, 0) + 1
             self.pointer += 1
         return self.counts
+
+
+class _ActiveEventIndex:
+    """Pure, render-local index answering "which (jersey_number, Event) pairs have an active
+    caption window at time `t`" — presorted ONCE by `Event.t_start` (same `_SortedTimeIndex`-style
+    "sort once, bisect per query" discipline as the ball/track box indices above, needed for the
+    same reason: this is queried once per rendered native frame, ~7000 times for a whole video).
+
+    An event is "active" for `[t_start, t_start + caption_duration_s]` — captions are keyed off
+    when the event STARTED, not `t_end` (a `TOUCH`/`GOAL`/... event's own `t_start`==`t_end` in the
+    common case anyway; a longer interval event like `POSSESSION` isn't a template timeline row
+    at all, see `src.pipeline.player_output._TIMELINE_EVENT_TYPES`'s own docstring).
+    """
+
+    def __init__(self, events_by_number: dict[int, list[Event]], caption_duration_s: float) -> None:
+        entries = [
+            (ev.t_start, number, ev) for number, events in events_by_number.items() for ev in events
+        ]
+        entries.sort(key=lambda e: e[0])
+        self._starts = [e[0] for e in entries]
+        self._entries = entries
+        self._caption_duration_s = caption_duration_s
+
+    def active_at(self, t: float) -> list[tuple[int, Event]]:
+        """Every `(jersey_number, Event)` whose own `[t_start, t_start + caption_duration_s]`
+        window contains `t`, oldest-started first."""
+        lo = bisect_left(self._starts, t - self._caption_duration_s)
+        hi = bisect_right(self._starts, t)
+        return [(number, ev) for _start, number, ev in self._entries[lo:hi]]
+
+
+def _format_caption_timestamp(t: float) -> str:
+    """`M:SS` rendering — identical convention to
+    `src.pipeline.player_output._format_timestamp`'s whole-minutes/seconds split, just without the
+    tenths-of-a-second decimal (a caption is read at a glance, not audited to the frame)."""
+    minutes = int(t // 60)
+    seconds = int(t % 60)
+    return f"{minutes}:{seconds:02d}"
+
+
+def _event_caption_label(event: Event) -> str:
+    """The SAME label a viewer would find on that event's `statcard.md` timeline row — reuses
+    `src.pipeline.player_output`'s own `_TIMELINE_EVENT_TYPES`/`_key_moment_label` verbatim
+    (Golden Rule 5: the overlay must never show a label the stat card itself wouldn't also use)."""
+    if event.type == EventType.KEY_MOMENT:
+        return _key_moment_label(event)
+    return _TIMELINE_EVENT_TYPES.get(event.type, event.type.value.replace("_", " ").title())
+
+
+def _draw_event_caption(frame: np.ndarray, active_events: list[tuple[int, Event]]) -> None:
+    """Draw one bottom-centred caption line per currently-active `(jersey_number, Event)` pair
+    (CLAUDE.md §13.1: "a brief on-screen caption naming the event, the jersey number, and the
+    timestamp"), stacked upward so simultaneous captions (rare, but possible with two players
+    annotated at nearly the same instant) never overlap. A no-op when nothing is active."""
+    if not active_events:
+        return
+    frame_h, frame_w = frame.shape[:2]
+    for i, (number, ev) in enumerate(active_events):
+        text = f"#{number} | {_event_caption_label(ev)} | {_format_caption_timestamp(ev.t_start)}"
+        (tw, th), baseline = cv2.getTextSize(
+            text, _CAPTION_FONT, _CAPTION_FONT_SCALE, _CAPTION_FONT_THICKNESS
+        )
+        x = (frame_w - tw) // 2
+        y = frame_h - _CAPTION_BOTTOM_MARGIN_PX - i * _CAPTION_LINE_HEIGHT_PX
+        cv2.rectangle(
+            frame,
+            (x - _CAPTION_PADDING_PX, y - th - _CAPTION_PADDING_PX),
+            (x + tw + _CAPTION_PADDING_PX, y + baseline + _CAPTION_PADDING_PX // 2),
+            _CAPTION_BG_COLOR,
+            -1,
+        )
+        cv2.putText(
+            frame,
+            text,
+            (x, y),
+            _CAPTION_FONT,
+            _CAPTION_FONT_SCALE,
+            _CAPTION_TEXT_COLOR,
+            _CAPTION_FONT_THICKNESS,
+            cv2.LINE_AA,
+        )
 
 
 def _draw_box_with_label(
@@ -380,6 +480,7 @@ def render_full_annotated_video(
     progress_by_number: dict[int, _NumberProgress] = {
         number: _NumberProgress(events) for number, events in events_by_number.items()
     }
+    active_event_index = _ActiveEventIndex(events_by_number, _CAPTION_DURATION_S)
 
     video_only_path = work_dir / "debug" / "original_annotated_video_only.mp4"
 
@@ -460,6 +561,12 @@ def render_full_annotated_video(
                 _draw_cut_banner(
                     frame, take.id, identity is not None and identity.status == "verified"
                 )
+
+            # ADR-19/20 (CLAUDE.md §13.1): event captions fire regardless of whether THIS frame's
+            # take has a red box at all -- a manual-mode event whose track association couldn't be
+            # made confidently still gets its caption (name + jersey + timestamp), never silently
+            # dropped just because there's nothing to box.
+            _draw_event_caption(frame, active_event_index.active_at(t))
 
             yield frame
 
