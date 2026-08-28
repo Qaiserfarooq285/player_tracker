@@ -17,6 +17,7 @@ via cache).
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from collections import defaultdict
@@ -24,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 import typer
+from dotenv import load_dotenv
 from rich.console import Console
 
 from src.common.io import (
@@ -39,6 +41,7 @@ from src.common.logging import DropCounter, get_logger
 from src.common.types import (
     BallDetection,
     Event,
+    EventType,
     RunReport,
     StageTiming,
     Take,
@@ -46,14 +49,24 @@ from src.common.types import (
 )
 from src.common.video import probe
 from src.detect.overlay_mask import ArrowHint
+from src.events.aggregate import (
+    attribute_events_to_target,
+    compute_take_all_events,
+    target_identity_id,
+)
 from src.events.goals import GoalDetectionResult, detect_goals_for_video
+from src.events.key_moments import classify_candidate_windows, find_candidate_windows
+from src.events.possession import compute_distance_covered
 from src.events.shots import detect_shots
 from src.events.sprints import detect_sprints
 from src.highlights.cutting import cut_clips
 from src.highlights.ranking import rank_events
 from src.highlights.reel import build_reel, select_for_export
 from src.highlights.selection import SelectionResult, select_targets
+from src.identity.verify import TakeIdentityResult
 from src.ingest.discovery import VideoRef, find_videos, parse_filename
+from src.pipeline.annotated_video import render_full_annotated_video
+from src.pipeline.player_output import write_player_output
 from src.pipeline.profiler import build_run_profile
 from src.stats.stats import build_player_stats, write_stat_card
 from src.track.run import run_track_stage
@@ -146,6 +159,24 @@ def _compute_events(
             detect_shots(balls_by_take.get(take.id, []), take.id, frame_width, events_cfg, drops)
         )
     return events
+
+
+def _stitched_virtual_track(take_id: int, take_tracks: list[Track], ids: list[int]) -> Track:
+    """Merge the boxes of several raw take-scoped fragments (one target's own location-selection
+    `track_ids`) into ONE synthetic `Track`, time-sorted — mirrors
+    `src.pipeline.extended_output._stitched_virtual_track` EXACTLY (kept independently duplicated
+    per CLAUDE.md §10's "stages independently runnable/debuggable" convention, same as
+    `_effective_frame_size` above). Needed because `find_candidate_windows` operates on a single
+    `Track`'s own box sequence, not a list of fragments.
+    """
+    by_id = {tr.id: tr for tr in take_tracks}
+    boxes = []
+    for tid in ids:
+        tr = by_id.get(tid)
+        if tr is not None:
+            boxes.extend(tr.boxes)
+    boxes.sort(key=lambda b: b.t)
+    return Track(id=-1, take_id=take_id, boxes=boxes)
 
 
 def _load_stage2_3_artifacts(
@@ -437,6 +468,203 @@ def run_pipeline_for_video(
     timings.append(
         StageTiming(stage="stats", wall_seconds=round(time.time() - t0, 2), vram_peak_mb=None)
     )
+
+    # --- Stage 6b: full event suite + full-res annotated video + per-player output (ADR-21) ------
+    # Unifies this Phase-1 flow with `src.pipeline.extended_output`'s own event suite / statcard /
+    # annotated-video / highlight-reel machinery -- previously wired ONLY for filename-less videos,
+    # even though the owner's exact statcard template + full event suite lives here and is fully
+    # tested. The identity SOURCE differs (a human-selected/arrow-confirmed track + the filename's
+    # own known jersey number, never OCR/VLM) but every downstream detector/writer below is the
+    # SAME already-tested code `run_extended_pipeline_for_video` calls. Purely additive: nothing
+    # above this point (reel.mp4/stat_card.md/clips/) is touched.
+    load_dotenv()
+    gemini_api_key = os.environ.get("GEMINI_API_KEY") or None
+    if not gemini_api_key:
+        logger.warning(
+            "GEMINI_API_KEY not set for %s -- key-moment classification proceeds in its honest "
+            "degraded mode (zero KEY_MOMENT events, never a guess)",
+            video_path.name,
+        )
+
+    t0 = time.time()
+    identity_by_take: dict[int, TakeIdentityResult] = {}
+    for sel in selection.takes:
+        is_located = sel.method != "none" and bool(sel.track_ids)
+        identity_by_take[sel.take_id] = TakeIdentityResult(
+            take_id=sel.take_id,
+            jersey_number=target_jersey,
+            status="verified" if is_located else "unverified",
+            confidence=sel.confidence,
+            evidence_frames=[],
+            # This take's identity comes from the Phase-1 human-selection seam (arrow prior,
+            # heuristic fallback, or an explicit `--track-id` override), never OCR/VLM -- honestly
+            # distinguished from ADR-15's verified-jersey provenance via `identity_status` below,
+            # where it actually surfaces (Golden Rule 5: never conflate two different kinds of
+            # evidence behind the same label).
+            location_method=str(sel.method),
+            location_track_ids=sel.track_ids,
+        )
+
+    full_tracks_by_take: dict[int, list[Track]] = defaultdict(list)
+    for tr in tracks:
+        full_tracks_by_take[tr.take_id].append(tr)
+    full_balls_by_take = _bucket_by_take(balls, takes)
+
+    goal_assist_by_take: dict[int, list[Event]] = defaultdict(list)
+    for ev in goal_result.events:
+        if ev.take_id is not None:
+            goal_assist_by_take[ev.take_id].append(ev)
+
+    full_events_cfg = configs["events"]
+    full_selection_cfg = configs["highlights"]["selection"]
+    full_attribution_cfg = configs["highlights"]["attribution"]
+    full_key_moment_cfg = configs["key_moments"]
+
+    full_drops = DropCounter("full_events")
+    events_by_number: dict[int, list[Event]] = defaultdict(list)
+    takes_used_by_number: dict[int, list[tuple[int, list[int]]]] = defaultdict(list)
+
+    for take in takes:
+        tir = identity_by_take.get(take.id)
+        if tir is None or tir.status != "verified" or tir.jersey_number is None:
+            continue
+        take_tracks = full_tracks_by_take.get(take.id, [])
+        take_balls = full_balls_by_take.get(take.id, [])
+        if not take_tracks:
+            continue
+
+        all_events, identity_of, _identity_confidence = compute_take_all_events(
+            take,
+            take_tracks,
+            take_balls,
+            frame_width,
+            full_events_cfg,
+            full_selection_cfg,
+            fps_sample,
+            drops=full_drops,
+        )
+        all_events = all_events + goal_assist_by_take.get(take.id, [])
+        target_events = attribute_events_to_target(
+            all_events,
+            take_tracks,
+            take_balls,
+            tir.location_track_ids,
+            identity_of,
+            full_attribution_cfg,
+        )
+
+        virtual_track = _stitched_virtual_track(take.id, take_tracks, tir.location_track_ids)
+        existing_windows = [
+            (ev.t_start, ev.t_end)
+            for ev in target_events
+            if ev.type in (EventType.SPRINT, EventType.DRIBBLE, EventType.POSSESSION)
+        ]
+        candidates = find_candidate_windows(
+            virtual_track, full_key_moment_cfg["prefilter"], existing_windows
+        )
+        key_moment_player_id = target_identity_id(tir.location_track_ids, identity_of)
+        if key_moment_player_id is None and tir.location_track_ids:
+            key_moment_player_id = tir.location_track_ids[0]
+        key_events = classify_candidate_windows(
+            video_path,
+            take.id,
+            key_moment_player_id,
+            candidates,
+            gemini_api_key,
+            full_key_moment_cfg["vlm"],
+            use_nvdec=use_nvdec,
+        )
+        target_events = target_events + key_events
+
+        events_by_number[tir.jersey_number].extend(target_events)
+        takes_used_by_number[tir.jersey_number].append((take.id, tir.location_track_ids))
+
+    full_dropped = full_drops.report()
+    if full_dropped:
+        logger.info("full-event drops: %s", full_dropped)
+    timings.append(
+        StageTiming(
+            stage="full_events",
+            wall_seconds=round(time.time() - t0, 2),
+            vram_peak_mb=None,
+            notes=f"n_jersey_numbers={len(events_by_number)}",
+        )
+    )
+
+    t0 = time.time()
+    final_video_path = output_dir / "original_annotated_video.mp4"
+    render_full_annotated_video(
+        video_path,
+        work_dir,
+        final_video_path,
+        takes,
+        tracks,
+        balls,
+        identity_by_take,
+        dict(events_by_number),
+        frame_width,
+        frame_height,
+        use_nvdec=use_nvdec,
+        goal_region_cfg=configs["goal_region"],
+    )
+    timings.append(
+        StageTiming(
+            stage="annotated_video", wall_seconds=round(time.time() - t0, 2), vram_peak_mb=None
+        )
+    )
+
+    t0 = time.time()
+    for number in sorted(events_by_number.keys()):
+        number_events = events_by_number.get(number, [])
+        possession_seconds = sum(
+            ev.t_end - ev.t_start for ev in number_events if ev.type == EventType.POSSESSION
+        )
+        total_distance = 0.0
+        total_samples = 0
+        total_fragments = 0
+        for take_id, ids in takes_used_by_number.get(number, []):
+            result = compute_distance_covered(
+                ids, full_tracks_by_take.get(take_id, []), full_events_cfg
+            )
+            total_distance += result["distance"]
+            total_samples += result["n_speed_samples"]
+            total_fragments += result["n_track_fragments"]
+        distance_result = {
+            "distance": total_distance,
+            "unit": "bbox_heights",
+            "calibrated": False,
+            "n_track_fragments": total_fragments,
+            "n_speed_samples": total_samples,
+        }
+        player_dir = output_dir / "players" / f"player_{number}"
+        write_player_output(
+            player_dir,
+            number,
+            number_events,
+            possession_seconds,
+            distance_result,
+            takes_by_id,
+            final_video_path,
+            configs["highlights"],
+            goal_result.reason,
+            identity_status="Verified (arrow/manual track selection)",
+        )
+        logger.info(
+            "player_%d: %d event(s) across %d take(s) -- statcard/highlights written",
+            number,
+            len(number_events),
+            len(takes_used_by_number.get(number, [])),
+        )
+    timings.append(
+        StageTiming(
+            stage="player_output", wall_seconds=round(time.time() - t0, 2), vram_peak_mb=None
+        )
+    )
+    if not events_by_number:
+        logger.warning(
+            "no take of %s ever had a located target track -- no players/ folder written",
+            video_path.name,
+        )
 
     hashed_config = config_hash({**configs, "target_jersey": target_jersey})
     report = RunReport(
