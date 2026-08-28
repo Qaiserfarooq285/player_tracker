@@ -203,7 +203,10 @@ class EventType(str, Enum):  # noqa: UP042 -- (str, Enum) is the spec'd contract
     """Kinds of events the pipeline can emit (CLAUDE.md §5, Stage 5; §13.3/ADR-13/ADR-14 add
     SAVE and POSSESSION for the best-effort heuristic layer -- `src/events/{touches,possession,
     tackles,saves}.py`; ADR-17 adds ASSIST alongside GOAL for the real scoreboard-OCR-delta
-    detector -- `src/events/goals.py`)."""
+    detector -- `src/events/goals.py`; ADR-19/20 add TURNOVER (a possession change to a
+    different-colour receiver -- `src/events/possession.py::detect_passes`, never counted as a
+    completed PASS) and OUT_OF_BOUNDS (annotation-only, CLAUDE.md §14.3 -- there is no auto
+    detector for this, it only ever comes from a parsed `Annotation`)."""
 
     GOAL = "goal"
     SHOT = "shot"
@@ -216,6 +219,8 @@ class EventType(str, Enum):  # noqa: UP042 -- (str, Enum) is the spec'd contract
     POSSESSION = "possession"
     KEY_MOMENT = "key_moment"
     ASSIST = "assist"
+    TURNOVER = "turnover"
+    OUT_OF_BOUNDS = "out_of_bounds"
 
 
 class Event(BaseModel):
@@ -235,6 +240,25 @@ class Event(BaseModel):
     confidence: float
     source: str
     evidence: dict = Field(default_factory=dict)
+
+
+class Annotation(BaseModel):
+    """One parsed line from a manual-annotation sidecar (ADR-19, CLAUDE.md §14.3).
+
+    Maps 1:1 to an `Event(source="manual_annotation", confidence=configs/annotations.yaml:
+    default_confidence)` via `src.annotations.parse.annotation_to_event` -- kept as its own model
+    (not built directly into an `Event`) so the parser stays pure/testable against the sidecar's
+    own grammar without needing to know anything about track ids, take ids, or confidence
+    plumbing (Golden Rule 5: every field here is exactly what was read off the client's own line,
+    nothing inferred).
+    """
+
+    t: float
+    jersey_number: int
+    team_colour: str
+    action_phrase: str
+    event_type: EventType
+    raw_line: str
 
 
 class Clip(BaseModel):

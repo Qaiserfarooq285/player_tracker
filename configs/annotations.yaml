@@ -1,0 +1,68 @@
+# ADR-19 (CLAUDE.md §14.3) — manual-annotation sidecar parser config. Owner-authorized recovery
+# path for footage too poor for ADR-15's OCR/VLM identity verification (§3.3 measured 0/14): the
+# client watches the video and supplies a short text file of timestamped events in their own
+# natural phrasing. This file holds the grammar's tunables — the parser (src/annotations/parse.py)
+# hard-codes no phrase strings or confidence numbers (CLAUDE.md §10 "no magic numbers in code").
+
+default_confidence: 0.95 # CLAUDE.md §14.3/ADR-19: a human directly watching the footage and
+# transcribing what they saw is the strongest identity/event evidence this project has (Golden
+# Rule 4) — higher than any auto heuristic's own ceiling in configs/events.yaml (all <= 0.8) — but
+# not a full 1.0, since a human transcript can still contain typos/misremembered timestamps
+# (an honest, non-zero "transcription-fallible" discount, not a fabricated exact certainty).
+
+time_prefixes:
+  # Optional literal prefix stripped before parsing the time field itself — the client's own
+  # example phrasing ("Min 26:56 ...") uses this; the prefix is OPTIONAL in the grammar (a bare
+  # "26:56 player #2 ..." must also parse) so a client who drops the "Min " label isn't rejected.
+  - "Min "
+
+time_pattern: '(?:\d{1,2}:)?\d{1,2}:\d{2}' # MM:SS or H:MM:SS/HH:MM:SS, converted to a float
+# seconds-from-video-start offset (src/annotations/parse.py::_parse_time). Deliberately permissive
+# on hour-digit count (1 or 2) since a client is very unlikely to annotate a 100+ hour clip.
+
+# Ordered phrase -> EventType map (CLAUDE.md §14.3's "starter map"), checked TOP TO BOTTOM against
+# the lower-cased action-phrase text via substring containment — order matters where one phrase is
+# a substring of another's plausible phrasing (e.g. "out of bounds" must be checked as its own
+# entry, not accidentally swallowed by a looser later pattern). The FIRST matching entry wins; an
+# action phrase matching none of them becomes `unmapped_event_type` below (never dropped, §10).
+phrase_map:
+  - patterns: ["touch"]
+    event_type: TOUCH
+  - patterns: ["out of bounds", "out of play"]
+    event_type: OUT_OF_BOUNDS
+  - patterns: ["pass"]
+    event_type: PASS
+  - patterns: ["shot", "shoots", "shoot"]
+    event_type: SHOT
+  - patterns: ["goal", "scores", "score"]
+    event_type: GOAL
+  - patterns: ["assist"]
+    event_type: ASSIST
+  - patterns: ["tackle"]
+    event_type: TACKLE
+  - patterns: ["save"]
+    event_type: SAVE
+  - patterns: ["sprint", "run"]
+    event_type: SPRINT
+  - patterns: ["dribble"]
+    event_type: DRIBBLE
+  - patterns: ["celebrat"] # CLAUDE.md §14.3: deliberately maps to KEY_MOMENT, not a new
+    # CELEBRATION EventType — src/pipeline/player_output.py::_key_moment_label already renders a
+    # KEY_MOMENT as "Celebration" in the timeline by reading Gemini's own reasoning text (ADR-14);
+    # extended here to also read an Annotation's own `action_phrase` for the identical text, so
+    # both routes to the same timeline label share one representation instead of two.
+    event_type: KEY_MOMENT
+
+unmapped_event_type: KEY_MOMENT # CLAUDE.md §14.3: a phrase matching none of the entries above is
+# never dropped -- kept as a KEY_MOMENT event with the raw phrase preserved in evidence, and
+# reported in annotation_report.json (§10 "log everything dropped" -- an unmapped phrase isn't
+# "dropped" exactly, but it is a case the parser couldn't confidently classify, same spirit).
+
+event_window_seconds: 1.0 # An annotation records a single INSTANT the client watched (a touch,
+# a pass, ...), not a measured [t_start, t_end] interval the way an auto-detector's heuristic
+# produces one. When converting an Annotation into an Event (src/annotations/parse.py::
+# annotation_to_event), t_end = t_start + event_window_seconds -- a short, symmetric-feeling
+# window long enough that highlight-clip cutting (configs/highlights.yaml: clip.pre_roll_s/
+# post_roll_s, which are added on top of this) has a non-degenerate [t_start, t_end] to work with,
+# short enough that it stays "this instant", not a fabricated multi-second duration the client
+# never actually specified.
