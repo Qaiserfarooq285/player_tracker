@@ -26,6 +26,8 @@ logger = get_logger(__name__)
 _TIMELINE_EVENT_TYPES = {
     EventType.TOUCH: "Touch",
     EventType.PASS: "Pass",
+    EventType.TURNOVER: "Turnover",  # ADR-20: a possession loss to an opposing colour cluster --
+    # its own template row, distinct from (and never counted toward) "Pass".
     EventType.SPRINT: "Sprint",
     EventType.DRIBBLE: "Dribble",
     EventType.SHOT: "Shot",
@@ -33,6 +35,8 @@ _TIMELINE_EVENT_TYPES = {
     EventType.GOAL: "Goal",
     EventType.ASSIST: "Assist",  # ADR-17: real detector now exists (src/events/goals.py) --
     # previously omitted since EventType.ASSIST didn't exist at all.
+    EventType.OUT_OF_BOUNDS: "Out of bounds",  # ADR-19: annotation-only -- there is no auto
+    # detector for this (CLAUDE.md §14.3), it only ever appears via a parsed manual annotation.
     # EventType.KEY_MOMENT splits into "Celebration"/"Other Key Moment" via _key_moment_label —
     # the owner's template distinguishes the two but this project's single Gemini prompt (ADR-14)
     # classifies both together; the split below is a light, honestly-documented text heuristic on
@@ -46,6 +50,9 @@ _TIMELINE_EVENT_TYPES = {
 # ASSIST existed at all.
 _HIGHLIGHT_CATEGORIES: dict[str, list[EventType]] = {
     "ball_possession": [EventType.POSSESSION],
+    "passes": [EventType.PASS],  # ADR-20/CLAUDE.md §13.4: the owner's explicitly requested reel.
+    "turnovers": [EventType.TURNOVER],  # ADR-20: kept separate from "passes" -- a turnover is
+    # never a completed pass, so it never contributes to that category (Golden Rule 5).
     "dribbles": [EventType.DRIBBLE],
     "assists": [EventType.ASSIST],
     "goals": [EventType.GOAL],
@@ -61,11 +68,17 @@ def _format_timestamp(seconds: float) -> str:
 
 
 def _key_moment_label(event: Event) -> str:
-    """ "Celebration" vs "Other Key Moment" — a light, documented text heuristic on Gemini's own
-    one-sentence reasoning (`Event.evidence['gemini_raw_response']`, `src/events/key_moments.py`),
-    since the single ADR-14 prompt classifies both together and the owner's template distinguishes
-    them. Defaults to "Other Key Moment" when the reasoning text doesn't clearly say so."""
-    raw = str(event.evidence.get("gemini_raw_response", "")).lower()
+    """ "Celebration" vs "Other Key Moment" — a light, documented text heuristic on either
+    Gemini's own one-sentence reasoning (`Event.evidence['gemini_raw_response']`,
+    `src/events/key_moments.py`, ADR-14) or, for a manual-annotation-sourced KEY_MOMENT (ADR-19,
+    `src.annotations.parse.annotation_to_event`), the client's own `evidence['action_phrase']` --
+    the SAME "celebrat" substring test either way (`configs/annotations.yaml`'s own phrase map
+    deliberately maps "celebrat" to KEY_MOMENT rather than a second, competing EventType, exactly
+    so this one heuristic covers both routes). Defaults to "Other Key Moment" when neither text
+    clearly says so."""
+    raw = str(
+        event.evidence.get("gemini_raw_response") or event.evidence.get("action_phrase") or ""
+    ).lower()
     return "Celebration" if "celebrat" in raw else "Other Key Moment"
 
 
@@ -98,10 +111,11 @@ def build_event_timeline_rows(events: list[Event]) -> list[dict]:
 def render_statcard_markdown(
     jersey_number: int,
     counts: dict[str, int],
-    possession_seconds: float,
-    distance_result: dict,
+    possession_seconds: float | None,
+    distance_result: dict | None,
     timeline_rows: list[dict],
     goal_reason: str | None = None,
+    identity_status: str = "Verified",
 ) -> str:
     """The owner's EXACT `statcard.md` template (CLAUDE.md §13.2, revised 2026-08-27), filled with
     real computed values. `Goals`/`Assists` are REAL computed counts (ADR-17) when the scoreboard
@@ -112,6 +126,18 @@ def render_statcard_markdown(
     it is used as-is here rather than re-wrapped in a second "not available (...)" layer. On this
     project's own footage `goal_reason` measurably explains "not available" every time (§3.2(3):
     no scoreboard anywhere) -- a data ceiling, not a missing feature.
+
+    `identity_status` (ADR-19) is `"Verified"` by default (the existing ADR-15 auto path --
+    `TakeIdentityResult.status` only has two literal values, `verified`/`unverified`, and an
+    unverified take never reaches this function at all, see `run_extended_pipeline_for_video`) or
+    `"Human-provided (manual annotation)"` when the caller is Stage 4's manual-events mode (the
+    jersey number/colour came straight from the client's own sidecar, never OCR/VLM-verified).
+
+    `possession_seconds`/`distance_result` are `None` (rendered as `uncertain`, the owner's own
+    word, CLAUDE.md §13.2) rather than a required float/dict, since Stage 4's manual-events mode
+    has no ball-proximity possession heuristic run over annotation-only events to derive either
+    value from (Golden Rule 5: never print a number -- not even a fabricated 0.0 -- for a value
+    genuinely not computed this run).
     """
     goals_count = counts.get("goal", 0)
     assists_count = counts.get("assist", 0)
@@ -130,10 +156,11 @@ def render_statcard_markdown(
         "",
         f"## Player #{jersey_number}",
         "",
-        "**Identity Status:** Verified",
+        f"**Identity Status:** {identity_status}",
         "",
         f"**Touches:** {counts.get('touch', 0)}",
         f"**Passes:** {counts.get('pass', 0)}",
+        f"**Turnovers:** {counts.get('turnover', 0)}",
         f"**Sprints/Runs:** {counts.get('sprint', 0)}",
         goals_line,
         assists_line,
@@ -141,9 +168,17 @@ def render_statcard_markdown(
         f"**Tackles:** {counts.get('tackle', 0)}",
         f"**Saves:** {counts.get('save', 0)}",
         f"**Dribbles:** {counts.get('dribble', 0)}",
-        f"**Possession Time:** {possession_seconds:.1f}s",
-        f"**Distance Covered:** {distance_result['distance']:.2f} {distance_result['unit']} "
-        "(uncalibrated)",
+        (
+            f"**Possession Time:** {possession_seconds:.1f}s"
+            if possession_seconds is not None
+            else "**Possession Time:** uncertain"
+        ),
+        (
+            f"**Distance Covered:** {distance_result['distance']:.2f} {distance_result['unit']} "
+            "(uncalibrated)"
+            if distance_result is not None
+            else "**Distance Covered:** uncertain"
+        ),
         "",
         "## Event Timeline",
         "",
@@ -198,19 +233,21 @@ def write_player_output(
     player_dir: Path,
     jersey_number: int,
     events: list[Event],
-    possession_seconds: float,
-    distance_result: dict,
+    possession_seconds: float | None,
+    distance_result: dict | None,
     takes_by_id: dict[int, Take],
     video_path,
     highlights_cfg: dict,
     goal_reason: str | None = None,
+    identity_status: str = "Verified",
 ) -> None:
     """Write one verified player's complete `output/<slug>/players/player_<N>/` tree
     (CLAUDE.md §13.5). `goal_reason` (ADR-17) is the whole-video
     `src.events.goals.GoalDetectionResult.reason` -- a per-video property (scoreboard
     availability), threaded through so `statcard.md`'s Goals/Assists lines carry the SPECIFIC
     reason (Golden Rule 5) instead of a bare "not available" whenever this player's own counts
-    are genuinely zero.
+    are genuinely zero. `identity_status` (ADR-19) is `"Verified"` by default (the existing
+    ADR-15 auto path) or `"Human-provided (manual annotation)"` from Stage 4's manual-events mode.
     """
     player_dir.mkdir(parents=True, exist_ok=True)
     (player_dir / "events").mkdir(parents=True, exist_ok=True)
@@ -224,7 +261,13 @@ def write_player_output(
     save_json(timeline_rows, player_dir / "events" / "event_timeline.json")
 
     markdown = render_statcard_markdown(
-        jersey_number, counts, possession_seconds, distance_result, timeline_rows, goal_reason
+        jersey_number,
+        counts,
+        possession_seconds,
+        distance_result,
+        timeline_rows,
+        goal_reason,
+        identity_status,
     )
     (player_dir / "statcard.md").write_text(markdown)
 

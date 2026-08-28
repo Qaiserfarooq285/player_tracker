@@ -551,13 +551,14 @@ generated because jersey identity could not be verified"* — and points to the 
 | **All of the above, manual mode** | 🆕 **ADR-19** | when a sidecar exists, the timeline **is** the parsed annotations (`source="manual_annotation"`); auto-detectors are skipped for event generation but detection/tracking still run for the overlay |
 
 ### 13.4 Highlight compilations (per clip, category-specific — not the single ranked reel)
-`output/<slug>/players/player_<N>/highlights/{ball_possession,dribbles,passes,assists,goals,key_moments}.mp4`
+`output/<slug>/players/player_<N>/highlights/{ball_possession,passes,turnovers,dribbles,assists,goals,key_moments}.mp4`
 — each a concatenation of every event in that category for **that known player**, a few seconds of context
 before/after each event (`pre_seconds`/`post_seconds`). **An empty/absent file, not a fabricated one, when a
 category has zero real events.** Each highlight clip carries the same red/green/ball overlay plus an
 event-name + timestamp + jersey-number caption — it is a cut of the **annotated** video (ADR-18), not the raw
-footage. (`passes.mp4` is the owner's explicitly requested pass reel; `goals.mp4`/`assists.mp4` are usually
-empty on amateur footage unless a goal region is marked or a sidecar supplies them.)
+footage. (`passes.mp4` is the owner's explicitly requested pass reel; `turnovers.mp4` is its ADR-20 counterpart
+-- a lost possession never counted toward `passes.mp4`; `goals.mp4`/`assists.mp4` are usually empty on
+amateur footage unless a goal region is marked or a sidecar supplies them.)
 
 ### 13.5 Required directory layout (per input video)
 **When the jersey number is known from the filename (§3.1 clips):** one flat `output/<slug>/` per clip.
@@ -573,6 +574,7 @@ output/<slug>/
       highlights/
         ball_possession.mp4
         passes.mp4                 # owner's requested pass reel
+        turnovers.mp4              # ADR-20: never double-counted into passes.mp4
         dribbles.mp4
         assists.mp4                # empty unless a goal source + preceding same-colour pass exist
         goals.mp4                  # empty unless annotation / scoreboard / marked goal region sources one

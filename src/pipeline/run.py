@@ -488,6 +488,10 @@ def _load_all_configs() -> dict[str, dict]:
         # own run_pipeline_for_video simply never reads these two keys (no behavior change).
         "identity": load_yaml("configs/identity.yaml"),
         "key_moments": load_yaml("configs/key_moments.yaml"),
+        # ADR-19: only ever consumed by src.pipeline.manual_events (a `.annotations.txt` sidecar
+        # is present next to the input, CLAUDE.md §14.1) -- loaded here unconditionally, same
+        # "cheap and harmless when unused" reasoning as "identity"/"key_moments" above.
+        "annotations": load_yaml("configs/annotations.yaml"),
     }
 
 
@@ -568,6 +572,28 @@ def main(
 
     for ref in refs:
         console.rule(f"[bold]{ref.path.name}[/bold]")
+
+        # ADR-19 / CLAUDE.md §14.1: branch selection, in this exact order. A `.annotations.txt`
+        # sidecar next to the input wins UNCONDITIONALLY -- checked before either the filename-
+        # jersey or the ADR-15 auto branch below, because "the client's own file winning is the
+        # trigger" (not a quality score, not whether a jersey number happens to be parseable).
+        annotations_path = ref.path.parent / f"{ref.path.stem}.annotations.txt"
+        if annotations_path.exists():
+            # Imported lazily, same convention as the ADR-15 import below, so importing this
+            # module never pulls the annotation/associate/annotated-video stack unless this
+            # branch actually runs.
+            from src.pipeline.manual_events import run_manual_events_pipeline_for_video
+
+            summary = run_manual_events_pipeline_for_video(
+                ref.path,
+                configs,
+                annotations_path,
+                work_root=work_root,
+                output_root=output_root,
+            )
+            console.print(summary)
+            continue
+
         if ref.target_jersey is None:
             # ADR-15 (CLAUDE.md §3.3): no filename jersey number -> verified-identity extended
             # pipeline, never the Phase-1 single-target flow below. Imported lazily so importing

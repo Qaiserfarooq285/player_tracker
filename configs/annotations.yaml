@@ -58,6 +58,66 @@ unmapped_event_type: KEY_MOMENT # CLAUDE.md §14.3: a phrase matching none of th
 # reported in annotation_report.json (§10 "log everything dropped" -- an unmapped phrase isn't
 # "dropped" exactly, but it is a case the parser couldn't confidently classify, same spirit).
 
+# ---------------------------------------------------------------------------------------------
+# Stage 4 -- manual-mode track association by colour + timing (src/annotations/associate.py).
+# Reuses src/team/classifier.py's existing torso-crop + CIELAB machinery verbatim (Golden Rule:
+# no new model). This module adds the one step ADR-12's own per-take clustering never needed:
+# matching a colour WORD (the client's own "in white"/"in red"/...) to a measured Lab value.
+# ---------------------------------------------------------------------------------------------
+
+colour_reference_lab:
+  # ⚠️ REASONED-BUT-UNMEASURED (same epistemic status as `goal_region.confidence`/
+  # `save.save_gk_proximity_px` in configs/events.yaml -- no real client-annotated footage exists
+  # on this project yet to measure actual jersey-colour Lab values against). These are the
+  # standard CIELAB (D65) conversions of canonical sRGB primary/secondary/named colours -- a
+  # reasonable STARTING reference for "does this track's own measured torso Lab read as roughly
+  # this colour", not a promise that any given kit's exact shade matches these numbers precisely.
+  # Revisit the moment a real client sidecar + footage exists to check real jersey Lab values
+  # against (same "revisit when real data exists" discipline as those two other blocks).
+  white: [100.0, 0.0, 0.0]
+  black: [0.0, 0.0, 0.0]
+  grey: [53.59, 0.0, 0.0]
+  gray: [53.59, 0.0, 0.0] # US spelling alias -- the client's own wording is not policed
+  red: [53.24, 80.09, 67.20]
+  maroon: [25.53, 48.05, 38.06]
+  orange: [74.94, 23.93, 78.95]
+  yellow: [97.14, -21.55, 94.48]
+  green: [87.73, -86.18, 83.18]
+  blue: [32.30, 79.19, -107.86]
+  navy: [12.97, 47.53, -64.70]
+  sky: [91.11, -48.09, -14.13]
+  cyan: [91.11, -48.09, -14.13]
+  purple: [29.78, 58.93, -36.49]
+  pink: [60.32, 98.23, -60.83]
+
+colour_match_max_distance: 40.0 # ⚠️ REASONED-BUT-UNMEASURED: a candidate track's own measured
+# torso Lab must sit within this CIELAB Euclidean distance of the named colour's reference above
+# to count as a confident match -- otherwise `nearest_track_by_colour` returns `None` (Golden
+# Rule 5: caption-only, no red box, rather than a forced guess). 40 sits at roughly half the
+# smallest gap between any two of this table's OWN reference colours (e.g. white/grey = 46.4,
+# black/navy = 79.9) -- close enough to catch real lighting/kit-shade variation around a named
+# colour without being so loose it would also accept a genuinely different colour.
+
+track_association:
+  match_tolerance_s: 0.2 # a candidate track must have a box within this many seconds of the
+  # annotation's own timestamp to be considered "at that instant" at all -- one sampled-frame
+  # step of slop at `configs/hardware.yaml: stages.track.fps_sample`=10 (~0.1s apart), matching
+  # the reasoning `configs/highlights.yaml: selection.arrow_match_tolerance_s` already uses for an
+  # identical "is this the same instant" judgement.
+  window_s: 1.0 # decode a short window this many seconds EITHER SIDE of the annotation's own `t`
+  # (clamped into the take) -- only THIS instant's identity matters for manual-mode association,
+  # unlike `src.team.classifier.collect_track_crops`'s own take-wide sampling (which answers "this
+  # track's colour ALL TAKE", a different question team clustering needs but this doesn't).
+  fps_sample: 5 # cheap enough for a ~2s window to decode near-instantly, dense enough that a
+  # genuine 0.2s match_tolerance_s window contains multiple samples to median across.
+  min_box_height_px: 25 # identical value/reasoning to `configs/team.yaml: sampling.min_box_height_px`
+  # -- below this a torso crop carries essentially no reliable colour signal (CLAUDE.md §3.2).
+  torso_top_frac: 0.15 # identical values to `configs/team.yaml: sampling.torso_top_frac/
+  torso_bottom_frac: 0.50 # torso_bottom_frac/torso_x_inset_frac` -- the same measured band that
+  torso_x_inset_frac: 0.18 # gave a clean CIELAB separation on clip2 (ADR-12), reused here rather
+  # than cross-imported per this project's own "independently runnable stage configs" convention
+  # (see e.g. configs/events.yaml: touch.match_tolerance_s's identical duplication precedent).
+
 event_window_seconds: 1.0 # An annotation records a single INSTANT the client watched (a touch,
 # a pass, ...), not a measured [t_start, t_end] interval the way an auto-detector's heuristic
 # produces one. When converting an Annotation into an Event (src/annotations/parse.py::

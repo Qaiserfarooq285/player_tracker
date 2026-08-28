@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from src.common.types import Event, EventType
 from src.pipeline.player_output import (
+    _HIGHLIGHT_CATEGORIES,
+    _key_moment_label,
     build_event_timeline_rows,
     render_statcard_markdown,
 )
@@ -82,12 +84,93 @@ def test_render_statcard_markdown_uses_exact_template_headers():
     assert "**Identity Status:** Verified" in md
     assert "**Touches:** 3" in md
     assert "**Passes:** 1" in md
+    assert "**Turnovers:** 0" in md  # ADR-20: own line, never fabricated -- genuinely zero
     assert "**Sprints/Runs:** 0" in md  # never fabricated -- genuinely zero, reported as such
     assert "**Goals:** not available" in md
     assert "**Assists:** not available" in md
     assert "**Possession Time:** 12.5s" in md
     assert "(uncalibrated)" in md
     assert "## Event Timeline" in md
+
+
+def test_render_statcard_markdown_counts_turnovers_separately_from_passes():
+    # ADR-20: a turnover must never inflate the Passes count.
+    md = render_statcard_markdown(
+        jersey_number=7,
+        counts={"pass": 2, "turnover": 3},
+        possession_seconds=0.0,
+        distance_result={"distance": 0.0, "unit": "bbox_heights"},
+        timeline_rows=[],
+    )
+    assert "**Passes:** 2" in md
+    assert "**Turnovers:** 3" in md
+
+
+def test_render_statcard_markdown_identity_status_defaults_to_verified():
+    md = render_statcard_markdown(
+        jersey_number=7,
+        counts={},
+        possession_seconds=0.0,
+        distance_result={"distance": 0.0, "unit": "bbox_heights"},
+        timeline_rows=[],
+    )
+    assert "**Identity Status:** Verified" in md
+
+
+def test_render_statcard_markdown_identity_status_manual_annotation():
+    # ADR-19: manual-events mode never claims a stronger "Verified" identity than it earned.
+    md = render_statcard_markdown(
+        jersey_number=2,
+        counts={},
+        possession_seconds=0.0,
+        distance_result={"distance": 0.0, "unit": "bbox_heights"},
+        timeline_rows=[],
+        identity_status="Human-provided (manual annotation)",
+    )
+    assert "**Identity Status:** Human-provided (manual annotation)" in md
+    assert "**Identity Status:** Verified" not in md
+
+
+# ---------------------------------------------------------------------------
+# ADR-19/20: TURNOVER/OUT_OF_BOUNDS timeline rows, passes/turnovers highlight categories, and the
+# _key_moment_label extension for a manual-annotation-sourced KEY_MOMENT
+# ---------------------------------------------------------------------------
+
+
+def test_timeline_includes_turnover_and_out_of_bounds_rows():
+    events = [_event(EventType.TURNOVER, 1.0), _event(EventType.OUT_OF_BOUNDS, 2.0)]
+    rows = build_event_timeline_rows(events)
+    assert [r["label"] for r in rows] == ["Turnover", "Out of bounds"]
+
+
+def test_highlight_categories_include_passes_and_turnovers():
+    assert _HIGHLIGHT_CATEGORIES["passes"] == [EventType.PASS]
+    assert _HIGHLIGHT_CATEGORIES["turnovers"] == [EventType.TURNOVER]
+
+
+def test_render_statcard_markdown_uncertain_possession_and_distance_when_none():
+    # ADR-19: manual mode has no possession heuristic to derive these from -- must say
+    # "uncertain" (owner's own word, CLAUDE.md §13.2), never a fabricated 0.0.
+    md = render_statcard_markdown(
+        jersey_number=2,
+        counts={},
+        possession_seconds=None,
+        distance_result=None,
+        timeline_rows=[],
+    )
+    assert "**Possession Time:** uncertain" in md
+    assert "**Distance Covered:** uncertain" in md
+
+
+def test_key_moment_label_reads_manual_annotation_action_phrase():
+    # ADR-19: a manual-annotation-sourced KEY_MOMENT carries evidence["action_phrase"], not
+    # evidence["gemini_raw_response"] -- the SAME "celebrat" substring test must still apply.
+    celebration = _event(
+        EventType.KEY_MOMENT, 1.0, evidence={"action_phrase": "celebrates with the fans"}
+    )
+    other = _event(EventType.KEY_MOMENT, 2.0, evidence={"action_phrase": "argues with the ref"})
+    assert _key_moment_label(celebration) == "Celebration"
+    assert _key_moment_label(other) == "Other Key Moment"
 
 
 def test_render_statcard_markdown_shows_real_goal_and_assist_counts_when_present():
