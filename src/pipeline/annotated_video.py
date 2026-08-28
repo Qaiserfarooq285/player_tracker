@@ -96,6 +96,17 @@ _CAPTION_DURATION_S = 2.5  # how long ONE event's caption stays on screen after 
 # long enough to be readable at a glance, short enough that two close-together events (e.g. a
 # touch immediately followed by a pass) don't visually smear into one incoherent caption.
 
+# ADR-20/21: human-marked goal-mouth region overlay (`configs/goal_region.yaml`) — deliberately a
+# THIRD colour, distinct from both the target's red and other-players' green, so a viewer never
+# mistakes a goal-mouth polygon for a player box. Drawn on every frame (cheap: a handful of
+# polylines/label calls, no per-frame recomputation of the polygon geometry itself).
+_GOAL_REGION_COLOR = (255, 255, 0)  # BGR cyan
+_GOAL_REGION_THICKNESS = 3
+_GOAL_REGION_LABEL = "GOAL REGION"
+_GOAL_REGION_LABEL_FONT = cv2.FONT_HERSHEY_SIMPLEX
+_GOAL_REGION_LABEL_FONT_SCALE = 0.9
+_GOAL_REGION_LABEL_FONT_THICKNESS = 2
+
 
 def _nearest_by_time(items: list, t: float, tolerance: float, key):
     """Bisect-based nearest-in-time lookup (identical technique to
@@ -329,6 +340,71 @@ def _draw_live_panel(
         )
 
 
+def _prepare_goal_region_polygons(
+    goal_region_cfg: dict | None,
+    slug: str,
+    detect_frame_width: float,
+    detect_frame_height: float,
+    scale_x: float,
+    scale_y: float,
+) -> list[np.ndarray]:
+    """Resolve `configs/goal_region.yaml`'s own `[0,1]`-fraction-of-detect-frame polygons (see
+    that file's header comment — same coordinate space `src.events.goals.detect_goals_for_video`
+    already scales into, ADR-20) into native-pixel `cv2.polylines`-ready `int32` arrays for THIS
+    video's own slug. Empty (⇒ nothing drawn, no placeholder) when no config, no `regions` map, or
+    no entry for this slug exists — the common/default case (ADR-20: `regions: {}` until the owner
+    actually marks one). A malformed individual polygon is logged and skipped, never crashes the
+    whole render (CLAUDE.md §10: one bad config entry must not take down a multi-minute render).
+    """
+    if not goal_region_cfg:
+        return []
+    raw_polygons = (goal_region_cfg.get("regions") or {}).get(slug)
+    if not raw_polygons:
+        return []
+
+    polygons: list[np.ndarray] = []
+    for raw_poly in raw_polygons:
+        try:
+            pts = [
+                (
+                    int(round(x * detect_frame_width * scale_x)),
+                    int(round(y * detect_frame_height * scale_y)),
+                )
+                for x, y in raw_poly
+            ]
+            if len(pts) < 3:
+                raise ValueError(f"polygon needs >= 3 vertices, got {len(pts)}")
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "goal_region: could not parse polygon %r for slug=%s -- skipping it (%s)",
+                raw_poly,
+                slug,
+                exc,
+            )
+            continue
+        polygons.append(np.array(pts, dtype=np.int32).reshape((-1, 1, 2)))
+    return polygons
+
+
+def _draw_goal_regions(frame: np.ndarray, polygons: list[np.ndarray]) -> None:
+    """Draw every prepared goal-region polygon (ADR-20/21) — a no-op when `polygons` is empty
+    (the default, no region configured for this slug), never a placeholder/"not configured" note
+    (Golden Rule 5 spirit: don't manufacture visual noise for an absent feature)."""
+    for pts in polygons:
+        cv2.polylines(frame, [pts], isClosed=True, color=_GOAL_REGION_COLOR, thickness=_GOAL_REGION_THICKNESS)
+        label_x, label_y = int(pts[0][0][0]), int(pts[0][0][1])
+        cv2.putText(
+            frame,
+            _GOAL_REGION_LABEL,
+            (label_x, max(label_y - 10, 20)),
+            _GOAL_REGION_LABEL_FONT,
+            _GOAL_REGION_LABEL_FONT_SCALE,
+            _GOAL_REGION_COLOR,
+            _GOAL_REGION_LABEL_FONT_THICKNESS,
+            cv2.LINE_AA,
+        )
+
+
 def _draw_cut_banner(frame: np.ndarray, take_id: int, verified: bool) -> None:
     width = frame.shape[1]
     cv2.rectangle(frame, (0, 0), (width, _BANNER_HEIGHT_PX), _BANNER_BG_COLOR, -1)
@@ -446,10 +522,17 @@ def render_full_annotated_video(
     detect_frame_width: float,
     detect_frame_height: float,
     use_nvdec: bool = True,
+    goal_region_cfg: dict | None = None,
 ) -> Path:
-    """Render CLAUDE.md §13.1's primary output for one filename-less video: the WHOLE input, at
-    native resolution/fps, red-boxed only during verified takes, green everywhere else, with a
+    """Render CLAUDE.md §13.1's primary output for one video: the WHOLE input, at native
+    resolution/fps, red-boxed only during known-identity takes, green everywhere else, with a
     live stats panel and CUT banners -- then mux the original audio back in.
+
+    `goal_region_cfg` (ADR-20/21, optional) is `configs/goal_region.yaml` verbatim -- when this
+    video's own slug (`work_dir.name`) has one or more marked polygons, they're drawn as a thin
+    cyan outline on every frame; absent for every one of this project's clips until the owner
+    marks one (`_prepare_goal_region_polygons` returns `[]` and nothing is drawn -- Golden Rule 5:
+    no placeholder for an unconfigured feature).
     """
     video_path = Path(video_path)
     native_meta = probe(video_path)
@@ -481,6 +564,10 @@ def render_full_annotated_video(
         number: _NumberProgress(events) for number, events in events_by_number.items()
     }
     active_event_index = _ActiveEventIndex(events_by_number, _CAPTION_DURATION_S)
+
+    goal_region_polygons = _prepare_goal_region_polygons(
+        goal_region_cfg, work_dir.name, detect_frame_width, detect_frame_height, scale_x, scale_y
+    )
 
     video_only_path = work_dir / "debug" / "original_annotated_video_only.mp4"
 
@@ -567,6 +654,8 @@ def render_full_annotated_video(
             # made confidently still gets its caption (name + jersey + timestamp), never silently
             # dropped just because there's nothing to box.
             _draw_event_caption(frame, active_event_index.active_at(t))
+
+            _draw_goal_regions(frame, goal_region_polygons)
 
             yield frame
 

@@ -347,6 +347,7 @@ def run_extended_pipeline_for_video(
         frame_width,
         frame_height,
         use_nvdec=use_nvdec,
+        goal_region_cfg=configs["goal_region"],
     )
     logger.info("annotated video render: %.1fs -> %s", time.time() - t0, final_video_path)
 

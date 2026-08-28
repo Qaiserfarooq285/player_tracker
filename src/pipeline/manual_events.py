@@ -259,6 +259,12 @@ def run_manual_events_pipeline_for_video(
         frame_width,
         frame_height,
         use_nvdec=use_nvdec,
+        # `.get`, not `configs["goal_region"]`: manual mode never touches goal detection itself
+        # (ADR-19 -- the sidecar is the sole event source), so unlike run.py/extended_output.py it
+        # has no pre-existing hard dependency on this key being present in every caller's configs
+        # dict (e.g. a minimal test fixture) -- `render_full_annotated_video` already treats a
+        # missing/`None` goal_region_cfg as "no polygon configured", the correct default anyway.
+        goal_region_cfg=configs.get("goal_region"),
     )
     logger.info("manual-mode annotated video render -> %s", final_video_path)
 
