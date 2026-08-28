@@ -57,6 +57,7 @@ from src.common.logging import get_logger
 from src.common.types import BallDetection, Event, EventType, Take, Track
 from src.common.video import decode_frames
 from src.events.possession import detect_passes, detect_possession, possession_runs_for_take
+from src.events.shots import detect_shots
 from src.identity.jersey_ocr import free_easyocr_reader, load_easyocr_reader
 
 logger = get_logger(__name__)
@@ -461,6 +462,100 @@ def find_assist_event(
 
 
 # ---------------------------------------------------------------------------
+# ADR-20 -- human-marked goal-region detector (a second, independent occurrence source)
+# ---------------------------------------------------------------------------
+
+
+def _point_in_polygon(x: float, y: float, polygon: list[tuple[float, float]]) -> bool:
+    """Standard ray-casting point-in-polygon test, pure/dependency-free (no need for a cv2/shapely
+    import for this -- a handful of point tests per take is cheap either way). `polygon` is a list
+    of `(x, y)` vertices in the SAME normalised-fraction coordinate space the ball centroid is
+    converted into before calling this (see `detect_goals_goal_region`)."""
+    inside = False
+    n = len(polygon)
+    for i in range(n):
+        x1, y1 = polygon[i]
+        x2, y2 = polygon[(i + 1) % n]
+        crosses = (y1 > y) != (y2 > y)
+        if crosses and x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-12) + x1:
+            inside = not inside
+    return inside
+
+
+def detect_goals_goal_region(
+    balls: list[BallDetection],
+    shots: list[Event],
+    slug: str,
+    region_cfg: dict,
+    take_id: int | None,
+) -> list[Event]:
+    """ADR-20 -- the human-marked goal-mouth-region occurrence detector: a SECOND, independent
+    "did a goal occur" source alongside `detect_goals_scoreboard_delta`, for the static-camera
+    footage that has no scoreboard at all (the owner's own `configs/goal_region.yaml`, one or more
+    hand-drawn polygons per video slug -- CLAUDE.md ADR-3's own human-in-the-loop, no-training
+    pattern, never an auto-detected goal line/net).
+
+    `region_cfg['regions']` is `{slug: [[(x, y), ...], ...]}`, `(x, y)` as FRACTIONS of the
+    detect-stage frame (same coordinate space as `configs/events.yaml: goal.candidate_regions`) --
+    a `slug` absent from that mapping means no polygon was ever drawn for this video, so this
+    returns `[]` immediately (Golden Rule 5: no polygon configured is a genuine "not available",
+    never a guessed default region).
+
+    A ball sample counts as a goal candidate only when its centroid falls inside ANY of the
+    slug's own polygons AND a `SHOT` event (`shots`, this take's own `detect_shots` output) ended
+    within `region_cfg['shot_window_s']` seconds before it -- the shot-window gate is what
+    distinguishes an actual strike finding the net from the ball merely sitting/rolling through
+    the marked area (a goal kick, a keeper's distribution, a corner taken from behind the line).
+    Consecutive qualifying samples from the SAME continuous crossing are debounced into one event
+    (`shot_window_s` is reused as the debounce gap too -- a real goal is one instant, not one event
+    per ~0.03s ball sample crossing the line).
+    """
+    polygons = (region_cfg.get("regions") or {}).get(slug)
+    if not polygons:
+        return []
+
+    window = region_cfg["shot_window_s"]
+    shot_ends = sorted(s.t_end for s in shots)
+
+    events: list[Event] = []
+    debounce_until = float("-inf")
+    for ball in sorted(balls, key=lambda b: b.t):
+        if ball.t <= debounce_until:
+            continue
+        inside = any(_point_in_polygon(ball.bbox.cx, ball.bbox.cy, poly) for poly in polygons)
+        if not inside:
+            continue
+        preceding_shot_ends = [t for t in shot_ends if t <= ball.t and (ball.t - t) <= window]
+        if not preceding_shot_ends:
+            continue
+
+        shot_t_end = max(preceding_shot_ends)
+        events.append(
+            Event(
+                id=str(uuid.uuid4()),
+                type=EventType.GOAL,
+                t_start=shot_t_end,
+                t_end=ball.t,
+                player_track_id=None,
+                take_id=take_id,
+                confidence=region_cfg["confidence"],
+                source="goal_region",
+                evidence={
+                    "ball_t": ball.t,
+                    "ball_cx": ball.bbox.cx,
+                    "ball_cy": ball.bbox.cy,
+                    "shot_t_end": shot_t_end,
+                    "shot_window_s": window,
+                    "goal_region_source": "manual",
+                    "slug": slug,
+                },
+            )
+        )
+        debounce_until = ball.t + window
+    return events
+
+
+# ---------------------------------------------------------------------------
 # per-take orchestration (does its own decode; lazily computes possession/pass only if needed)
 # ---------------------------------------------------------------------------
 
@@ -474,14 +569,27 @@ def detect_goals_for_take(
     events_cfg: dict,
     identity_of: dict[int, int] | None,
     use_nvdec: bool = True,
+    frame_width: float | None = None,
+    frame_height: float | None = None,
+    goal_region_cfg: dict | None = None,
+    slug: str | None = None,
 ) -> tuple[list[Event], dict]:
     """Full ADR-17 pipeline for ONE take: decode a low-fps frame series spanning it, run the
-    occurrence scan, and — ONLY when at least one occurrence event is actually found — lazily
-    compute this take's own possession runs + passes (`src/events/possession.py`) purely to
+    scoreboard occurrence scan, and — ONLY when at least one occurrence event is actually found —
+    lazily compute this take's own possession runs + passes (`src/events/possession.py`) purely to
     attribute team/scorer/assist. A take with no scoreboard activation or no increment never pays
     that extra cost, which is what keeps this cheap on scoreboard-less footage (measured true for
     every take of all 5 original clips + `jordan_thomas_highlight_video`, this task's own
     verification run).
+
+    ADR-20 adds a SECOND, independent occurrence source alongside the scoreboard scan: when
+    `goal_region_cfg`/`slug`/`frame_width` are given and a polygon exists for `slug`
+    (`detect_goals_goal_region`), this take's own `SHOT` events are computed (lazily, only then --
+    `frame_width` being `None` skips this path entirely, same "don't pay for what isn't
+    configured" discipline as the scoreboard branch above) and checked for a ball-crossing goal.
+    Region-sourced `GOAL`s never go through team/scorer/assist attribution (they carry no
+    possession-run context of their own to attribute from) -- they are appended to the result
+    as-is, occurrence-only, exactly per ADR-20's own scope.
 
     `identity_of` is the SAME `build_take_identities` partition the caller's own event pipeline
     uses for this take (`None` for the original Phase-1 flow, which has no identity-stitching
@@ -506,8 +614,37 @@ def detect_goals_for_take(
     occurrence_events, debug = detect_goals_scoreboard_delta(
         reader, frames, times, take.id, goal_cfg
     )
+
+    region_events: list[Event] = []
+    region_attempted = False
+    raw_polygons = (goal_region_cfg or {}).get("regions", {}).get(slug) if slug else None
+    if (
+        goal_region_cfg is not None
+        and slug is not None
+        and frame_width is not None
+        and frame_height is not None
+        and goal_region_cfg.get("enabled", True)
+        and raw_polygons
+    ):
+        region_attempted = True
+        # `configs/goal_region.yaml` polygons are authored as [0,1] FRACTIONS of the frame (so one
+        # polygon travels correctly across a re-run at a different decode scale_width) --
+        # `detect_goals_goal_region` itself is unit-agnostic (it just compares ball coordinates
+        # against polygon coordinates directly), so the fraction -> pixel scaling happens exactly
+        # once, here, into a per-call copy of the config rather than mutating the shared one.
+        scaled_polygons = [
+            [(x * frame_width, y * frame_height) for x, y in poly] for poly in raw_polygons
+        ]
+        scaled_region_cfg = {**goal_region_cfg, "regions": {slug: scaled_polygons}}
+        take_shots = detect_shots(take_balls, take.id, frame_width, events_cfg)
+        region_events = detect_goals_goal_region(
+            take_balls, take_shots, slug, scaled_region_cfg, take.id
+        )
+    debug["goal_region_attempted"] = region_attempted
+    debug["goal_region_events_found"] = len(region_events)
+
     if not occurrence_events:
-        return [], debug
+        return region_events, debug
 
     tracks_by_id = {tr.id: tr for tr in take_tracks}
     runs = possession_runs_for_take(take_balls, take_tracks, events_cfg, identity_of)
@@ -522,7 +659,7 @@ def detect_goals_for_take(
         assist_event = find_assist_event(attributed, pass_events, assist_cfg)
         if assist_event is not None:
             events.append(assist_event)
-    return events, debug
+    return events + region_events, debug
 
 
 # ---------------------------------------------------------------------------
@@ -535,12 +672,23 @@ def check_goal_availability(
     activated_any_region: bool,
     events: list[Event],
     goal_cfg: dict,
+    goal_region_configured: bool = False,
 ) -> GoalDetectionResult:
-    """The final Golden-Rule-5 reporting step (ADR-17): turns a scan's own OUTCOME into an honest
-    `GoalDetectionResult`. Never does I/O itself — `detect_goals_for_video` is responsible for
-    actually running the scan; this stays a pure, trivially-unit-testable decision table, so its
-    result is provably driven by real input rather than a hardcoded "not available" regardless of
-    what was actually found (the exact defect ADR-17 fixes).
+    """The final Golden-Rule-5 reporting step (ADR-17, extended by ADR-20): turns a scan's own
+    OUTCOME into an honest `GoalDetectionResult`. Never does I/O itself — `detect_goals_for_video`
+    is responsible for actually running the scan(s); this stays a pure, trivially-unit-testable
+    decision table, so its result is provably driven by real input rather than a hardcoded "not
+    available" regardless of what was actually found (the exact defect ADR-17 fixes).
+
+    ADR-20: the availability decision is now made off `events` (whichever `GOAL`s survived from
+    EITHER the scoreboard-OCR-delta source or the human-marked goal-region source) FIRST, not off
+    `activated_any_region` (the scoreboard-only activation flag) alone -- a video with a configured
+    goal region but no scoreboard anywhere must still correctly report `available=True` off a real
+    region-sourced goal, never masked by "no scoreboard activated". `goal_region_configured` names,
+    in the "not available" reason, whether a human-marked polygon was even in play for this video
+    (`configs/goal_region.yaml`) so the reason always says which of the two sources this module
+    itself attempted (a third source, the ADR-19 manual-annotation sidecar, is a separate pipeline
+    entirely and is not this function's concern).
     """
     if not scan_attempted:
         return GoalDetectionResult(
@@ -549,38 +697,53 @@ def check_goal_availability(
             events=[],
         )
 
-    if not activated_any_region:
-        return GoalDetectionResult(
-            available=False,
-            reason=(
-                "not available (no legible scoreboard found by the region-activation scan -- "
-                "CLAUDE.md ADR-17: EasyOCR was run over each candidate corner region across "
-                "multiple sampled frames per take and none yielded a stable digit-separator-digit "
-                "reading; this is the measured, per-video result, never an assumption from the "
-                "source profile label)"
-            ),
-            events=[],
-        )
-
     goal_events = [e for e in events if e.type == EventType.GOAL]
+    region_note = (
+        "a human-marked goal region IS configured for this video (configs/goal_region.yaml, "
+        "ADR-20) and was also checked"
+        if goal_region_configured
+        else "no human-marked goal region is configured for this video either "
+        "(configs/goal_region.yaml, ADR-20)"
+    )
+
     if not goal_events:
+        if not activated_any_region:
+            scoreboard_note = (
+                "no legible scoreboard found by the region-activation scan -- CLAUDE.md ADR-17: "
+                "EasyOCR was run over each candidate corner region across multiple sampled frames "
+                "per take and none yielded a stable digit-separator-digit reading; this is the "
+                "measured, per-video result, never an assumption from the source profile label"
+            )
+        else:
+            scoreboard_note = (
+                "a scoreboard region activated on this footage, but no debounced score increment "
+                "was ever observed across the video"
+            )
         return GoalDetectionResult(
             available=False,
             reason=(
-                "not available (a scoreboard region activated on this footage, but no debounced "
-                "score increment was ever observed across the video)"
+                f"not available ({scoreboard_note}; {region_note}, and no ball-crossing-a-marked-"
+                "region goal was found)"
             ),
             events=events,
         )
 
     assist_events = [e for e in events if e.type == EventType.ASSIST]
+    scoreboard_n = sum(1 for e in goal_events if e.source == "scoreboard_ocr_delta")
+    region_n = sum(1 for e in goal_events if e.source == "goal_region")
+    source_bits = []
+    if scoreboard_n:
+        source_bits.append(f"{scoreboard_n} via scoreboard-OCR delta")
+    if region_n:
+        source_bits.append(f"{region_n} via a human-marked goal region (ADR-20)")
+    source_desc = "; ".join(source_bits) if source_bits else "via an unspecified source"
     return GoalDetectionResult(
         available=True,
         reason=(
-            f"{len(goal_events)} goal(s) detected via scoreboard-OCR delta "
+            f"{len(goal_events)} goal(s) detected ({source_desc}) "
             f"({len(assist_events)} with an assist credited) -- see each Event.evidence for the "
-            "full audit trail (activated region, before/after reading, possession-window scores, "
-            "supporting pass id), Golden Rule 5"
+            "full audit trail (activated region / marked polygon, before/after reading or "
+            "crossing point, possession-window scores, supporting pass id), Golden Rule 5"
         ),
         events=events,
     )
@@ -600,20 +763,34 @@ def detect_goals_for_video(
     identity_of_by_take: dict[int, dict[int, int]] | None = None,
     ocr_cfg: dict | None = None,
     use_nvdec: bool = True,
+    frame_width: float | None = None,
+    frame_height: float | None = None,
+    goal_region_cfg: dict | None = None,
+    slug: str | None = None,
 ) -> GoalDetectionResult:
-    """ADR-17's real, per-video goal+assist detector — the single entrypoint both
-    `src.pipeline.run` (the 5 original filename-based clips) and `src.pipeline.extended_output`
-    (ADR-15's filename-less flow) call identically. Loads ONE EasyOCR reader for the whole video
-    (CLAUDE.md §11: never reload per-take), matching `src/identity/verify.py`'s own
-    load-once/free-in-`finally` convention.
+    """ADR-17's real, per-video goal+assist detector (ADR-20 adds the human-marked goal-region
+    source alongside it) — the single entrypoint both `src.pipeline.run` (the 5 original
+    filename-based clips) and `src.pipeline.extended_output` (ADR-15's filename-less flow) call
+    identically. Loads ONE EasyOCR reader for the whole video (CLAUDE.md §11: never reload
+    per-take), matching `src/identity/verify.py`'s own load-once/free-in-`finally` convention.
 
     Never trusts `RunProfile.profile` (ADR-11's own lesson): every take gets the SAME measured
     region-activation scan regardless of what the source profiler labeled the video.
+
+    `frame_width`/`frame_height`/`goal_region_cfg`/`slug` (ADR-20) are all optional and default to
+    `None` -- omitting any of them simply skips the goal-region source entirely (never a crash,
+    never a fabricated region), which is exactly what every caller that doesn't yet pass them gets
+    (safe, behaviour-preserving default for any pre-ADR-20 call site).
     """
     goal_cfg = events_cfg["goal"]
+    goal_region_configured = bool(slug and (goal_region_cfg or {}).get("regions", {}).get(slug))
     if not takes:
         return check_goal_availability(
-            scan_attempted=False, activated_any_region=False, events=[], goal_cfg=goal_cfg
+            scan_attempted=False,
+            activated_any_region=False,
+            events=[],
+            goal_cfg=goal_cfg,
+            goal_region_configured=goal_region_configured,
         )
 
     reader = load_easyocr_reader(ocr_cfg or {"gpu": True})
@@ -633,6 +810,10 @@ def detect_goals_for_video(
                 events_cfg,
                 identity_of,
                 use_nvdec=use_nvdec,
+                frame_width=frame_width,
+                frame_height=frame_height,
+                goal_region_cfg=goal_region_cfg,
+                slug=slug,
             )
             if debug.get("activated_region") is not None:
                 activated_any = True
@@ -642,14 +823,17 @@ def detect_goals_for_video(
 
     any_goal = any(e.type == EventType.GOAL for e in all_events)
     logger.info(
-        "goal detection: %s (%d take(s) scanned, region activated=%s)",
+        "goal detection: %s (%d take(s) scanned, scoreboard region activated=%s, goal region "
+        "configured=%s)",
         "available" if any_goal else "not available",
         len(takes),
         activated_any,
+        goal_region_configured,
     )
     return check_goal_availability(
         scan_attempted=True,
         activated_any_region=activated_any,
         events=all_events,
         goal_cfg=goal_cfg,
+        goal_region_configured=goal_region_configured,
     )

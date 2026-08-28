@@ -1,0 +1,26 @@
+# ADR-20 (CLAUDE.md §5.1) -- human-marked goal-mouth region(s) for the "ball into the box = goal"
+# detector (`src.events.goals.detect_goals_goal_region`). Deliberately EMPTY by default: a slug
+# absent from `regions` below means no polygon was ever drawn for that video, so the goal-region
+# path is simply INACTIVE for it and goal detection honestly falls back to "not available" (Golden
+# Rule 5) -- never a guessed/typical goal-mouth position. Same human-in-the-loop, no-training
+# discipline as ADR-3's assisted 4-point pitch calibration: only the OWNER, having actually
+# watched a specific clip, draws a polygon for it.
+#
+# Format: `regions: {<video_slug>: [[[x1, y1], [x2, y2], ...], ...]}`
+#   - `<video_slug>` matches `src.common.io.work_dir_for()`'s own slug (e.g. "clip2_77" for
+#     `input/clip2 77.mp4`, or the slugified stem of a filename-less video).
+#   - each polygon is a list of `[x, y]` VERTICES as FRACTIONS of the detect-stage decoded frame
+#     (same coordinate space as `configs/events.yaml: goal.candidate_regions` -- i.e. Stage 2's
+#     downscaled decode resolution, NOT raw native/4K pixels), so one polygon travels correctly
+#     across a re-run at a different `configs/hardware.yaml: decode.scale_width`.
+#   - a slug MAY have more than one polygon (e.g. both goal mouths visible in one static wide
+#     shot) -- `detect_goals_goal_region` checks the ball centroid against every polygon for the
+#     slug and treats an "inside ANY of them" as one candidate crossing.
+#
+# Example (commented out -- uncomment and adjust after actually watching the specific clip; never
+# copy these numbers as a "typical" goal-mouth position for a different video):
+# regions:
+#   clip2_77:
+#     - [[0.82, 0.35], [0.95, 0.35], [0.95, 0.55], [0.82, 0.55]]
+
+regions: {}

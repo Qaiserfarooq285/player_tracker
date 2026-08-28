@@ -16,12 +16,13 @@ from pathlib import Path
 import numpy as np
 
 from src.common.io import load_yaml
-from src.common.types import Event, EventType, Take, Track
+from src.common.types import BallDetection, BBox, Event, EventType, Take, Track
 from src.events import goals as goals_mod
 from src.events.goals import (
     GoalDetectionResult,
     attribute_goal_team_and_scorer,
     check_goal_availability,
+    detect_goals_goal_region,
     detect_goals_scoreboard_delta,
     find_assist_event,
     find_score_increments,
@@ -412,6 +413,97 @@ def test_find_assist_event_picks_the_nearest_preceding_pass():
 
 
 # ---------------------------------------------------------------------------
+# detect_goals_goal_region (ADR-20) -- acceptance #4
+# ---------------------------------------------------------------------------
+
+
+def _goal_region_cfg(**overrides) -> dict:
+    cfg = dict(_events_config()["goal_region"])
+    cfg.update(overrides)
+    return cfg
+
+
+def _region_ball(t: float, cx: float, cy: float = 0.5) -> BallDetection:
+    return BallDetection(
+        bbox=BBox(x1=cx - 5, y1=cy - 5, x2=cx + 5, y2=cy + 5), conf=0.9, frame_index=0, t=t
+    )
+
+
+def _shot_event(t_end: float) -> Event:
+    return Event(
+        id=f"shot-{t_end}",
+        type=EventType.SHOT,
+        t_start=t_end - 0.5,
+        t_end=t_end,
+        player_track_id=None,
+        take_id=0,
+        confidence=0.2,
+        source="ball_speed_direction_heuristic",
+        evidence={},
+    )
+
+
+SQUARE_POLYGON = [(0.8, 0.0), (1.0, 0.0), (1.0, 1.0), (0.8, 1.0)]  # right-edge 20% of frame
+
+
+def test_detect_goals_goal_region_no_polygon_configured_returns_empty():
+    cfg = _goal_region_cfg(regions={})
+    balls = [_region_ball(1.0, cx=950.0)]
+    events = detect_goals_goal_region(balls, [_shot_event(0.9)], "someslug", cfg, take_id=0)
+    assert events == []
+
+
+def test_detect_goals_goal_region_crossing_inside_shot_window_fires_one_goal():
+    cfg = _goal_region_cfg(regions={"someslug": [SQUARE_POLYGON]})
+    # ball centroid at cx=950 on an implicit 1000-wide frame (cx/cy passed as already-scaled
+    # coordinates, matching how detect_goals_for_take feeds it -- polygon fractions * frame_width)
+    balls = [_region_ball(t=1.0, cx=0.95 * 1.0)]  # cx as a FRACTION here (polygon test is unitless)
+    shots = [_shot_event(t_end=0.5)]  # ended 0.5s before the crossing, inside shot_window_s=3.0
+    events = detect_goals_goal_region(balls, shots, "someslug", cfg, take_id=7)
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.type == EventType.GOAL
+    assert ev.source == "goal_region"
+    assert ev.take_id == 7
+    assert ev.player_track_id is None
+    assert ev.confidence == cfg["confidence"]
+    assert ev.evidence["goal_region_source"] == "manual"
+    assert ev.evidence["slug"] == "someslug"
+
+
+def test_detect_goals_goal_region_crossing_without_preceding_shot_does_not_fire():
+    cfg = _goal_region_cfg(regions={"someslug": [SQUARE_POLYGON]})
+    balls = [_region_ball(t=10.0, cx=0.95)]
+    # no shots at all -- ball merely sitting/rolling in the region is not a goal on its own
+    events = detect_goals_goal_region(balls, [], "someslug", cfg, take_id=0)
+    assert events == []
+
+
+def test_detect_goals_goal_region_crossing_outside_shot_window_does_not_fire():
+    cfg = _goal_region_cfg(regions={"someslug": [SQUARE_POLYGON]})
+    balls = [_region_ball(t=10.0, cx=0.95)]
+    shots = [_shot_event(t_end=1.0)]  # 9s before the crossing -- far outside shot_window_s=3.0
+    events = detect_goals_goal_region(balls, shots, "someslug", cfg, take_id=0)
+    assert events == []
+
+
+def test_detect_goals_goal_region_ball_outside_polygon_does_not_fire():
+    cfg = _goal_region_cfg(regions={"someslug": [SQUARE_POLYGON]})
+    balls = [_region_ball(t=1.0, cx=0.1)]  # far from the polygon (right 20% of frame)
+    shots = [_shot_event(t_end=0.5)]
+    events = detect_goals_goal_region(balls, shots, "someslug", cfg, take_id=0)
+    assert events == []
+
+
+def test_detect_goals_goal_region_debounces_one_continuous_crossing():
+    cfg = _goal_region_cfg(regions={"someslug": [SQUARE_POLYGON]})
+    shots = [_shot_event(t_end=0.5)]
+    balls = [_region_ball(t, cx=0.95) for t in (1.0, 1.2, 1.4, 1.6)]  # one continuous crossing
+    events = detect_goals_goal_region(balls, shots, "someslug", cfg, take_id=0)
+    assert len(events) == 1
+
+
+# ---------------------------------------------------------------------------
 # check_goal_availability -- the final Golden-Rule-5 decision table
 # ---------------------------------------------------------------------------
 
@@ -521,3 +613,142 @@ def test_detect_goals_for_video_no_takes_is_not_available():
     )
     assert result.available is False
     assert result.reason.startswith("not available")
+
+
+# ---------------------------------------------------------------------------
+# check_goal_availability -- ADR-20 region-awareness (must not be masked by "no scoreboard")
+# ---------------------------------------------------------------------------
+
+
+def test_check_goal_availability_region_goal_available_even_with_no_scoreboard_activation():
+    """The bug ADR-20 fixes: a video with NO scoreboard anywhere but a real region-sourced goal
+    must report available=True, never masked by activated_any_region=False."""
+    region_goal = Event(
+        id="region-goal-1",
+        type=EventType.GOAL,
+        t_start=9.0,
+        t_end=10.0,
+        player_track_id=None,
+        take_id=0,
+        confidence=0.45,
+        source="goal_region",
+        evidence={},
+    )
+    result = check_goal_availability(
+        scan_attempted=True,
+        activated_any_region=False,
+        events=[region_goal],
+        goal_cfg=_goal_cfg(),
+        goal_region_configured=True,
+    )
+    assert result.available is True
+    assert "via a human-marked goal region" in result.reason
+
+
+def test_check_goal_availability_neither_source_names_both_as_attempted():
+    result = check_goal_availability(
+        scan_attempted=True,
+        activated_any_region=False,
+        events=[],
+        goal_cfg=_goal_cfg(),
+        goal_region_configured=True,
+    )
+    assert result.available is False
+    assert "human-marked goal region IS configured" in result.reason
+    assert "no ball-crossing-a-marked-region goal was found" in result.reason
+
+
+def test_check_goal_availability_no_region_configured_says_so():
+    result = check_goal_availability(
+        scan_attempted=True,
+        activated_any_region=False,
+        events=[],
+        goal_cfg=_goal_cfg(),
+        goal_region_configured=False,
+    )
+    assert "no human-marked goal region is configured" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# detect_goals_for_video -- ADR-20 goal-region end-to-end (acceptance #4)
+# ---------------------------------------------------------------------------
+
+
+def test_detect_goals_for_video_goal_region_end_to_end(monkeypatch):
+    """Acceptance #4: polygon configured for a test slug + a synthetic ball track crossing it
+    inside the shot window -> exactly one GOAL with source="goal_region"; polygon removed ->
+    goals read not available, no crash, no fabricated goal."""
+
+    def fake_decode_frames(
+        video_path, fps=None, start=None, end=None, scale_width=None, use_nvdec=True
+    ):
+        # no scoreboard text anywhere in this take -- purely exercising the goal-region source
+        for i in range(2):
+            yield i, float(i), np.zeros((10, 10, 3), dtype=np.uint8)
+
+    class EmptyReader:
+        def readtext(self, crop):
+            return []
+
+    monkeypatch.setattr(goals_mod, "decode_frames", fake_decode_frames)
+    monkeypatch.setattr(goals_mod, "load_easyocr_reader", lambda cfg: EmptyReader())
+    monkeypatch.setattr(goals_mod, "free_easyocr_reader", lambda reader: None)
+
+    events_cfg = _events_config()
+    take = Take(id=0, t_start=0.0, t_end=1.0, frame_start=0, frame_end=10, kind="main")
+    frame_width = 1000.0
+    frame_height = 1000.0
+
+    # A fast, sustained rightward ball run (clears shot.ball_speed_threshold with full direction
+    # consistency) ending at cx=910 -- inside the marked polygon's right-hand 15% of the frame.
+    balls = [
+        BallDetection(
+            bbox=BBox(x1=100.0 + i * 90.0 - 5, y1=45.0, x2=100.0 + i * 90.0 + 5, y2=55.0),
+            conf=0.9,
+            frame_index=i,
+            t=i * 0.1,
+        )
+        for i in range(10)
+    ]
+    polygon = [(0.85, 0.0), (1.0, 0.0), (1.0, 1.0), (0.85, 1.0)]
+    goal_region_cfg = {**events_cfg["goal_region"], "regions": {"testslug": [polygon]}}
+
+    result = goals_mod.detect_goals_for_video(
+        video_path="fake.mp4",
+        takes=[take],
+        tracks_by_take={0: []},
+        balls_by_take={0: balls},
+        events_cfg=events_cfg,
+        identity_of_by_take=None,
+        ocr_cfg={"gpu": False},
+        use_nvdec=False,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        goal_region_cfg=goal_region_cfg,
+        slug="testslug",
+    )
+    assert result.available is True
+    goal_events = [e for e in result.events if e.type == EventType.GOAL]
+    assert len(goal_events) == 1
+    assert goal_events[0].source == "goal_region"
+
+    # polygon removed -> not available, no crash, no fabricated goal
+    result_no_polygon = goals_mod.detect_goals_for_video(
+        video_path="fake.mp4",
+        takes=[take],
+        tracks_by_take={0: []},
+        balls_by_take={0: balls},
+        events_cfg=events_cfg,
+        identity_of_by_take=None,
+        ocr_cfg={"gpu": False},
+        use_nvdec=False,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        goal_region_cfg={**events_cfg["goal_region"], "regions": {}},
+        slug="testslug",
+    )
+    assert result_no_polygon.available is False
+    assert result_no_polygon.reason.startswith("not available")
+    assert result_no_polygon.events == [] or all(
+        e.type != EventType.GOAL for e in result_no_polygon.events
+    )

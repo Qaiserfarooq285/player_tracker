@@ -274,6 +274,11 @@ def run_pipeline_for_video(
     goals_cache_config = {
         "goal_cfg": configs["events"]["goal"],
         "assist_cfg": configs["events"]["assist"],
+        "goal_region_cfg": configs["events"]["goal_region"],
+        # ADR-20: the polygon (if any) actually configured for THIS slug, not the whole
+        # goal_region.yaml file -- editing another video's polygon must not invalidate this one's
+        # cache, but editing (or newly adding) this slug's own polygon must.
+        "goal_region_polygon": configs["goal_region"].get("regions", {}).get(work_dir.name),
         "n_tracks": len(tracks),
         "n_balls": len(balls),
         "n_takes": len(takes),
@@ -300,6 +305,10 @@ def run_pipeline_for_video(
             identity_of_by_take=None,
             ocr_cfg=configs["shots"]["ocr"],
             use_nvdec=use_nvdec,
+            frame_width=frame_width,
+            frame_height=frame_height,
+            goal_region_cfg=configs["goal_region"],
+            slug=work_dir.name,
         )
         save_json(goal_result.model_dump(mode="json"), goals_path)
         goals_cache.write_meta()
@@ -469,6 +478,10 @@ def _load_all_configs() -> dict[str, dict]:
         "track": load_yaml("configs/track.yaml"),
         "team": load_yaml("configs/team.yaml"),
         "events": load_yaml("configs/events.yaml"),
+        "goal_region": load_yaml("configs/goal_region.yaml"),  # ADR-20: human-marked goal-mouth
+        # polygons, empty by default -- loaded unconditionally (cheap, tiny file) same as
+        # "identity"/"key_moments" below; every clip's own slug is simply absent until the owner
+        # draws a polygon for it, so this is a no-op for all 5 original clips today.
         "highlights": load_yaml("configs/highlights.yaml"),
         # ADR-15/14: only ever consumed by src.pipeline.extended_output (target_jersey is None
         # path, CLAUDE.md §3.3) -- loaded here unconditionally too since the original 5 clips'

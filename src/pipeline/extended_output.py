@@ -244,6 +244,10 @@ def run_extended_pipeline_for_video(
         identity_of_by_take=identity_of_by_take,
         ocr_cfg=configs["shots"]["ocr"],
         use_nvdec=use_nvdec,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        goal_region_cfg=configs["goal_region"],
+        slug=work_dir.name,
     )
     logger.info("goal detection: %s (%.1fs)", goal_result.reason, time.time() - t0)
     goal_assist_by_take: dict[int, list[Event]] = defaultdict(list)

@@ -153,6 +153,36 @@ assist:
   # can never read more certain than the pass heuristic it is built on).
   min_confidence: 0.1
 
+goal_region:
+  # ADR-20 (owner, 2026-08-27) -- a SECOND, independent goal-occurrence source alongside `goal`'s
+  # scoreboard-OCR delta above, for exactly the footage that has no scoreboard at all (every one
+  # of this project's own clips, §3.2(3)): a HUMAN-MARKED goal-mouth polygon per video
+  # (`configs/goal_region.yaml`, empty by default -- ADR-3's own human-in-the-loop, no-training
+  # pattern, never an auto-detected goal line/net, Golden Rule 2). The ball centroid entering a
+  # marked polygon within `shot_window_s` of a real `SHOT` event becomes a `GOAL` candidate.
+  #
+  # ⚠️ Every default below is REASONED-BUT-UNMEASURED (same epistemic status as `goal`'s own block
+  # comment and `save.save_gk_proximity_px`): no clip in this project has a marked goal region yet
+  # to measure real ball-crossing/shot-timing statistics against. Revisit the moment the owner
+  # actually marks a region on real footage.
+  enabled: true # a single kill switch, independent of whether any slug actually has a polygon --
+  # set False to disable the whole source globally without editing configs/goal_region.yaml.
+  shot_window_s: 3.0 # ADR-20: how long after a SHOT event's own t_end a ball-in-region crossing
+  # still counts as that shot finding the net. Reasoned from `pass.pass_max_gap_s`=2.0 (a
+  # comparable "how long can two related ball events be apart and still be one continuous
+  # sequence" judgement) plus slack for the ball's own flight time from a strike outside the box
+  # to the goal mouth -- generous enough to cover a real shot-to-goal-line flight, tight enough to
+  # exclude an unrelated later goal-kick/keeper-distribution rolling through the same polygon.
+  # Reused as the DEBOUNCE gap too (see `detect_goals_goal_region`): one continuous crossing should
+  # not fire once per ~0.03s ball sample.
+  confidence: 0.45 # BELOW the scoreboard source's own `goal.occurrence_confidence`=0.75 -- a
+  # human-marked region + shot-window heuristic is a real, traceable signal (Golden Rule 5) but a
+  # ball merely being inside a hand-drawn polygon after some shot is weaker evidence than literally
+  # reading an incremented scoreboard digit. Used directly as both min and max here (a single
+  # fixed value, not a formula) since this detector has no further per-event signal to scale by
+  # (unlike `goal.occurrence_confidence`, which stacks DOWN through team/scorer attribution this
+  # detector doesn't attempt -- ADR-20's own scope note).
+
 confidence:
   min_emit_confidence: 0.15 # ANY event (sprint, shot, or any of the ADR-13/14 heuristics below)
   # scoring below this after its own type-specific formula is dropped outright, not emitted —
