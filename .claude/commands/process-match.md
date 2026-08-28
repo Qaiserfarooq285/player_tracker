@@ -10,13 +10,25 @@ card + run report in `output/`. **Meant to be planned in Plan Mode (Opus) and th
 executes." Read `CLAUDE.md` fully before running this; it is the source of truth and overrides
 anything below if they conflict.
 
-## 0. Detect input + parse target jersey
+## 0. Detect input + branch (CLAUDE.md §14.1 — check in this exact order, per video)
 
-- List `input/*.{mp4,mkv,mov}`. For each file, match it against
-  `configs/run.yaml: filename_convention_regex` (`^clip(?P<n>\d+)\s+(?P<jersey>\d+)$` on the
-  stem). A match sets `target_jersey` (run metadata only in Phase 1 — Golden Rule 7, CLAUDE.md
-  §3.1); a non-match still runs, just without a pre-filled jersey label.
-- If `input/` is empty or missing, stop and tell the user what to drop in and where.
+- List `input/*.{mp4,mkv,mov}`. If `input/` is empty or missing, stop and tell the user what to
+  drop in and where. For each file (`make run` does this automatically; `make run VIDEO="<path>"`
+  targets one):
+  1. **Sidecar present?** `input/<basename>.annotations.txt` next to the video ⇒ **ADR-19 manual-
+     events mode** — the parsed sidecar is the sole, authoritative event source (no auto
+     detectors run for event generation); identity (jersey + colour) comes straight from it.
+     This is checked FIRST and wins unconditionally — the client's own file is the trigger, never
+     a quality score. `scripts/make_annotation_template.py <video>` can generate a starter
+     sidecar from a prior run's `identity_report.json`.
+  2. **Else, does the filename match `configs/run.yaml: filename_convention_regex`**
+     (`^clip(?P<n>\d+)\s+(?P<jersey>\d+)$` on the stem)? ⇒ the original Phase-1 flow below,
+     `target_jersey` set from the filename (Golden Rule 7: run metadata only, human still picks
+     the track).
+  3. **Else** ⇒ ADR-15's extended pipeline runs regardless of quality (its own OCR/VLM
+     verification step IS the honest check — it verifies on clear footage, honestly reports
+     unverified takes on poor footage). Pass a human-confirmed number with
+     `make run VIDEO="<path>" TARGET=<jersey>` (ADR-18's `--target-jersey`) if you already know it.
 
 ## 1. Verify environment + secrets — ASK if missing
 

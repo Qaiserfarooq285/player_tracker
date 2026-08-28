@@ -17,8 +17,12 @@ install-gpu:
 		--extra-index-url https://download.pytorch.org/whl/cu121
 
 # Process the video(s) in input/ -> reel + stat card + report in output/ (resumable via work/).
+# CLAUDE.md §14: auto-branches per video (manual-annotation sidecar -> filename jersey -> ADR-15
+# auto). VIDEO=<path> targets a single video instead of every file in input/; TARGET=<n> passes a
+# human-confirmed jersey number for a filename-less video (ADR-18's --target-jersey seam) --
+# meaningless (and harmlessly ignored by main()) for a video with a filename-parsed number.
 run:
-	$(PYTHON) -m src.pipeline.run
+	$(PYTHON) -m src.pipeline.run $(if $(VIDEO),"$(VIDEO)") $(if $(TARGET),--target-jersey $(TARGET))
 
 # Detection mAP + tracking HOTA (+ action mAP@1 later) on data/eval/ (CLAUDE.md §9).
 eval:
