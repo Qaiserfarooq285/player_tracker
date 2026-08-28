@@ -6,10 +6,17 @@
 ## 1. What this project is
 Ingest a **full broadcast soccer match** (90+ min, TV-style: multiple cameras, cuts, zooms, replays,
 on-screen graphics) and produce **per-player highlight reels** + a **basic stat card**.
-User flow: `Upload match → choose a player → process → review actions → auto/select highlights → export reel`.
+User flow: `Upload match → choose a player (by jersey #) → process → review actions → auto/select highlights → export reel`.
 
 Input reality we design for: **broadcast** (hardest case) and a **production** quality bar.
 Reference blueprint (rationale for every choice): https://claude.ai/code/artifact/e3f76bf9-ac19-4d68-8175-f4bfba418f37
+
+**One-line goal (owner, 2026-08-27):** given *any* clip and a target jersey number, produce (a) an
+**annotated copy of the same video** with the target player boxed + labelled with their jersey number and the
+**ball tracked**, (b) a **stat card** with a timestamped event timeline, and (c) **per-category highlight
+reels** (passes, goals, assists, …) — **fully automatic, correct on the first run**. When the footage is too
+poor to read automatically, the client supplies **manual timestamped annotations** and the pipeline runs from
+those instead (ADR-19). See §14 for the single auto flow.
 
 ## 2. Golden rules (do not break without asking the owner)
 1. **Pipeline of specialized models, not one model.** Build stage by stage (§5).
@@ -18,18 +25,26 @@ Reference blueprint (rationale for every choice): https://claude.ai/code/artifac
 3. **Broadcast tax first.** Segment video into continuous **camera takes** and drop replays/close-ups before
    any tracking. Track only *within* a take; reset IDs at every cut.
 4. **Human-in-the-loop for player identity.** Cross-cut auto-ID is not production-reliable — design a
-   user-confirmation step. Never claim perfect automatic identification.
+   user-confirmation step. Never claim perfect automatic identification. (A **human-provided** jersey number —
+   filename metadata, `--target-jersey`, or a manual-annotation sidecar — is the strongest identity evidence
+   we have, ADR-18/ADR-19.)
 5. **Every stat is traceable + carries a confidence.** No fabricated numbers; each event links to its clip.
    Lead with reliable events (goals, shots, sprints); passes/touches/tackles are best-effort, flagged.
 6. **License hygiene.** Prefer Apache-2.0 / MIT / BSD. **RF-DETR, not Ultralytics YOLO. `supervision` tracker,
    not BoxMOT.** Flag any GPL/AGPL/research-only dependency in §7 before adding it.
 7. **Ship Phase 1 first** (§6). No jersey auto-ID or fine-grained action stats until Phase 1 is done + evaluated.
 8. **Evaluation is part of the build.** Stand up the eval harness early; verify with numbers, not vibes.
+9. **One command, first-flow-correct, resumable.** The whole thing runs with a single `make run` that
+   auto-branches per input (§14). "Everything runs auto" (owner, 2026-08-27) is a hard requirement, not a
+   nicety — but "auto" never means "guessed": an honest `not available`/`unverified`/`uncertain` is a correct
+   auto result (Golden Rule 5), a fabricated number is a bug.
 
 ## 3. Current phase
 **▶ PHASE 1 — within-take core with MANUAL player selection**, plus an **owner-authorized, verified-jersey
-auto-ID exception for filename-less inputs** (ADR-15) that pulls a narrow slice of Phase 2 forward. (See §6
-for scope + definition of done.)
+auto-ID exception for filename-less inputs** (ADR-15), a **manual-annotation sidecar path for low-quality
+footage** (ADR-19), and **team-colour-aware pass/turnover/assist + a human-marked goal region** (ADR-20).
+These pull a narrow slice of Phase 2 forward under explicit owner authorization. (See §6 for scope + definition
+of done, and §14 for how they compose into one auto flow.)
 Update this line as we advance.
 
 ### 3.1 Current input set (measured 2026-08-24)
@@ -104,6 +119,9 @@ elevated wide sideline camera, digital pan/zoom cropped out of a stitched panora
 3. **⚠️ No scoreboard anywhere in this footage** → the Phase-1 "goal = scoreboard delta" detector is **N/A**
    here. It stays in the code for broadcast input, but on these clips it must report *"not available"*, never a
    guessed goal (Golden Rule 5). Usable Phase-1 events on this footage: **sprints** and **shots (heuristic)**.
+   *(Goals on this footage now also have the manual-annotation path (ADR-19) and the human-marked goal-region
+   path (ADR-20) — both still honest, both still "not available" when neither a sidecar nor a marked region
+   nor a scoreboard exists.)*
 4. **⚠️ Sparse/ambiguous pitch lines.** clip1 is a shared-use field with **American-football lines painted over
    the soccer pitch** (yard numbers, hashes); clip2/4 show only a touchline and part of a box, with portable
    goals. A pitch-keypoint model trained on pro stadiums will fail on both. This strongly confirms **ADR-3**.
@@ -145,6 +163,13 @@ official throughout and an "IDENTITY: unverified in this segment" panel + CUT ba
 exactly the honest, non-forced outcome CLAUDE.md's own accuracy rule requires when the evidence doesn't
 support a claim, not a build failure.
 
+> **This clip is exactly the case ADR-19 (§14) now covers.** Its escalated crops are genuinely unreadable
+> (0/14 verified — a well-evidenced negative, not a bug). Under the new flow, the honest next step for a clip
+> like this is: the owner watches it and drops a `Jordan Thomas Highlight Video.annotations.txt` sidecar next
+> to it; the pipeline then runs from those human-observed events instead of re-deriving an impossible
+> auto-identity. The `identity_report.json` "unverified" record is what tells the owner *which* takes need a
+> sidecar line.
+
 ### 3.4 Third input (pending): a SoccerNet broadcast clip, to isolate "does jersey OCR/VLM work at all
 on clear footage" from "this specific amateur footage has no legible numbers" (added 2026-08-27)
 
@@ -160,13 +185,48 @@ package itself), only the actual video download does. Default target picked and 
 listing: `england_epl/2016-2017/2016-09-24 - 14-30 Manchester United 4 - 1 Leicester`, `1_720p.mkv`,
 trimmed to the first 5 minutes by default (§6's "validate on a short clip first," not a 45-minute half).
 
+**Keep the SoccerNet path (owner, 2026-08-27):** the download script and its cached clip stay in the repo as
+the project's **good-quality control input** — "if we need high-quality video we can take it." When the auto
+flow (§14) meets a *good-quality* clip it runs the full auto jersey-read (SoccerNet-trained detector, ADR-8,
++ the ADR-15 OCR/VLM identity stack); the SoccerNet clip is what proves that path actually reads numbers when
+the footage supports it, cleanly separated from the amateur-footage legibility ceiling.
+
 **Important scope note, not yet resolved:** SoccerNet broadcast video carries no burned-in arrow (that
 graphic is specific to the owner's own Veo exports, §3.2 consequence 1) and this clip's filename won't carry
 a jersey number either (same filename-less path as §3.3, ADR-15 applies) — so there is no "the target
-player" for this clip, only "whichever track `heuristic_fallback_seed` locks onto." That's fine for
-answering the narrow legibility question this test exists to answer, but it means this run is a capability
-check on the OCR/VLM stage, not a meaningful end-to-end "did we correctly identify a named player" run —
-don't over-read a verified number here as validating the *selection* heuristic, only the *reading* one.
+player" for this clip unless the owner supplies one via `--target-jersey` (ADR-18), only "whichever track
+`heuristic_fallback_seed` locks onto." That's fine for answering the narrow legibility question this test
+exists to answer, but it means this run is a capability check on the OCR/VLM stage, not a meaningful
+end-to-end "did we correctly identify a named player" run — don't over-read a verified number here as
+validating the *selection* heuristic, only the *reading* one.
+
+### 3.5 Owner update 2026-08-27 (this drove ADR-19 + ADR-20 + §14 — the single auto flow)
+The owner restated the end-to-end goal and added two capabilities. Verbatim intent, mapped to what already
+exists vs. what ADR-19/20 add:
+
+| Owner ask (2026-08-27) | Status |
+|---|---|
+| Track the target player **by jersey number**; box them with the number written on the box | ✅ existing (red box `#<N> \| TARGET`, ADR-14/§13.1); jersey from filename / `--target-jersey` / verified-ID / **now also manual-annotation sidecar** (ADR-19) |
+| **Track the ball** in the same output video | ✅ existing ball marker (Stage 2 SAHI, §13.1) — solid when observed, hollow/dashed when interpolated |
+| Per-player **stat card** with a **timestamped** timeline (passes at each time, then the goal) | ✅ existing `statcard.md` template (§13.2); in manual mode the timeline **is** the parsed sidecar (ADR-19) |
+| **Highlight reels** per category (passes, goals, assists, …) | ✅ existing per-category compilations (§13.4) |
+| Output **folder named by the player number** with highlights + stat card + overlay video | ✅ existing `output/<slug>/players/player_<N>/…` (§13.5) |
+| **SoccerNet** jersey detector when quality is **good**; keep the downloaded SoccerNet video for high-quality tests | ✅ existing detector (ADR-8) + OCR/VLM identity (ADR-15); download script kept (§3.4, §8) |
+| When quality is **bad**, the client supplies **manual annotations** (`Min MM:SS player #N in white …`) — run from those | 🆕 **ADR-19** — manual-annotation sidecar, authoritative event source (§14) |
+| **Pass** = target passes to the **same jersey colour**; to the **other** side = not a completed pass; the pass **before a goal** = **assist**; ball into the **"white box"** = **goal** | 🆕 **ADR-20** — team-colour-aware pass/turnover/assist + human-marked goal region |
+| **Everything runs auto**, correct on the first flow | 🆕 Golden Rule 9 + §14 (one `make run`, auto-branches per input) |
+| **Plan with Opus, execute with Sonnet** | ✅ existing convention (§10, `opusplan`) — reinforced in the Claude Code prompt |
+
+**Manual-mode reference input (2026-08-27):** the client's own worked example is
+`https://www.youtube.com/watch?v=wzvM66c8ZmE` with the sidecar lines:
+```
+Min 26:56 player #2 in white takes a touch
+Min 26:58 player #2 in white makes a pass
+Min 27:28 player #2 in white kicks the ball out of bounds
+```
+Downloading YouTube video is out of scope for the pipeline itself (rights/tooling); the owner places the
+downloaded file in `input/` and its `.annotations.txt` sidecar beside it. This exact three-line example is the
+first acceptance test for the ADR-19 parser (§14.3).
 
 ## 4. Data contracts (`src/common/types.py`, pydantic)
 Stages compose through these; intermediate artifacts cache to disk (parquet/JSON + video) so stages run independently.
@@ -174,9 +234,14 @@ Stages compose through these; intermediate artifacts cache to disk (parquet/JSON
 - `Detection(bbox, cls, conf)` · `BallDetection(bbox, conf, interpolated: bool)`
 - `PitchHomography(matrix, keypoints, conf)` — pixels ↔ pitch metres
 - `Track(id, take_id, boxes[], team?, jersey_number?, id_confidence, path_pitch_xy[])`
-- `Event(type, t_start, t_end, player_track_id?, confidence, source)` — `source` = how it was derived
+- `Event(type, t_start, t_end, player_track_id?, confidence, source, evidence{})` — `source` = how it was
+  derived (e.g. `scoreboard_delta`, `possession_heuristic`, `gemini_vlm`, **`manual_annotation`**,
+  **`goal_region`**); `evidence` carries the full traceable trail (Golden Rule 5)
 - `Clip(event_id, t_start, t_end, take_id, rank_score, path)`
 - `PlayerStats(player_ref, counts{...}, confidences{...})`
+- `Annotation(t, jersey_number, team_colour, action_phrase, event_type, raw_line)` — **ADR-19**; one parsed
+  sidecar line; maps 1:1 to an `Event(source="manual_annotation", confidence=annotation_confidence)`
+- `TakeIdentityResult(take_id, jersey_number|None, status, confidence, evidence_frames[], human_override_note?)`
 Rule: no stage invents fields it can't justify; unknowns are explicit (`None` + confidence), never guessed.
 
 ## 5. Architecture (build order; models are current recommendations — verify latest before committing)
@@ -184,60 +249,66 @@ Rule: no stage invents fields it can't justify; unknowns are explicit (`None` + 
 |---|---|---|---|
 | 0 Ingest | decode, sample fps | `ffmpeg` (NVDEC), PyAV | per-stage sampling; 90min@25fps ≈ 135k frames |
 | 0.5 Source profiler | detect input type | cuts (PySceneDetect) + camera-motion + resolution → run profile | `broadcast` / `single-static` / `single-panning`; broadcast path is a **superset** (single-cam = one long take) |
-| 1 Temporal structure | takes, replays, shot type, clock | **PySceneDetect** (→ TransNetV2), replay + shot-type classifier, **PaddleOCR/EasyOCR** | **only when profile=`broadcast`; auto-skipped for single-camera**; protects everything downstream |
-| 2 Perception | players/ball/refs, pitch | **RF-DETR** (Apache), **SAHI** tiling / **TrackNetV3** ball, pitch keypoints + `supervision` ViewTransformer | ball is the weak spot; homography enables speed |
-| 3 Track + team | IDs within take, team | **`supervision` ByteTrack (MIT)**, associate in pitch coords; **SigLIP→UMAP→KMeans** team | reset IDs at cuts; same-kit ⇒ weak appearance |
-| 4 Identity *(Phase 2)* | who is #N | **ViTPose**→legibility→**PARSeq**→tracklet vote (ref `mkoshkina/jersey-number-pipeline`); VLM fallback; fuse #+team+ReID+position → `id_confidence` → **HITL** | ~87% per-tracklet ceiling; route low conf to human |
-| 5 Events | actions | P1: goals (scoreboard Δ), shots (heuristic), sprints (homography+speed). P2+: **T-DEED** action spotting; assist = rule (inferred); optional Gemini/TwelveLabs | ~60 mAP@1 SOTA for ball actions |
-| 6 Assemble | rank, cut, reel, stats | rules score + optional VLM; `ffmpeg` cut (snap to takes, dedupe); stat card w/ confidence + click-to-clip | user picks clip count/length |
+| 0.6 Annotation ingest *(ADR-19)* | parse manual sidecar if present | `src/annotations/parse.py` + `configs/annotations.yaml` phrase map | **if `input/<video>.annotations.txt` exists ⇒ manual-events mode: sidecar is the authoritative event source (§14.1); no new deps (stdlib `re`)** |
+| 1 Temporal structure | takes, replays, shot type, clock | **PySceneDetect** (→ TransNetV2), replay + shot-type classifier, **PaddleOCR/EasyOCR** | **only when profile=`broadcast`; auto-skipped for single-camera**; shot-boundary always runs (ADR-7); protects everything downstream |
+| 2 Perception | players/ball/refs, pitch | **RF-DETR** (Apache, ADR-8), **SAHI** tiling / **TrackNetV3** ball, pitch keypoints + `supervision` ViewTransformer | ball is the weak spot; homography enables speed |
+| 3 Track + team | IDs within take, team-**colour** | **`supervision` ByteTrack (MIT)**, associate in pitch coords; **torso-colour CIELAB KMeans** team (ADR-12) | reset IDs at cuts; **team colour is what ADR-20's pass/turnover rule keys on** |
+| 4 Identity *(Phase 2 slice: ADR-15/18/19)* | who is #N | filename / `--target-jersey` / **manual-annotation sidecar** (human-given ⇒ verified, ADR-19) → else **ViTPose**→legibility→**PARSeq/EasyOCR**→tracklet vote + **Gemini VLM** fallback; fuse #+team+ReID+position → `id_confidence` → **HITL** | human-given number is strongest evidence (GR4); ~87% per-tracklet ceiling for auto reads; route low conf to human/sidecar |
+| 5 Events | actions | **manual sidecar (ADR-19, authoritative when present)**; else P1: goals (scoreboard Δ / **marked goal region, ADR-20**), shots (heuristic), sprints (homography+speed), **passes/turnovers (team-colour, ADR-20)**, touches/tackles/saves/dribbles (ADR-13), celebrations/key-moments (Gemini, ADR-14); **assist = pass-before-goal to a teammate (ADR-17/20)** | ~60 mAP@1 SOTA for ball actions; each heuristic honestly flagged |
+| 6 Assemble | rank, cut, reel, stats | rules score + optional VLM; `ffmpeg` cut (snap to takes, dedupe); **per-category highlight reels cut from the annotated render** (ADR-18); stat card w/ confidence + click-to-clip | user picks clip count/length |
 
 ## 5.1 Decision log (ADRs — deviations from the original brief, with reasons)
 Anything here overrides the brief's default suggestion. Add a row whenever a recommendation is changed.
 
+> **Two-tier log.** The table below is the **working summary** — kept lean because this whole file is read at
+> the start of every session. The **full verbatim rationale + run-logs** for every ADR live in
+> [`docs/adr-evidence.md`](docs/adr-evidence.md), anchored by number (`#adr-15`, `#adr-17`, …). Rows that were
+> condensed carry a `→ full evidence` link. **When you condense a new ADR row here, move its verbatim text into
+> `docs/adr-evidence.md` in the same commit** — same discipline as keeping this file current.
+
 | # | Decision | Why | Status |
 |---|---|---|---|
-| ADR-17 | **Finish real goal detection (scoreboard-delta) + best-effort scorer/assist attribution, self-gated on actually finding a legible scoreboard — never on the `profile` label** | Owner asked (2026-08-27) to "do something about goal and assist" rather than leave `detect_goals_scoreboard_delta` a permanent `NotImplementedError` stub. §3.2(3)/§3.4 established goals are a genuine **data ceiling** on the owner's own footage (no scoreboard exists), but the incoming SoccerNet broadcast clip (§3.4) is exactly the input this path was always meant for — the stub just needed finishing, not redesigning. **Scope of what's real, in order of confidence:** (1) **goal occurrence** — OCR-scan a small set of CANDIDATE scoreboard regions (top-left, top-right; score bugs are essentially never bottom-corner) across several early sampled frames, using the existing `configs/shots.yaml: ocr` EasyOCR engine; a region only "activates" for a run if it yields a STABLE, plausible `digit [sep] digit` pattern across multiple frames — this is a measured self-check, not trust in one hardcoded ROI or the `profile == broadcast` label (ADR-11's own lesson: read the measured signal). A goal event fires on a debounced digit increment in an activated region — this is the highest-confidence signal in the chain (literally reading the score). (2) **scoring team** — deliberately sidesteps ever needing to know which on-screen digit is "home"/"away": credit whichever team (our own colour-cluster, not the scoreboard's own left/right semantics) held ball possession (existing `src/events/possession.py::possession_runs_for_take`/`track_team`) in the window immediately before the digit changed. (3) **scorer** — same idea one level down: the individual identity with the last possession run before the goal, gated to the team from (2). (4) **assist** — new `EventType.ASSIST`; the rule is literally the owner's own words back: the nearest preceding `PASS` event (`src/events/possession.py::detect_passes`, which already carries `evidence["receiver_identity"]`) whose receiver is the credited scorer, from a teammate, within a configurable `assist_window_seconds` — credited to the passer. Each step down the chain (occurrence → team → scorer → assist) stacks a heuristic on a heuristic, so confidence is deliberately driven DOWN at each step and every event's `evidence` carries the full trail (which region/frames the OCR locked onto, the possession-window scores considered, which specific `Event.id` was picked as the assist) — Golden Rule 5, same "stack of flagged heuristics" pattern ADR-13 already established as owner-authorized for touches/passes/tackles. **Deliberately NOT built:** visual ball-crosses-the-goal-line/mouth detection (the owner's own "ball goes under the white box" framing). No current detector class represents a goal frame/net (`ball, player, referee, goalkeeper` only) and adding one means training a new class from scratch (Golden Rule 2); a homography-based goal-mouth-crossing check would need automatic pitch-keypoint calibration for a PANNING broadcast camera, which ADR-3 explicitly left as an unevaluated future item, not a static-camera 4-point calibration like the owner's own clips use; a naive "ball bbox disappears near a corner region" shortcut would be exactly the fragile, ungrounded guess Golden Rule 5 warns against (corners, saves, clearances, and camera cuts all look similar to that heuristic). Flagged as a candidate future ADR contingent on broadcast pitch-keypoint calibration landing first (which calibrated speed/distance would also benefit from), not silently dropped. **Still correctly "not available" on the owner's own 5 clips + `jordan_thomas_highlight_video`** — now because the self-gating OCR scan measurably finds no stable scoreboard pattern there (a live check, not a hardcoded "these clips have no scoreboard" fact repeated from §3.2(3)). **Concrete defaults landed in `configs/events.yaml` (reasoned, not measured — no real goal footage exists on this project to calibrate against, same epistemic status as `save.save_gk_proximity_px`):** `candidate_regions` = top-left `[0,0,0.25,0.12]` + top-right `[0.75,0,1.0,0.12]`, tried in that order; `activation_frames_count`=8 early samples, `min_stable_frames`=5 (a clear majority, not a bare plurality) to activate a region; `increment_debounce_samples`=2 subsequent samples before trusting an increment; `occurrence_confidence`=0.75 (highest in the chain), `possession_lookback_s`=8.0 (goal step 2), `assist_window_seconds`=15.0 (goal step 4) — each stacks the confidence DOWN via `team_unknown_confidence_penalty`=0.5 / `scorer_confidence_multiplier`=0.8 / `assist_confidence_multiplier`=0.6. **Verified 2026-08-27** with a real, non-mocked run of the finished `detect_goals_for_video` against all 6 clips' own cached `work/<slug>/` artifacts (the 5 originals + `jordan_thomas_highlight_video`): every one reports the honest "not available (no legible scoreboard found by the region-activation scan...)" reason — confirming the self-gating scan genuinely finds nothing on this footage rather than assuming it. | ✅ implemented + verified 2026-08-27 |
-| ADR-18 | **Spec-completeness audit against the owner's full 29-section jersey/event spec (2026-08-27) found three real gaps, fixed alongside ADR-17** | Owner asked to confirm "everything I told you in the prompt" is actually wired into the pipeline/statcard, ahead of manually confirming a jersey number for the incoming SoccerNet clip (§3.4). Audited section-by-section against the actual code (not assumed) and found: **(1) no human-confirmed-identity path existed.** `target_jersey` could only ever come from the `clip<N> <jersey>` filename regex — a filename-less video (the owner's own stated new workflow: watch the clip, then tell the system the number) had no seam to receive that. Fix: `main()` gains a `--target-jersey` CLI override for filename-less videos; `src.identity.verify` threads an optional `human_confirmed_jersey` through aggregation — a human-given number needs only ONE non-contradicting read to verify (a human directly watching the footage is stronger evidence than an independent OCR/VLM multi-frame vote, Golden Rule 4), but a read that ACTIVELY DISAGREES with the human's number is surfaced, never silently suppressed (Golden Rule 5 — disagreement is itself evidence worth keeping). **(2) highlight-category clips were cut from the RAW input, not the annotated render** — found by tracing `write_player_output`'s `video_path` argument back to `run_extended_pipeline_for_video`'s own raw-file parameter; `render_full_annotated_video` didn't even run yet at the point highlights were cut. Directly contradicts owner spec §24 ("highlight videos should also show RED/GREEN boxes, ball tracking, event name, timestamp, jersey number"). Fix: reorder so the full annotated render happens BEFORE the per-player loop, and highlight-clip cutting reads from `original_annotated_video.mp4`, not the source. **(3) green-box labels read a bare `#{track_id}`** — indistinguishable at a glance from a jersey number, undermining the owner's own explicit §7 requirement ("track ID and jersey identity are different concepts... do NOT assume Track ID 10 = Jersey #10"). Fix: green boxes now read `ID: {track_id}`; the target's red box reads `#{jersey_number} | TARGET | ID: {track_id}` — both identifiers visible, neither ambiguous. **Not a gap, verified correct:** the live stats panel already shares the exact same per-player `Event` list used to write `statcard.md` (`_NumberProgress.advance_to`, keyed correctly per verified jersey number per take) — owner spec §20's "no separate hardcoded counters" rule was already satisfied, confirmed by reading the render loop rather than assumed. **Implemented 2026-08-27:** `--target-jersey` lives on `main()` alongside `--track-id`; `aggregate_take_identity` gained `human_confirmed_jersey` (one supporting read verifies; a contradicting majority is recorded in a new `TakeIdentityResult.human_override_note` field, never hidden); `run_extended_pipeline_for_video` reorders `render_full_annotated_video` before the per-player loop and feeds `write_player_output` the rendered `original_annotated_video.mp4` path instead of the raw source; green boxes render `ID: {track_id}`, the target's red box renders `#{jersey_number} \| TARGET \| ID: {track_id}`. **Verified 2026-08-27** with a full, real re-run of `run_extended_pipeline_for_video` for `jordan_thomas_highlight_video` (detection/tracking served from cache; identity/events/goals/render recomputed, 1123s total) — completed with exit code 0: 1/14 takes verified as jersey #11, goal detection correctly reported "not available" (region-activation scan found nothing, ADR-17), the 234.13s annotated video rendered successfully BEFORE the per-player loop ran, and `players/player_11/statcard.md`'s Goals/Assists lines show the real ADR-17 reason text (not a hardcoded string), confirming the reordering didn't break anything. | ✅ implemented + verified 2026-08-27 |
-| ADR-16 | **Cut detection: fixed-threshold `ContentDetector` does not generalize across a heterogeneous multi-match compilation; per-take identity now depends on getting this right** | §3.3 measured that `Jordan Thomas Highlight Video.mp4`'s real cuts sit at content-value scores as low as ~21–27 (a 13-cut set, stable across thresholds 21.0/24.0/27.0 — the same "find the plateau" method ADR-7 used), while clip4's three confirmed **false**-positive foreground-crossings score up to 32.0. No single fixed threshold can keep clip4's false positives out *and* catch this new video's real cuts — the existing global default (38.0, tuned on clip4) misses 6 of the 13; lowering the global default to clip4's false-positive ceiling would corrupt clip4. This now matters more than it used to: ADR-15's per-take jersey verification is only as good as take segmentation — a missed cut means the tracker (and then the jersey-OCR/VLM step) runs straight across a real venue/match change, contaminating one take's "verified identity" with another game's frames. **Resolution (scoped, low-risk):** `configs/shots.yaml: scenedetect` gains an `overrides: {<video-slug>: <threshold>}` map, keyed by the same slug `work_dir_for()` already uses everywhere; `detect_takes()` looks itself up there and falls back to the existing global `threshold` when absent — so the original 5 clips' behaviour is provably unchanged (no entry for them). `jordan_thomas_highlight_video: 24.0` is the measured entry, verified by eyeballing contact-sheet frames either side of each of the 13 cut timestamps before locking it in (same verification discipline as ADR-7). PySceneDetect's `AdaptiveDetector` (same library/license, rolling-average threshold instead of one fixed number) would be the more general long-term fix for arbitrary future compilations, but is **deferred** — not evaluated here — to keep this change small and reviewable. | ✅ adopted 2026-08-27 (per-video override); AdaptiveDetector deferred |
-| ADR-15 | **Verified-jersey identification required when no filename jersey number exists; no verified number ⇒ no target identity ⇒ no target stats for that take** | Owner request (2026-08-27, full spec in chat): for a video with no `clip<N> <jersey>` filename metadata, the target player's jersey number must be **read from visual evidence and confirmed**, never guessed from appearance, position, team, or the burned-in arrow alone (the arrow is a *location* prior, not an identity — §3.2 consequence 1 already says this; it reads no digits). This is a deliberate, owner-authorized pull-forward of a narrow slice of **Phase 2** (§6) for this input only — Golden Rule 7's "no jersey auto-ID until Phase 1 done" is superseded here by an explicit owner instruction, the same pattern as ADR-13's exception, not a silent scope change. **Pipeline addition:** for each **take** (cuts matter more now — ADR-16), take the arrow-hint track (existing `selection.py` logic, generalized) as a **location candidate only**; crop that track's box across the take at native/high resolution wherever it's front/back-facing and large enough to plausibly read a number; run **EasyOCR** (Apache-2.0, already in `configs/shots.yaml`'s license-approved OCR row) plus **Gemini** (owner-supplied key, ADR-14) as a cross-check on the same crops; require **temporal agreement across multiple frames**, not a single read (owner's explicit "don't randomly pick one frame's answer" rule). A take's identity record is `{take_id, jersey_number: int|None, status: verified|unverified, confidence, evidence_frames[]}`. **Unverified take ⇒ no red box, no target stats for that take** — green boxes and ball tracking still render (those don't depend on identity), and the run report says plainly "target could not be reliably identified in take N," never a guessed fallback. **Output is grouped by verified jersey number, not by an assumed single continuous human identity**: because this compilation's segments come from different matches with visibly different kits (§3.3), two takes verified to *different* numbers are **not** merged into one player just because the same arrow-selection heuristic picked a person in both — that would itself be an appearance/position-based identity assumption, which the owner explicitly forbade. Each distinct verified number gets its own `output/<slug>/players/player_<N>/` folder (statcard, highlights, timeline); the single annotated video still shows one continuous red box per take, labeled with that take's own verified number. Gemini model note: `gemini-2.5-flash` (ADR-14's implicit assumption) now 404s for new callers ("no longer available to new users") — resolved to **`gemini-3.6-flash`** (confirmed reachable 2026-08-27), with retry-on-503 (measured transient `UNAVAILABLE` during testing).
-> **✅ Built + run end-to-end 2026-08-27.** Concrete details pinned during implementation: crop min height **120px** at native 4K (`configs/identity.yaml: crop.min_crop_height_px`, derived from the §3.2 "legible at 4K" finding scaled to native res); at most **6** OCR-ambiguous-or-silent crops per take escalated to the VLM (`vlm.max_escalations_per_take`, cost control mirroring ADR-14's own pattern); verification requires **>= 2 independent frames** (OCR and/or VLM, any mix) agreeing on the identical digit string, with a **strict, never-arbitrarily-broken tie rule** (`aggregation.min_agreeing_frames`/`aggregate_take_identity` in `src/identity/verify.py`) — a 2-vs-2 split, or any tie for the top count, stays unverified. Evidence collection is ONE single native-resolution decode pass over the whole video (not per-candidate-frame seeking), bucketed into takes by timestamp, specifically to avoid the keyframe-seek inaccuracy that could otherwise leak one take's frames into another's identity evidence.
-> **⚠️ Mid-run discovery: `gemini-3.6-flash`'s free tier carries a hard 20-REQUESTS-PER-DAY quota** (`quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier"`) — the first real end-to-end run exhausted it partway through take 6 of 14, and the original single-model retry logic just retried the same exhausted model until giving up, silently turning every later take into a false "unverified" (crops never actually looked at). **Fixed**: `src/common/gemini.py::call_gemini_vision` now takes an ORDERED FALLBACK LIST (`configs/identity.yaml`/`configs/key_moments.yaml: vlm.models`: `[gemini-flash-lite-latest, gemini-3.1-flash-lite, gemini-3.6-flash]`), and distinguishes a 429 with body `error.status == "RESOURCE_EXHAUSTED"` (daily quota — skip straight to the next model, no point retrying) from a transient 429/5xx (still retried on the SAME model with backoff first). Which model actually answered is recorded in every evidence entry (`"[model=<name>] <response text>"`).
-> **Real result on `Jordan Thomas Highlight Video.mp4`, re-run with the fix: 0/14 takes verified.** Every one of the 13 non-empty takes' escalated crops got a genuine answer from a working model (0 VLM failures anywhere — confirmed by inspecting `identity.json`'s own evidence trail, not just the summary counts) — e.g. *"The player is viewed from the side and no jersey number is visible"*, *"The image is extremely blurry and low-resolution"*, *"The jersey number on the back is partially visible and obscured"*. EasyOCR likewise found zero confident reads anywhere. This is a genuine, well-evidenced negative, not a quota-silenced default: the arrow-marked target specifically is too blurred/angled/small to read across every take, even in frames where a *different*, non-target player's own number is clearly legible (spot-checked visually in the rendered output at t≈65s, take 6: player #21's "9" is crisp while the arrow-marked player is unreadable from that angle). `output/jordan_thomas_highlight_video/players/` is therefore correctly EMPTY — no forced result. | ✅ built + run 2026-08-27 |
-| ADR-1 | **PyAV + ffmpeg CLI for decode; drop `decord`** | `decord` 0.6.0 has no cp311/cp312 wheels and is effectively unmaintained; building it from source is a needless risk. PyAV covers seeking/frame-accurate decode, and `ffmpeg -hwaccel cuda -c:v h264_cuvid` covers NVDEC bulk decode. Same capability, zero build risk. | ✅ adopted |
-| ADR-2 | **Roboflow's soccer player/pitch checkpoints are YOLOv8 → AGPL → cannot ship** | `roboflow/sports` is MIT *code*, but the released player-detection and field-keypoint **weights are Ultralytics YOLOv8**, which is AGPL-3.0. Using them violates Golden Rule 6. Resolution ladder: (a) an **Apache-2.0 RF-DETR** soccer checkpoint; (b) **RF-DETR COCO-pretrained** (`person` + `sports ball`); (c) optional overnight fine-tune. **No training in Phase 1 either way.** | ✅ **resolved → see ADR-8** |
-| ADR-8 | **Phase-1 detector = `julianzu9612/RFDETR-Soccernet` (Apache-2.0), with RF-DETR-COCO as fallback** | Investigated 2026-08-24 with the validated Roboflow key. **(1)** The three canonical Roboflow soccer projects (`football-players-detection-3zvbc`, `football-field-detection-f07vi`, `football-ball-detection-rejhg`) return `model: None` on **every** version — Roboflow hosts **no trained weights** for them, only data. Their *datasets* are **CC BY 4.0** (commercially usable with attribution) — so they are excellent **eval + future fine-tune** material, which is how we use them. **(2)** On HF, `julianzu9612/RFDETR-Soccernet` is **Apache-2.0**, RF-DETR-Large (128 M, DINOv2 backbone, 1280², 1.46 GB) with exactly the classes we need — `ball, player, referee, goalkeeper` — reporting mAP@50 **0.857** / mAP **0.498** on SoccerNet. **(3)** The alternative `OrbitalLab/mova-rfdetr-soccernet-v1` (MIT) is **gated** (needs an access request) → skipped. | ✅ adopted for P1 |
-| ADR-9 | **⚠️ SoccerNet-derived weights are dev-only until licensing is cleared** | ADR-8's checkpoint is *declared* Apache-2.0 by its uploader, but it was **trained on SoccerNet-Tracking-2023**, and §7 lists SoccerNet data as **research/education only**. Whether an uploader can relicense a model trained on restricted data is legally unsettled — so this is a Golden-Rule-6 "flag before adding", not a silent adoption. **Use it for Phase-1 development and evaluation** (internal R&D, not distribution). **Before any commercial ship**, take one of: (i) obtain SoccerNet commercial terms, (ii) fine-tune RF-DETR on the **CC BY 4.0** Roboflow soccer dataset, or (iii) fall back to RF-DETR-COCO. Do not ship (i)-unresolved. | ⚠️ open — revisit before ship |
-| ADR-11 | **Downstream stages must consume the *motion score*, not the static/panning *label*** | Stage 0.5 put **4 of 5 clips inside the ambiguous band** (1.5–6.0 px/frame). clip2 scores **3.79 → `single-panning`** while clip4 scores **3.14 → `single-static`**, purely because the band's midpoint is 3.75 — essentially identical footage landing on opposite sides of a knife-edge. Worse, the label is contaminated by the ~3–5 s settling pan every clip opens with (§3.2), which is a startup transient, not a camera regime. Acting on the label would mean "calibrate homography once" vs "re-estimate continuously" flipping on noise. **Resolution:** the label stays in `RunProfile` for reporting, but **ADR-3's homography cadence reads `motion_score` directly** — recalibration interval scales continuously with measured motion, with the settling window excluded. For Veo footage the honest answer is that the camera digitally pans to follow play, so homography needs periodic re-estimation *regardless* of which label it got. | ✅ adopted — implement at Stage 2/pitch |
-| ADR-14 | **Full extended-output spec: exact statcard.md format, full-resolution annotated original video, per-category highlight reels, Gemini for celebrations** | Owner supplied a complete, detailed spec (2026-08-25) superseding/extending ADR-13 — see **§13** for the full text. Key decisions: (1) the "primary output" is the **original video at original resolution/fps/duration/audio**, annotated in place (red box = target, green = others, ball marker, live stat panel) — not a separate downscaled debug render; (2) `statcard.md` must use the owner's exact template with real computed values, `[uncertain]` wherever a stat can't be reliably derived rather than any invented number (owner's own accuracy rule, independently identical to Golden Rule 5); (3) category-specific highlight compilations (`ball_possession.mp4`, `dribbles.mp4`, `assists.mp4`, `goals.mp4`) — an empty file (not a fabricated one) when a category never occurs, per the owner's own "do not fabricate a highlight" rule; (4) celebrations/"other key moments" — asked the owner directly (no heuristic exists that means anything here); owner chose to supply a **Gemini API key** rather than a cheap heuristic or skipping — Gemini is used ONLY to classify short, cheaply-pre-filtered candidate windows as celebration/key-moment or not; it never touches player/ball detection, which stays RF-DETR (Golden Rule 1 — pipeline of specialized models, VLM is one more specialized stage, not a replacement). | ✅ owner-authorized 2026-08-25 |
-| ADR-13 | **Owner explicitly authorized best-effort touch/pass/tackle/save heuristics ahead of Phase 1 completion** | Golden Rule 7 reserves fine-grained action stats for Phase 2+ and requires asking the owner before breaking it. Asked (2026-08-25): owner chose "best-effort heuristics now" over staying Phase-1-only or building a real fine-tuned action-spotting model. Scope: touch/pass/tackle/save-for-GK detectors, **no training, no new pretrained model** (Golden Rule 2 still holds) — proximity/possession-change/speed heuristics on top of existing detections+tracks, each with a low, honestly-stated confidence ceiling (Golden Rule 5). **Still structurally impossible regardless of this decision:** goals and assists on this footage — no scoreboard exists to verify a goal (§3.2(3)), so assist's own rule ("the pass before a goal") can never fire here. **Superseded by ADR-14** on celebration/key-moment scope (Gemini approved, see above). | ✅ owner-authorized 2026-08-25 |
-| ADR-12 | **Team assignment = torso-colour clustering, NOT SigLIP, on this footage** | §5 Stage 3 recommended SigLIP→UMAP→KMeans (the `roboflow/sports` recipe). Measured on `clip2`, it failed twice: team splits of **48/3** then **27/2/18-NaN** where a real two-team split is ~50/50 — it was clustering grass and pose, not kit. A controlled experiment on the *same* tracks (torso band y∈[0.15,0.50]·h, x inset 18%, boxes ≥25 px, mean **CIELAB**, KMeans k=2, 39 usable tracks) gave **24/15** with cluster means L\*=**97** (dark-blue kit) vs L\*=**146** (white kit) — a large, physically meaningful separation. **Why SigLIP loses:** it is trained for image–*text* semantic alignment, so at 60–150 px crop size every crop reads as "a soccer player" and the dominant variance is pose/blur/background, not jersey colour. It is right for Roboflow's large broadcast crops, wrong for youth Veo footage at this scale. **Resolution:** `team.method: colour` (default) with SigLIP retained as a config-selectable fallback for real broadcast input. **Cluster per take, not globally** — clip4 spans 4 venues with very different lighting. Confidence = distance to own centroid relative to inter-centroid distance. | ✅ adopted |
-| ADR-10 | **Expect a real domain gap; do not trust the published 0.857 mAP on this footage** | ADR-8's checkpoint was trained on SoccerNet = **professional broadcast** footage. §3.2 footage is **youth/amateur Veo** — higher/wider fixed camera, smaller players, different kits, painted-over American-football lines. Published mAP does **not** transfer. This is precisely why §9's eval harness is built before tuning: measure mAP on *our* labeled slice, and treat the Roboflow CC BY 4.0 set as a second eval set. | ✅ adopted |
-| ADR-3 | **Phase-1 homography = assisted 4-point manual calibration for single-camera profiles** | The usual auto pitch-keypoint model is also YOLOv8-pose (AGPL, same problem as ADR-2). For a *static* camera one calibration serves the whole clip, it is more accurate than a per-frame keypoint model, it costs no VRAM, and it is consistent with the human-in-the-loop principle (Golden Rule 4). Auto keypoints (PnLCalib / TVCalib / an Apache RF-DETR-pose) get evaluated for the broadcast branch. | ✅ adopted for P1 |
-| ADR-4 | **Repo root = the existing working directory**, not a new `soccer-highlight-analyzer/` subdir | `input/` already exists here and holds the owner's clips; nesting would orphan them. | ✅ adopted |
-| ADR-5 | **Python 3.11 provisioned via `uv`** (system has only 3.12) | Honors §10 without `sudo` or deadsnakes; `uv` also gives fast, reproducible locking. | ✅ adopted |
-| ADR-6 | **Uncalibrated speed is reported as uncalibrated, never converted to fake m/s** | §3.2(4): on this footage there are often <4 usable pitch landmarks, so no metric homography exists. Golden Rule 5 forbids fabricated numbers. `Event.evidence` carries `calibrated: bool`; when false, speed is in normalised-pixel units, the confidence is penalised, and the UI/stat card must say "uncalibrated". A sprint can still be *ranked* without metres. | ✅ adopted |
-| ADR-7 | **Shot-boundary detection runs for every profile, not just `broadcast`** | §3.2(2): clip4 is single-camera yet contains a real cut at 60.07 s. Gating cut detection on `profile == broadcast` would have let tracking run straight across it and corrupt IDs. Only replay/close-up classification and scoreboard OCR stay broadcast-gated. | ✅ adopted, supersedes §5 row 1 |
+| ADR-20 | **Team-colour-aware pass / turnover / assist, and a human-marked goal region for the owner's "ball into the white box = goal"** | Owner (2026-08-27) restated the event semantics explicitly: a **pass to the same jersey colour is a completed PASS**, the ball going to the **other** colour is **not** a completed pass, the **pass immediately before a goal (to a teammate who scores) is an ASSIST**, and the ball going into the **"white box" (goal mouth) is a GOAL**. Three of these already had seams (ADR-13 pass heuristic carries `receiver_identity`; ADR-17 assist = nearest preceding teammate PASS to the scorer); this ADR makes the **team-colour test first-class** and adds the missing pieces honestly. **What's built:** (1) **PASS vs TURNOVER** — a possession-change from the target to a next-receiver of the **same** ADR-12 colour cluster ⇒ `EventType.PASS` (counted); to a **different** colour cluster ⇒ new `EventType.TURNOVER` (**logged with evidence, NOT counted as a pass** — Golden Rule 5: a lost ball is not a completed pass, and hiding it would be a silent filter). Out-of-play losses map to `EventType.OUT_OF_BOUNDS`. (2) **ASSIST** — unchanged rule from ADR-17, now explicitly colour-gated: a `PASS` (same-colour, by definition) whose receiver becomes the credited scorer within `assist_window_seconds` ⇒ `EventType.ASSIST` to the passer. (3) **GOAL via "white box"** — deliberately **not** a new trained net/goal detector (Golden Rule 2) and **not** a fragile "ball bbox vanishes in a corner" guess (Golden Rule 5) — the two shortcuts ADR-17 already rejected. Instead, a **human-marked goal-mouth region** per static single-camera clip in `configs/goal_region.yaml` (normalised polygon, one or two regions per clip), exactly the human-in-the-loop, no-training pattern as ADR-3's 4-point calibration: the ball centroid entering a marked region within a shot window ⇒ `EventType.GOAL` candidate, `source="goal_region"`, flagged low-confidence with `goal_region_source: manual` in evidence. Goals therefore now have **three** honest sources — manual annotation (ADR-19, authoritative), scoreboard delta (ADR-17, broadcast), and marked goal region (this ADR, static cams) — and remain **`not available`** when none of the three is present for a clip (still true for the §3.1 clips until a region is marked). **Confidence stacks DOWN** the chain (goal occurrence > scoring team > scorer > assist), evidence carries the full trail. **Config (`configs/events.yaml` additions):** `pass.same_colour_required: true`, `pass.colour_cluster_margin` (reuse ADR-12 distance), `turnover.enabled: true`, `goal_region.enabled: true`, `goal_region.shot_window_s: 3.0`, `goal_region.confidence: 0.45` (below scoreboard's 0.75 — a marked region is a strong prior but not a read score). `configs/goal_region.yaml` is empty by default (⇒ region path simply inactive, honest "not available"), populated per clip the owner chooses to mark. | 🆕 to build (owner-authorized 2026-08-27) |
+| ADR-19 | **Manual-annotation sidecar = authoritative event source for low-quality footage; the sidecar file winning is the auto trigger for manual mode** | Owner (2026-08-27): when footage is too poor for auto jersey/action reading (the §3.3 0/14 case is the canonical example), the client watches the video and supplies timestamped annotations — `Min 26:56 player #2 in white takes a touch` etc. — and the pipeline must run from those. **Chosen trigger (owner-confirmed):** *sidecar file wins, automatically.* If `input/<video_basename>.annotations.txt` exists next to the input, the run enters **manual-events mode**: the parsed annotations are the authoritative `Event` source (Stage 5 auto-detectors are skipped for event *generation*), and the target identity (jersey number + team colour) is taken **directly from the annotations** — a human directly watching the footage is the strongest identity evidence there is (Golden Rule 4, same logic as ADR-18's `human_confirmed_jersey`). No sidecar ⇒ full auto (§14.1). This is not a quality-score gate and not a per-video config flag — the *presence of the client's file* is the signal, so the client stays in control of which clips are manual. **Parser (`src/annotations/parse.py`):** tolerant regex over the client's natural phrasing; grammar + phrase→`EventType` map in `configs/annotations.yaml` (no magic strings in code, Golden Rule / §10). Each line → an `Annotation` → an `Event(source="manual_annotation", confidence=annotation_confidence` (default **0.95** — human-observed but transcription-fallible, per `configs/annotations.yaml`)`, evidence={raw_line, jersey_number, team_colour, action_phrase})`. **Unmapped action phrases are logged and kept** as `EventType.KEY_MOMENT` with the raw text in evidence — never silently dropped (§10). **Overlay in manual mode:** detection+tracking still run best-effort so boxes + ball marker are drawn where confident; the target's red box is associated by jersey-colour + timing to a track where possible and labelled with the annotation's number; **regardless of tracking quality, each annotated event's caption (name + timestamp + jersey #) is burned at its timestamp** so the annotated video is always faithful to the client's ground truth. The run report states plainly when a red box could not be reliably associated to a track in a given window ("event shown by caption; track association low-confidence"), never a fake box. **Statcard identity status** in manual mode reads `Human-provided (manual annotation)`. **No new dependency** (stdlib `re` + existing YAML). Same owner-authorized pull-forward pattern as ADR-13/15 — Golden Rule 7 is superseded *for inputs the client explicitly annotates*, not relaxed globally. | 🆕 to build (owner-authorized 2026-08-27) |
+| ADR-18 | **Spec-completeness audit against the owner's full 29-section jersey/event spec (2026-08-27) found three real gaps, fixed alongside ADR-17** | Owner asked to confirm "everything I told you in the prompt" is actually wired into the pipeline/statcard, ahead of manually confirming a jersey number for the incoming SoccerNet clip (§3.4). Audited section-by-section against the actual code (not assumed) and found: **(1) no human-confirmed-identity path existed.** `target_jersey` could only ever come from the `clip<N> <jersey>` filename regex — a filename-less video (the owner's own stated new workflow: watch the clip, then tell the system the number) had no seam to receive that. Fix: `main()` gains a `--target-jersey` CLI override for filename-less videos; `src.identity.verify` threads an optional `human_confirmed_jersey` through aggregation — a human-given number needs only ONE non-contradicting read to verify (a human directly watching the footage is stronger evidence than an independent OCR/VLM multi-frame vote, Golden Rule 4), but a read that ACTIVELY DISAGREES with the human's number is surfaced, never silently suppressed (Golden Rule 5 — disagreement is itself evidence worth keeping). **(2) highlight-category clips were cut from the RAW input, not the annotated render** — found by tracing `write_player_output`'s `video_path` argument back to `run_extended_pipeline_for_video`'s own raw-file parameter; `render_full_annotated_video` didn't even run yet at the point highlights were cut. Directly contradicts owner spec §24 ("highlight videos should also show RED/GREEN boxes, ball tracking, event name, timestamp, jersey number"). Fix: reorder so the full annotated render happens BEFORE the per-player loop, and highlight-clip cutting reads from `original_annotated_video.mp4`, not the source. **(3) green-box labels read a bare `#{track_id}`** — indistinguishable at a glance from a jersey number, undermining the owner's own explicit §7 requirement ("track ID and jersey identity are different concepts... do NOT assume Track ID 10 = Jersey #10"). Fix: green boxes now read `ID: {track_id}`; the target's red box reads `#{jersey_number} | TARGET | ID: {track_id}` — both identifiers visible, neither ambiguous. **Not a gap, verified correct:** the live stats panel already shares the exact same per-player `Event` list used to write `statcard.md`. **Verified 2026-08-27** with a full, real re-run for `jordan_thomas_highlight_video` (1123s total, exit 0). → [full evidence](docs/adr-evidence.md#adr-18) | ✅ implemented + verified 2026-08-27 |
+| ADR-17 | **Finish real goal detection (scoreboard-delta) + best-effort scorer/assist attribution, self-gated on actually finding a legible scoreboard — never on the `profile` label** | Owner asked (2026-08-27) to "do something about goal and assist" rather than leave `detect_goals_scoreboard_delta` a permanent `NotImplementedError` stub. §3.2(3)/§3.4 established goals are a genuine **data ceiling** on the owner's own footage (no scoreboard exists), but the incoming SoccerNet broadcast clip (§3.4) is exactly the input this path was always meant for. **Scope of what's real, in order of confidence:** (1) **goal occurrence** — OCR-scan a small set of CANDIDATE scoreboard regions across several early sampled frames; a region only "activates" if it yields a STABLE `digit [sep] digit` pattern across multiple frames (measured self-check, not a hardcoded ROI or the `profile` label). A goal event fires on a debounced digit increment. (2) **scoring team** — credit whichever ADR-12 colour-cluster held possession in the window before the digit changed (sidesteps home/away). (3) **scorer** — the identity with the last possession run before the goal, gated to the team from (2). (4) **assist** — new `EventType.ASSIST`; nearest preceding teammate `PASS` to the credited scorer within `assist_window_seconds`. Confidence driven DOWN at each step; full `evidence` trail. **Deliberately NOT built (then):** visual goal-line/net detection (owner's "white box" framing) — needed a new trained class or panning-camera calibration. *(ADR-20 now supplies the honest version of "white box = goal": a human-marked static-camera goal region, no training.)* **Still "not available" on the §3.1 clips + `jordan_thomas_highlight_video`** because the self-gating scan finds no stable scoreboard there. **Verified 2026-08-27** against all 6 clips' cached `work/<slug>/` artifacts. → [full evidence](docs/adr-evidence.md#adr-17) | ✅ implemented + verified 2026-08-27 |
+| ADR-16 | **Cut detection: fixed-threshold `ContentDetector` does not generalize across a heterogeneous multi-match compilation; per-take identity now depends on getting this right** | §3.3 measured that `Jordan Thomas Highlight Video.mp4`'s real cuts sit at content-value scores as low as ~21–27 (a 13-cut set, stable across thresholds 21.0/24.0/27.0), while clip4's three confirmed **false**-positive foreground-crossings score up to 32.0. No single fixed threshold keeps clip4's false positives out *and* catches this new video's real cuts. **Resolution:** `configs/shots.yaml: scenedetect` gains an `overrides: {<video-slug>: <threshold>}` map; `detect_takes()` looks itself up there and falls back to the global `threshold` when absent — the original 5 clips' behaviour is provably unchanged. `jordan_thomas_highlight_video: 24.0` verified by contact-sheet frames. `AdaptiveDetector` deferred. → [full evidence](docs/adr-evidence.md#adr-16) | ✅ adopted 2026-08-27 (per-video override) |
+| ADR-15 | **Verified-jersey identification required when no filename jersey number exists; no verified number ⇒ no target identity ⇒ no target stats for that take** | Owner request (2026-08-27): for a video with no `clip<N> <jersey>` filename metadata, the target player's jersey number must be **read from visual evidence and confirmed**, never guessed from appearance, position, team, or the burned-in arrow alone. Owner-authorized pull-forward of a Phase-2 slice for this input only. **Pipeline addition:** per **take**, take the arrow-hint track as a **location candidate only**; crop it at native/high res where front/back-facing and large enough; run **EasyOCR** + **Gemini** as a cross-check on the same crops; require **temporal agreement across multiple frames**. Take identity record `{take_id, jersey_number|None, status, confidence, evidence_frames[]}`. **Unverified take ⇒ no red box, no target stats** (green boxes + ball still render). Output grouped by verified number, not an assumed single identity. Gemini resolved to a working model with an ordered fallback list + quota handling. **Built + run end-to-end 2026-08-27: 0/14 verified on `jordan_thomas_highlight_video`** — a genuine, well-evidenced negative (crops truly unreadable), not a quota-silenced default. *(ADR-19 is the honest recovery path for exactly this outcome: the owner annotates the clip.)* → [full evidence](docs/adr-evidence.md#adr-15) | ✅ built + run 2026-08-27 |
+| ADR-14 | **Full extended-output spec: exact statcard.md format, full-resolution annotated original video, per-category highlight reels, Gemini for celebrations** | Owner supplied a complete spec (2026-08-25) — see **§13**. (1) primary output = the **original video at original resolution/fps/duration/audio**, annotated in place; (2) `statcard.md` uses the owner's exact template with `uncertain` wherever a stat can't be reliably derived; (3) category-specific highlight compilations, empty (not fabricated) when a category never occurs; (4) celebrations/key-moments via **Gemini** on cheaply pre-filtered candidate windows only (never every frame). → [full evidence](docs/adr-evidence.md#adr-14) | ✅ owner-authorized 2026-08-25 |
+| ADR-13 | **Owner explicitly authorized best-effort touch/pass/tackle/save heuristics ahead of Phase 1 completion** | Asked (2026-08-25): owner chose "best-effort heuristics now". Scope: touch/pass/tackle/save-for-GK detectors, **no training, no new pretrained model** — proximity/possession-change/speed heuristics on top of existing detections+tracks, each with a low, honestly-stated confidence ceiling. Superseded by ADR-14 on celebration scope; **extended by ADR-20** on the pass/turnover colour test. → [full evidence](docs/adr-evidence.md#adr-13) | ✅ owner-authorized 2026-08-25 |
+| ADR-12 | **Team assignment = torso-colour clustering, NOT SigLIP, on this footage** | Measured on `clip2`, SigLIP failed twice (48/3 then 27/2/18-NaN). Torso-band CIELAB KMeans k=2 gave 24/15 with a large L\* separation (dark-blue vs white kit). **Resolution:** `team.method: colour` (default), SigLIP retained as config-selectable fallback for real broadcast. **Cluster per take, not globally.** **ADR-20's pass/turnover/assist logic keys directly on this colour cluster** — "same jersey colour" = same cluster within the take. → [full evidence](docs/adr-evidence.md#adr-12) | ✅ adopted |
+| ADR-11 | **Downstream stages must consume the *motion score*, not the static/panning *label*** | Stage 0.5 put 4 of 5 clips inside the ambiguous band (1.5–6.0 px/frame). ADR-3's homography cadence reads `motion_score` directly; recalibration interval scales continuously with measured motion, settling window excluded. | ✅ adopted |
+| ADR-10 | **Expect a real domain gap; do not trust the published 0.857 mAP on this footage** | ADR-8's checkpoint was trained on professional broadcast; §3.2 footage is youth/amateur Veo. Measure mAP on *our* labeled slice; treat Roboflow CC BY 4.0 set as a second eval set. | ✅ adopted |
+| ADR-9 | **⚠️ SoccerNet-derived weights are dev-only until licensing is cleared** | ADR-8's checkpoint is *declared* Apache-2.0 but trained on SoccerNet-Tracking-2023 (research/education only, §7). Use for Phase-1 dev/eval; before any commercial ship take one of: SoccerNet commercial terms, fine-tune on CC BY 4.0 Roboflow set, or fall back to RF-DETR-COCO. | ⚠️ open — revisit before ship |
+| ADR-8 | **Phase-1 detector = `julianzu9612/RFDETR-Soccernet` (Apache-2.0), with RF-DETR-COCO as fallback** | The three canonical Roboflow soccer projects host no trained weights (only CC BY 4.0 data). On HF, `julianzu9612/RFDETR-Soccernet` is Apache-2.0, RF-DETR-Large, classes `ball, player, referee, goalkeeper`, mAP@50 0.857 on SoccerNet. `OrbitalLab/mova-rfdetr-soccernet-v1` (MIT) is gated → skipped. | ✅ adopted for P1 |
+| ADR-7 | **Shot-boundary detection runs for every profile, not just `broadcast`** | clip4 is single-camera yet contains real cuts. Only replay/close-up classification and scoreboard OCR stay broadcast-gated. | ✅ adopted, supersedes §5 row 1 |
+| ADR-6 | **Uncalibrated speed is reported as uncalibrated, never converted to fake m/s** | On this footage there are often <4 usable pitch landmarks. `Event.evidence` carries `calibrated: bool`; when false, speed is normalised-pixel units, confidence penalised, UI says "uncalibrated". | ✅ adopted |
+| ADR-5 | **Python 3.11 provisioned via `uv`** (system has only 3.12) | Honors §10 without `sudo`; `uv` gives fast, reproducible locking. | ✅ adopted |
+| ADR-4 | **Repo root = the existing working directory**, not a new subdir | `input/` already exists here and holds the owner's clips. | ✅ adopted |
+| ADR-3 | **Phase-1 homography = assisted 4-point manual calibration for single-camera profiles** | The usual auto pitch-keypoint model is YOLOv8-pose (AGPL). For a static camera one manual calibration serves the whole clip, is more accurate, costs no VRAM, and is consistent with HITL. **ADR-20's goal region uses the same human-marked, no-training pattern.** | ✅ adopted for P1 |
+| ADR-2 | **Roboflow's soccer player/pitch checkpoints are YOLOv8 → AGPL → cannot ship** | Released weights are Ultralytics YOLOv8 (AGPL-3.0). Datasets are CC BY 4.0 (eval + fine-tune material). | ✅ **resolved → see ADR-8** |
+| ADR-1 | **PyAV + ffmpeg CLI for decode; drop `decord`** | `decord` 0.6.0 has no cp311/cp312 wheels and is unmaintained. PyAV + NVDEC cover it with zero build risk. | ✅ adopted |
 
 ## 6. Phases
 **Phase 0 (done as part of P1 kickoff):** env check, repo scaffold, data contracts, eval harness stub, license table.
 
 **Phase 1 — within-take core, MANUAL player pick (current):**
-Ingest → shot-boundary + drop replays → detection (**pretrained** RF-DETR/soccer weights + SAHI ball; **no
-training**) → pitch homography → within-take tracking + team → events without identity (goals/shots/sprints) →
-**user selects a track** → clip cut + dedupe → best-first reel export → simple stat card → eval (mAP + HOTA on
+Ingest → **annotation-sidecar check (ADR-19)** → shot-boundary + drop replays → detection (**pretrained**
+RF-DETR/soccer weights + SAHI ball; **no training**) → pitch homography → within-take tracking + **team colour**
+→ events (auto: goals/shots/sprints/**passes+turnovers**/touches/tackles; **or** manual sidecar) → **user
+selects a track / jersey number** → clip cut + dedupe → best-first reel export → stat card → eval (mAP + HOTA on
 labeled slice) → thin API + minimal UI. **Runs entirely on the local A2000 12 GB — inference only, no paid cloud.**
-Handle **any single uploaded video**: the source profiler auto-detects broadcast vs single-camera and branches
-(single-camera skips Stage 1, calibrates homography once, keeps IDs across the whole clip — the easy case).
-**Validate on a static single-camera clip first**, then broaden to broadcast.
-*Definition of done:* on a sample match + a manually-selected player, output a de-duplicated reel + stat card
-(with confidences) + an eval report, reproducible via `make run`.
+Handle **any single uploaded video**: the source profiler auto-detects broadcast vs single-camera **and quality**,
+and branches (§14). **Validate on a static single-camera clip first**, then broaden to broadcast.
+*Definition of done:* on a sample clip + a target jersey, output a de-duplicated per-category reel set + stat
+card (with confidences) + an annotated video + an eval report, reproducible via `make run`, **including the
+manual-annotation path on the client's worked example (§3.5).**
 
 **Phase 2 — player identity:** jersey OCR + cross-take re-association + human-in-the-loop confirm → follow a
 chosen number automatically; per-player event attribution; passes/touches as best-effort (flagged).
-*This is where `target_jersey` (§3.1) stops being a label and starts driving automatic selection.*
 
 **Phase 3 — hardening:** fine-tuned action spotting; tackles/saves/assists; confidence + correction UI; scale
-compute; QA vs ground truth; optional provider-data adapter; active-learning loop (fixed errors → retrain).
+compute; QA vs ground truth; optional provider-data adapter; active-learning loop.
 
 ## 7. Dependency license table (keep updated; ⚠️ = do not ship in closed product without action)
 | Component | License | OK for closed product? |
@@ -250,7 +321,8 @@ compute; QA vs ground truth; optional provider-data adapter; active-learning loo
 | MMPose / MMOCR (ViTPose) | Apache-2.0 | ✅ |
 | PARSeq | Apache-2.0 | ✅ |
 | PaddleOCR / EasyOCR | Apache-2.0 | ✅ |
-| `requests` (ADR-15, `src/identity/jersey_vlm.py`'s Gemini HTTP calls) | Apache-2.0 | ✅ |
+| `requests` (ADR-15 Gemini HTTP) | Apache-2.0 | ✅ |
+| **manual-annotation parser (ADR-19)** | stdlib `re` + PyYAML (BSD/MIT) | ✅ **no new dependency** |
 | `SoccerNet` (pip package, `scripts/download_soccernet.py`) | MIT | ✅ package code only — the video *data* it downloads is the separate, NDA-gated row below |
 | SigLIP weights (via `transformers`/`timm`) | Apache-2.0 | ✅ (verify weight card) |
 | TransNetV2 | MIT | ✅ |
@@ -263,158 +335,173 @@ compute; QA vs ground truth; optional provider-data adapter; active-learning loo
 | `OrbitalLab/mova-rfdetr-soccernet-v1` | MIT | ⛔ gated on HF (access request) — not used |
 | BoxMOT | **AGPL-3.0** | ⚠️ avoid — use `supervision` tracker |
 | SoccerNet data | **Research/education** | ⚠️ email for commercial terms |
-| Broadcast footage | Rights-holder owned | ⚠️ legal review before commercial use |
+| Broadcast / YouTube footage | Rights-holder owned | ⚠️ legal review before commercial use — pipeline does **not** download YouTube; owner supplies the file + sidecar (§3.5) |
 Audit each new dependency's license here **before** adding it.
 
 ## 8. Commands (implement these; keep accurate)
 ```
 make setup     # create env, install deps, download model weights
-make run       # process the video in input/ → reel + stat card + report in output/ (resumable via work/)
+make run       # AUTO FLOW (§14): process EVERY video in input/ → per input, auto-branch on
+               #   (a) annotation sidecar present? -> manual-events mode (ADR-19)
+               #   (b) else profile + quality -> full auto (detector/OCR/VLM + colour events, ADR-20)
+               # -> annotated video + per-player stat card + per-category highlight reels + report
+               #    in output/<slug>/ (resumable via work/)
+make run VIDEO=input/"clip2 77.mp4"   # process a single video
 make eval      # detection mAP + tracking HOTA (+ action mAP@1 later) on data/eval/
-make test      # unit tests (contracts, ranking, dedupe, speed calc)
+make test      # unit tests (contracts, ANNOTATION PARSER (ADR-19), colour pass/turnover (ADR-20),
+               #             ranking, dedupe, speed calc)
 make lint      # ruff + black
-scripts/download_soccernet.py   # --list (no password needed) or pulls one broadcast clip into
-                                 # input/ (needs SOCCERNET_PASSWORD in .env, from the NDA form at
-                                 # soccer-net.org) -- used 2026-08-27 to get a clear-broadcast test
-                                 # case for ADR-15's jersey-verification pipeline, see §3.4
+scripts/download_soccernet.py   # --list (no password) or pulls one broadcast clip into input/
+                                 # (needs SOCCERNET_PASSWORD in .env, from the NDA form at soccer-net.org)
+                                 # -- kept as the GOOD-QUALITY control input (§3.4); "high-quality when needed"
 scripts/pull_roboflow.py        # pulls datasets + pretrained soccer weights (needs ROBOFLOW_API_KEY)
 scripts/prepare_eval.py         # ingest labeled slices into data/eval/
+scripts/make_annotation_template.py  # (ADR-19) emit a blank <video>.annotations.txt next to a video,
+                                      #  prefilled with its identity_report "unverified" takes as TODO lines
 ```
 Secrets in `.env` (`HF_TOKEN`, `ROBOFLOW_API_KEY`, `SOCCERNET_PASSWORD`, optional `GEMINI_API_KEY`,
 `TWELVELABS_API_KEY`); never commit them.
+
+Per-input sidecars in `input/` (never committed, gitignored with the rest of `input/`):
+- `input/<video>.annotations.txt` — manual events (ADR-19, §14.3). Presence ⇒ manual mode.
+- `configs/goal_region.yaml` — human-marked goal polygons per video slug (ADR-20). Empty ⇒ region path off.
 
 ## 9. Evaluation (metrics + first targets — refine against your labeled set)
 - **Detection:** mAP@50 on your labeled slice (players first, ball tracked separately — expect ball lower).
 - **Tracking:** **HOTA** via **TrackEval** (report IDF1 + ID switches too), measured **within takes**.
 - **Actions (Phase 2+):** **mAP@1s** (SoccerNet ball-action style).
 - **Jersey (Phase 2):** tracklet accuracy.
+- **Manual-annotation parser (ADR-19):** unit-tested round-trip — the §3.5 three-line example must parse to
+  exactly `[TOUCH@26:56 #2 white, PASS@26:58 #2 white, OUT_OF_BOUNDS@27:28 #2 white]`; malformed lines are
+  reported, never silently dropped.
 Wire these before optimizing anything. Log a run report (numbers + config hash) per run.
 
 ### 9.1 Eval datasets on disk
 | Set | Path | Content | Licence | What it measures |
 |---|---|---|---|---|
-| **Roboflow football-players v20** | `data/eval/roboflow-football-players-v20/` | 372 imgs / 8,905 anns (train 298 · valid 49 · test 25); classes `ball, goalkeeper, player, referee` | **CC BY 4.0** — attribution required, see `ATTRIBUTION.md` | Detection mAP **baseline** |
+| **Roboflow football-players v20** | `data/eval/roboflow-football-players-v20/` | 372 imgs / 8,905 anns; classes `ball, goalkeeper, player, referee` | **CC BY 4.0** — attribution required | Detection mAP **baseline** |
 | **Our Veo slice** | `data/eval/veo-labeled/` | ⛔ **not yet created** — must be hand-labeled from `input/` | own footage | Detection mAP + HOTA **that actually counts** |
 
-> ⚠️ **The Roboflow set is a sanity baseline, not our number.** Its images are **576×576 crops of
-> professional broadcast** footage. Per **ADR-10**, results there do **not** transfer to youth/amateur Veo
-> footage with a high fixed camera and much smaller players. A Phase-1 "definition of done" mAP/HOTA claim
-> must be measured on a **hand-labeled slice of our own clips** — creating that slice is a Phase-1 task, not
-> an optional extra. Report both numbers side by side so the domain gap stays visible.
->
-> Note: dataset **v20 is named "rf-detr-m"** — the publisher prepared it for RF-DETR training, which
-> corroborates ADR-8's model choice and makes it the natural base for the ADR-9 clean-licence fine-tune.
+> ⚠️ **The Roboflow set is a sanity baseline, not our number** (576×576 broadcast crops). Per **ADR-10**,
+> results there do **not** transfer to youth/amateur Veo footage. Report both numbers side by side.
 
 ## 10. Working conventions
-- Python 3.11 (via `uv`, see ADR-5). One `configs/*.yaml` per stage; **no magic numbers in code.**
+- Python 3.11 (via `uv`, see ADR-5). One `configs/*.yaml` per stage; **no magic numbers in code** — this now
+  explicitly includes the **annotation phrase→EventType map** (ADR-19) and the **colour/goal-region thresholds**
+  (ADR-20), which live in `configs/annotations.yaml`, `configs/events.yaml`, and `configs/goal_region.yaml`.
 - Cache each stage's output to disk; stages must be independently runnable/debuggable.
 - After each stage: a **smoke test** on a short clip + an **annotated overlay video** artifact.
-- **Log everything dropped** (replays, close-ups, low-confidence). Silent filtering = hidden bugs.
+- **Log everything dropped** (replays, close-ups, low-confidence, **unmapped annotation lines**, **turnovers**).
+  Silent filtering = hidden bugs.
 - Commit per stage; update this file when decisions change; verify with eval numbers before "done".
-- **I/O contract:** input video in `input/` (auto-detected); cached artifacts in `work/` (resumable, chunked);
-  final reel + stat card + run report in `output/`. Gitignore `input/`, `work/`, `output/`, `.env`, `models/`, `data/`.
-- **Secrets: ask, never assume.** Load from `.env`; when a token/decision is missing, STOP and ask the user (what /
-  why / where) — never mock data or skip a stage silently. Likely Phase-1 asks: Roboflow key, maybe HF token.
-- **Model workflow:** the user runs Claude Code in **`opusplan`** — Opus plans (Plan Mode), Sonnet executes. Plan
-  thoroughly; keep execution incremental + resumable. Provide `.claude/commands/process-match.md` to run the flow.
+- **I/O contract:** input video (+ optional sidecars) in `input/` (auto-detected); cached artifacts in `work/`
+  (resumable, chunked); final annotated video + stat card + highlight reels + run report in `output/`.
+  Gitignore `input/`, `work/`, `output/`, `.env`, `models/`, `data/`.
+- **Secrets: ask, never assume.** Load from `.env`; when a token/decision is missing, STOP and ask the user —
+  never mock data or skip a stage silently.
+- **Model workflow:** the user runs Claude Code in **`opusplan`** — **Opus plans (Plan Mode), Sonnet executes.**
+  Plan thoroughly; keep execution incremental + resumable. Provide `.claude/commands/process-match.md` to run
+  the flow. (See the delivered Claude Code prompt for the exact plan→execute contract.)
 
 ## 11. Hardware profile & compute budget
-**Single machine: NVIDIA RTX A2000 12 GB** (Ampere, low-power workstation; has NVENC/NVDEC). **LOCAL ONLY — no
-paid cloud.** The **entire pipeline, including full 90-min matches, runs on this GPU; long runtimes are acceptable**
-(design for "slow but completes", not real-time). Because **Phase 1 is inference-only with pretrained models, no
-training is required** and 12 GB is comfortable. Any fine-tuning is deferred/optional and, if ever needed, runs
-overnight on the A2000 or on a **free** GPU tier (Google Colab / Kaggle Notebooks, ~16 GB T4/P100 — check current limits).
-Never gate progress on paid GPUs.
+**Single machine: NVIDIA RTX A2000 12 GB** (Ampere; NVENC/NVDEC). **LOCAL ONLY — no paid cloud.** The entire
+pipeline, including full 90-min matches, runs on this GPU; long runtimes are acceptable (design for "slow but
+completes"). Phase 1 is inference-only with pretrained models, so 12 GB is comfortable. Any fine-tuning is
+deferred/optional (overnight on the A2000 or a free Colab/Kaggle T4/P100). Never gate progress on paid GPUs.
 
 ### 11.1 Measured environment (2026-08-24)
 | Item | Value |
 |---|---|
 | GPU | NVIDIA RTX A2000 12 GB (12282 MiB), Ampere |
 | Driver / CUDA | 580.173.02 / CUDA 13.0 runtime; `nvcc` 12.0 |
-| ffmpeg | 6.1.1 — `h264_cuvid` **NVDEC** ✅, `h264_nvenc` **NVENC** ✅, `-hwaccel cuda` ✅ |
+| ffmpeg | 6.1.1 — `h264_cuvid` NVDEC ✅, `h264_nvenc` NVENC ✅, `-hwaccel cuda` ✅ |
 | Python | system 3.12.3; **project uses 3.11 via `uv`** (ADR-5) |
 | RAM / disk | 125 GB / 124 GB free |
 
-> ⚠️ **VRAM contention:** an unrelated process (`Downloads/Ad Blocker/.venv`, PID 10393) was holding **6.0 GB**
-> and 87% GPU util at scaffold time, leaving only ~5.2 GB free. `configs/hardware.yaml` therefore defaults to a
-> **5 GB budget**, and the pipeline runs a **VRAM preflight** that warns (not fails) when free VRAM is below the
-> stage budget. Free that process before long runs to use the full 12 GB.
+> ⚠️ **VRAM contention:** an unrelated process was holding 6.0 GB at scaffold time. `configs/hardware.yaml`
+> defaults to a **5 GB budget**; the pipeline runs a **VRAM preflight** that warns (not fails) below budget.
 
-Fit-in-12 GB rules (put the knobs in `configs/hardware.yaml`, 12 GB-safe defaults):
-- **Run stages sequentially, cache to disk between them** — never hold detector + pose + SigLIP + OCR in VRAM at once; explicitly free/unload each model before loading the next.
-- **Chunk the match** (per camera take, or fixed 2–5 min segments) and make every run **resumable** from cached artifacts — a full match runs overnight and survives a crash/restart without redoing finished work.
-- **Mixed precision (AMP/FP16)** everywhere; add an **ONNX / TensorRT** inference path (Ampere → big speedup; worth it, we're compute-bound).
-- **Small / inference-friendly variants:** RF-DETR-base/small (not large), ViTPose-small, ByteTrack (cheap). Inference **batch size 1–2**.
-- **VLM layer via API** (Gemini / TwelveLabs free tiers), not a local VLM — an 11B vision model won't fit in 12 GB.
-- **Decode with NVDEC** (`ffmpeg`), **sample frames per stage**, and **skip replays/close-ups** so you process only ~⅓–½ of raw frames — the main lever that makes a full match tractable.
-- **Downscale 4K before detection** (§3.1) — 3840×2160 buys nothing at these player sizes and costs ~4× the VRAM.
+Fit-in-12 GB rules (knobs in `configs/hardware.yaml`):
+- **Run stages sequentially, cache to disk** — never hold detector + pose + SigLIP + OCR in VRAM at once.
+- **Chunk the match** and make every run **resumable** from cached artifacts.
+- **Mixed precision (AMP/FP16)** everywhere; add an **ONNX / TensorRT** path.
+- **Small variants:** RF-DETR-base/small, ViTPose-small, ByteTrack. Batch 1–2.
+- **VLM via API** (Gemini free tier), not a local VLM.
+- **Decode with NVDEC**, sample frames per stage, skip replays/close-ups.
+- **Downscale 4K before detection** (§3.1). The manual-annotation path (ADR-19) still decodes at native res for
+  the overlay render but does **no** heavy per-frame OCR/VLM (events come from the sidecar) — so it is cheaper
+  than the full auto path, which matters because bad-quality clips are exactly where auto would waste the most VLM budget.
 
-Per-stage fps sampling defaults (tune on your footage):
-shot-boundary/scoreboard **1–2 fps** · detection+tracking **5–12 fps** · ball + action windows **full fps only where needed** · team/jersey **1–2 fps per tracklet**.
+Per-stage fps sampling defaults: shot-boundary/scoreboard **1–2 fps** · detection+tracking **5–12 fps** ·
+ball + action windows **full fps only where needed** · team/jersey **1–2 fps per tracklet**.
 
-Estimate runtime honestly: **time a 2-min clip end-to-end, then multiply (~45× for 90 min).** Print a **per-stage VRAM +
-wall-clock report** so bottlenecks are visible. A full match taking a few hours is fine — it's a background batch job.
-If a stage OOMs: batch→1, lower image size, or switch to a smaller variant.
+Estimate runtime honestly: **time a 2-min clip end-to-end, then multiply (~45× for 90 min).** Print a per-stage
+VRAM + wall-clock report. If a stage OOMs: batch→1, lower image size, or switch to a smaller variant.
 
 ## 12. Don'ts
-❌ Train from scratch. ❌ Ship YOLO/BoxMOT (AGPL). ❌ Auto-ID player in Phase 1. ❌ Track across cuts.
-❌ Emit untraceable stats. ❌ Build everything at once. ❌ Hard-code params. ❌ Over-promise accuracy in
-UI copy. ❌ Feed raw 4K to a detector.
-> ❌ ~~Pass/touch/tackle stats in Phase 1~~ — **owner-authorized exception, ADR-13/14, §13.** Best-effort
-> heuristics only, never a fine-tuned model, always a low honestly-stated confidence.
-> ❌ ~~Auto-ID player in Phase 1~~ — **owner-authorized exception, ADR-15, §3.3, for inputs with no filename
-> jersey number.** Identity must still be *verified* (OCR + VLM temporal agreement on visible digits), never
-> inferred from appearance/position/team/the arrow alone; unverified ⇒ no red box, no target stats for that
-> take. This does not relax Golden Rule 7 for the original §3.1 clips, which keep filename-metadata-only,
-> human-selects-the-track Phase 1 behaviour.
+❌ Train from scratch. ❌ Ship YOLO/BoxMOT (AGPL). ❌ Track across cuts. ❌ Emit untraceable stats.
+❌ Build everything at once. ❌ Hard-code params (incl. annotation phrases + colour/goal-region thresholds).
+❌ Over-promise accuracy in UI copy. ❌ Feed raw 4K to a detector. ❌ Download YouTube in-pipeline (owner
+supplies the file + sidecar). ❌ Count a turnover as a completed pass. ❌ Draw a red target box you can't
+associate to a real track (caption the event instead).
+> ❌ ~~Pass/touch/tackle stats in Phase 1~~ — **owner-authorized, ADR-13/14/20, §13.** Best-effort heuristics,
+> never a fine-tuned model, always a low honestly-stated confidence.
+> ❌ ~~Auto-ID player in Phase 1~~ — **owner-authorized exceptions:** ADR-15 (verified OCR/VLM on legible
+> footage) and ADR-19 (**manual-annotation sidecar** on illegible footage). Identity is still either *verified*
+> or *human-provided*, never inferred from appearance/position/arrow alone. Filename-metadata §3.1 clips keep
+> the human-selects-the-track flow.
+> ❌ ~~Goal detection on non-broadcast footage~~ — **owner-authorized, ADR-20:** a **human-marked** goal region
+> (no training) or a **manual annotation** may source a goal; a guessed "ball vanished near a corner" may not.
 
-## 13. Extended output spec (owner-authorized 2026-08-25 — ADR-14, revised 2026-08-27 — ADR-15;
-supersedes prior output shape)
+## 13. Extended output spec (owner-authorized 2026-08-25 — ADR-14; revised 2026-08-27 — ADR-15/18;
+extended 2026-08-27 — ADR-19/20; supersedes prior output shape)
 
-> **ADR-15 gating (2026-08-27):** on an input with **no filename jersey number** (§3.3), everything in this
-> section that names "the target player" is conditioned on that take's identity being **verified** (jersey
-> number read from visible evidence with temporal agreement — ADR-15), never on the arrow/track-selection
-> heuristic alone. An unverified take still gets full green-box + ball-tracking output; it just contributes
-> no red box and no target-player stats. On the original §3.1 clips (filename gives the number), nothing in
-> this section changes — the human-confirms-the-track Phase-1 flow is untouched.
+> **Identity gating (ADR-15/18/19):** everything that names "the target player" is conditioned on that take's
+> identity being **known** — either **verified** (OCR/VLM temporal agreement, ADR-15), **human-confirmed**
+> (`--target-jersey` / filename, ADR-18), or **human-provided by sidecar** (ADR-19). An unknown-identity take
+> still gets full green-box + ball-tracking output; it just contributes no red box and no target-player stats,
+> and the run report says why.
 
 ### 13.1 Primary output: full-resolution annotated original video
 **`output/<slug>/original_annotated_video.mp4`** — the original input video, unchanged resolution/fps/
-duration, **original audio preserved**, with detections/tracking/events/stats drawn directly on top.
-Not a separate downscaled debug clip — the actual footage the owner uploaded. Draw:
-- **Red** box, thick, persistent label, around the **verified target player**, labeled with that take's own
-  verified jersey number (e.g. `#22 | TARGET`) — never a bare track ID standing in for a jersey identity
-  (ADR-15: a tracking ID and a jersey number are different concepts, never conflated). ID must not visibly
-  reset when the target overlaps another player or leaves/re-enters frame **within the same take**
-  (best-effort continuity via the existing within-take stitching logic, generalised to run continuously
-  rather than gated to arrow-hint votes only; this is still inference on top of raw tracks, not magic — flag
-  it as approximate, never silently drop it). A take with no verified identity gets **no red box at all** —
-  every detected player in that take renders green, plus a visible "IDENTITY: unverified in this segment"
-  note alongside that take's "CUT — take N" banner.
-- **Green** boxes, thin, around every other detected player, with a track ID where available.
-- A small distinct **ball marker** (already exists from Stage 2's SAHI ball detection) — solid when
-  observed, visually distinct (e.g. hollow/dashed) when interpolated across a gap (Golden Rule 5: never
-  present an inferred position as if it were observed).
+duration, **original audio preserved**, with detections/tracking/events/stats drawn directly on top. Draw:
+- **Red** box, thick, persistent label, around the **target player**, labelled with that take's jersey number
+  and both identifiers (`#<N> | TARGET | ID: <track_id>`) — never a bare track ID standing in for a jersey
+  identity (ADR-18). ID must not visibly reset when the target overlaps another player or leaves/re-enters
+  frame **within the same take** (best-effort within-take stitching; flagged approximate). A take with no
+  known identity gets **no red box** — every player renders green, plus an "IDENTITY: unverified in this
+  segment" note by that take's "CUT — take N" banner. **In manual mode (ADR-19), the target's number/colour
+  come from the sidecar**; where the red box can't be reliably associated to a track in an event window, the
+  event is shown by **caption** (name + timestamp + jersey #) rather than a fabricated box.
+- **Green** boxes, thin, around every other detected player, labelled `ID: <track_id>`.
+- A small distinct **ball marker** — solid when observed, visually distinct (hollow/dashed) when interpolated
+  across a gap (Golden Rule 5).
 - A **live stats panel** (semi-transparent, corner-anchored) that accumulates as the video plays: every
   category in §13.3, each showing its real running count/value, or a static "not detected"/"uncertain" line
   for whatever the current build genuinely cannot produce — never a fabricated or frozen-fake number.
-- A brief "CUT — take N" banner at every take boundary (existing pattern from `scripts/overlay_tracks.py`).
-4K NVENC encode + audio mux is expensive (multi-minute per clip, large files) — that is an accepted cost,
-not a reason to substitute a downscaled render.
+- A brief **"CUT — take N"** banner at every take boundary.
+- **Event captions** (ADR-19/20): at each event's timestamp, a brief on-screen caption naming the event, the
+  jersey number, and the timestamp — this is what guarantees the annotated video is faithful to a manual
+  sidecar even when tracking is weak, and it doubles as the caption burned into the highlight clips (§13.4).
+4K NVENC encode + audio mux is expensive (multi-minute per clip, large files) — an accepted cost, not a reason
+to substitute a downscaled render.
 
-### 13.2 `statcard.md` — exact template (owner-specified, **revised 2026-08-27 — ADR-15**)
-The owner restated the template on 2026-08-27 with an explicit **Identity Status** line and a **confidence
-column** on the timeline — this supersedes the plain-text 2026-08-25 version. One file per **verified**
-jersey number (§13.5), never one file blending two different verified numbers:
+### 13.2 `statcard.md` — exact template (owner-specified, revised 2026-08-27 — ADR-15/19/20)
+One file per **known** jersey number (§13.5), never one file blending two different numbers. **Identity Status**
+reads `Verified` (the existing ADR-15 auto path — covers both an OCR/VLM-confirmed read and a
+`--target-jersey`/filename-confirmed run, since `TakeIdentityResult.status` only has two literal values,
+`verified`/`unverified` — a third UI-only tier is not worth a type change) or `Human-provided (manual
+annotation)` (ADR-19, the new `identity_status` param on `render_statcard_markdown`):
 ```markdown
 # Player Statistics
 
 ## Player #<jersey_number>
 
-**Identity Status:** Verified
+**Identity Status:** Verified | Human-provided (manual annotation)
 
 **Touches:** [actual value]
-**Passes:** [actual value]
+**Passes:** [actual value]           # completed passes only (same-colour, ADR-20)
+**Turnovers:** [actual value]        # passes/losses to the other colour — logged, NOT added to Passes
 **Sprints/Runs:** [actual value]
 **Goals:** [actual value]
 **Assists:** [actual value]
@@ -431,68 +518,126 @@ jersey number (§13.5), never one file blending two different verified numbers:
 |------|-------|------------|
 | [Timestamp] | Touch | [0-1] |
 | [Timestamp] | Pass | [0-1] |
+| [Timestamp] | Turnover | [0-1] |
 | [Timestamp] | Sprint | [0-1] |
 | [Timestamp] | Dribble | [0-1] |
 | [Timestamp] | Shot | [0-1] |
 | [Timestamp] | Tackle | [0-1] |
 | [Timestamp] | Assist | [0-1] |
 | [Timestamp] | Goal | [0-1] |
+| [Timestamp] | Out of bounds | [0-1] |
 | [Timestamp] | Celebration | [0-1] |
 | [Timestamp] | Other Key Moment | [0-1] |
 ```
 Only list events that actually fired; **never pad the timeline to look complete.** Wherever a value can't be
-reliably derived, write `uncertain` (owner's own words) rather than a number — Golden Rule 5 in the owner's
-own terms, not a new rule. `Distance Covered` and any speed-derived value are additionally suffixed
-`(uncalibrated)` per ADR-6 — never bare metres/km. `Goals`/`Assists` read `not available` when no scoreboard
-exists to verify against (§3.2(3), true for the original §3.1 clips; re-check per-video for new input — don't
-assume it transfers). If a take's identity is **unverified** (ADR-15), no `statcard.md` is written for it at
-all — the run report states plainly which takes/segments had no verified target and why, per the owner's own
-words: *"Target player could not be reliably identified. Statistics were not generated because jersey
-identity could not be verified."*
+reliably derived, write `uncertain` (owner's own words) rather than a number. `Distance Covered` and any
+speed-derived value are suffixed `(uncalibrated)` per ADR-6. `Goals`/`Assists` read `not available` when no
+scoreboard, no marked goal region (ADR-20), and no manual annotation exists to source them (re-check per video).
+**In manual mode the confidence column shows the annotation confidence** (default 0.95, `configs/annotations.yaml`)
+and the timeline is exactly the parsed sidecar. If a take's identity is unknown (ADR-15), no `statcard.md` is
+written for it; the run report says: *"Target player could not be reliably identified. Statistics were not
+generated because jersey identity could not be verified"* — and points to the sidecar path (ADR-19) as the fix.
 
 ### 13.3 Event categories and their real status on this footage
 | Category | Status | Method |
 |---|---|---|
-| Sprint, Shot | ✅ built (Stage 4/5, pre-ADR-13) | speed/direction heuristic |
-| Touch, Pass, Tackle, Save (GK) | ✅ built + wired 2026-08-27 (ADR-13) | ball-proximity / possession-change heuristic, no training, low confidence ceiling; computed per take by `src/events/aggregate.py::compute_take_all_events`, attributed to one verified player by `attribute_events_to_target` |
+| Sprint, Shot | ✅ built (Stage 4/5) | speed/direction heuristic |
+| Touch, Tackle, Save (GK) | ✅ built + wired 2026-08-27 (ADR-13) | ball-proximity / possession-change heuristic, no training, low confidence ceiling |
+| **Pass, Turnover** | ✅ ADR-13 base + 🆕 **ADR-20 colour test** | possession-change to a **same-colour** receiver ⇒ **Pass** (counted); to a **different-colour** receiver ⇒ **Turnover** (logged, not counted); reuses ADR-12 clusters per take |
 | Dribble, Ball-possession, Possession duration | ✅ built + wired 2026-08-27 (ADR-14) | extension of the same possession-heuristic layer |
-| Distance covered | ✅ built + wired 2026-08-27 (ADR-14) | same normalised-pixel-unit speed integration as sprints (ADR-6) — always `(uncalibrated)`; summed ONE TAKE AT A TIME per verified jersey number (raw track ids reset per take, Golden Rule 3) |
-| Celebration, Other key moment | ✅ built + wired 2026-08-27 (ADR-14) | cheap motion pre-filter (`src/events/key_moments.py::find_candidate_windows`, excludes windows already explained by a counted sprint/dribble/possession) → **Gemini** (same model-fallback list as ADR-15's identity check) classifies only the surviving candidate windows, emitting an event ONLY on an explicit "yes"; never runs on every frame (cost control). Not exercised on `Jordan Thomas Highlight Video.mp4` (0 verified players -- no player timeline existed to search for key moments against). |
-| Goal, Assist | ✅ built + wired 2026-08-27 (ADR-17) | scoreboard-OCR delta for occurrence (self-gated on actually finding a legible scoreboard, not the `profile` label); team/scorer via last-possession-before-goal; assist = nearest preceding teammate `PASS` to the scorer. **Verified 2026-08-27** with a real (non-mocked) run of `detect_goals_for_video` against all 6 cached `work/<slug>/` artifacts (5 `clip<N>.mp4` + `jordan_thomas_highlight_video`): every one reports `not available (no legible scoreboard found by the region-activation scan ...)` — the region-activation scan genuinely finds nothing, never a hardcoded "these clips have no scoreboard" shortcut |
+| Distance covered | ✅ built + wired 2026-08-27 (ADR-14) | normalised-pixel-unit speed integration (ADR-6), always `(uncalibrated)`; summed one take at a time |
+| Celebration, Other key moment | ✅ built + wired 2026-08-27 (ADR-14) | cheap motion pre-filter → **Gemini** classifies only surviving candidate windows; emits only on explicit "yes" |
+| **Goal, Assist** | ✅ ADR-17 base + 🆕 **ADR-20 goal region** + 🆕 **ADR-19 annotation** | **Goal** occurrence from any of: manual annotation (authoritative), scoreboard-OCR delta (broadcast, self-gated), or **human-marked goal region** (static cam, ball enters region within a shot window). **Assist** = nearest preceding **same-colour** `PASS` to the credited scorer within `assist_window_seconds`. Still `not available` when none of the three goal sources exists for a clip |
+| **All of the above, manual mode** | 🆕 **ADR-19** | when a sidecar exists, the timeline **is** the parsed annotations (`source="manual_annotation"`); auto-detectors are skipped for event generation but detection/tracking still run for the overlay |
 
 ### 13.4 Highlight compilations (per clip, category-specific — not the single ranked reel)
-`output/<slug>/players/player_<N>/highlights/{ball_possession,dribbles,assists,goals,key_moments}.mp4` —
-each a concatenation of every event in that category for **that verified player**, a few seconds of context
-before/after each event (config knob, matches the existing `pre_seconds`/`post_seconds` pattern). **An
-empty/absent file, not a fabricated one, when a category has zero real events** (owner's rule, identical in
-spirit to Golden Rule 5). Each highlight clip itself carries the same red/green/ball overlay plus an
-event-name + timestamp + jersey-number caption (owner spec §24) — it is a cut of the annotated video, not the
-raw footage.
+`output/<slug>/players/player_<N>/highlights/{ball_possession,dribbles,passes,assists,goals,key_moments}.mp4`
+— each a concatenation of every event in that category for **that known player**, a few seconds of context
+before/after each event (`pre_seconds`/`post_seconds`). **An empty/absent file, not a fabricated one, when a
+category has zero real events.** Each highlight clip carries the same red/green/ball overlay plus an
+event-name + timestamp + jersey-number caption — it is a cut of the **annotated** video (ADR-18), not the raw
+footage. (`passes.mp4` is the owner's explicitly requested pass reel; `goals.mp4`/`assists.mp4` are usually
+empty on amateur footage unless a goal region is marked or a sidecar supplies them.)
 
 ### 13.5 Required directory layout (per input video)
-**When the filename gives the jersey number (§3.1 clips, Phase-1 human-confirms-the-track flow):** unchanged,
-one flat `output/<slug>/` per clip as before.
+**When the jersey number is known from the filename (§3.1 clips):** one flat `output/<slug>/` per clip.
 
-**When the jersey number is not in the filename and must be verified (ADR-15, §3.3):** identity is
-per-*verified-number*, not per-video — a compilation can legitimately contain more than one, or none:
+**When the number is verified (ADR-15) or human-provided (ADR-18 `--target-jersey` / ADR-19 sidecar):**
+identity is per-*known-number*, so a compilation can contain more than one, or none:
 ```
 output/<slug>/
-  original_annotated_video.mp4     # §13.1 — ONE file, whole video, red box only in verified takes
+  original_annotated_video.mp4     # §13.1 — ONE file, whole video, red box only in known-identity takes
   players/
-    player_<N>/                    # one folder per DISTINCT verified jersey number found
+    player_<N>/                    # one folder per DISTINCT known jersey number
       statcard.md                  # §13.2 — exact owner template, this player's real values only
       highlights/
         ball_possession.mp4
+        passes.mp4                 # owner's requested pass reel
         dribbles.mp4
-        assists.mp4                # expect empty on most amateur footage (no scoreboard, §3.2(3))
-        goals.mp4                  # expect empty on most amateur footage (no scoreboard, §3.2(3))
+        assists.mp4                # empty unless a goal source + preceding same-colour pass exist
+        goals.mp4                  # empty unless annotation / scoreboard / marked goal region sources one
         key_moments.mp4            # celebrations / other key moments, Gemini-classified (§13.3)
       events/
-        event_timeline.json        # machine-readable form of statcard.md's timeline, incl. confidence
+        event_timeline.json        # machine-readable timeline incl. confidence + source
   identity_report.json             # every take's {take_id, jersey_number|null, status, confidence,
-                                    # evidence_frames} — including UNVERIFIED takes, so "why is there no
-                                    # player_7 folder for take 3" is always answerable from this file
+                                    # evidence_frames} — including UNVERIFIED takes (so "why is there no
+                                    # player_7 folder for take 3" is always answerable, and which takes need
+                                    # a manual sidecar line is obvious)
+  annotation_report.json           # (ADR-19, manual mode) parsed sidecar + any malformed/unmapped lines
 ```
 The pre-existing `reel.mp4` / `stat_card.json` / `stat_card.md` / `run_report.json` / `clips/` artifacts are
-kept alongside (other tooling/tests depend on them) — §13.5 is additive, not a replacement of the verified
-Stage 4–6 output.
+kept alongside (other tooling/tests depend on them) — §13.5 is additive.
+
+## 14. The single auto flow (Golden Rule 9 — one command, first-flow-correct)
+`make run` iterates every video in `input/` and, **per video, auto-selects a branch with no human step**:
+
+### 14.1 Branch selection (deterministic, in this order)
+1. **Sidecar present?** — if `input/<video_basename>.annotations.txt` exists ⇒ **MANUAL-EVENTS MODE**
+   (ADR-19). The parsed annotations are the authoritative event source; identity = the sidecar's jersey
+   number + colour; Stage-5 auto event-detectors are skipped; detection/tracking still run for the overlay.
+   *This is the owner-confirmed rule: the client's file winning is the trigger — not a quality score.*
+2. **Else — full AUTO MODE**, per the existing `src.pipeline.run.main()` branch (unchanged by this work):
+   - **Jersey number available?** filename `clip<N> <jersey>` (§3.1) ⇒ the original Phase-1
+     `run_pipeline_for_video` flow (human-selects-the-track, `--track-id`).
+   - **No filename number** ⇒ ADR-15's extended pipeline (`run_extended_pipeline_for_video`) always runs —
+     there is no separate quality pre-check, because the OCR/VLM verification step IS the honest quality
+     check: on clear footage (e.g. SoccerNet) it verifies takes; on illegible footage (e.g.
+     `jordan_thomas_highlight_video`) it correctly verifies none. `--target-jersey` (ADR-18), when given,
+     is threaded in as a human-confirmed number that needs only one supporting read. Whichever takes come
+     back unverified are named in `identity_report.json`, which is exactly what
+     `scripts/make_annotation_template.py` reads to build a starter sidecar for a re-run.
+3. **Events, both modes:** colour-aware pass/turnover/assist (ADR-20) and the three goal sources (ADR-19/20/17)
+   apply in auto mode; in manual mode the sidecar already carries them.
+
+### 14.2 Why this is safe to run unattended
+Every branch has an **honest terminal state**: a value, or `not available`/`unverified`/`uncertain` with a
+reason in the run report (Golden Rules 5 + 9). "Runs auto and correct on the first flow" is satisfied by never
+letting a branch fabricate to look complete — a correctly-empty `goals.mp4` on amateur footage is a *pass*,
+not a failure. Resumability (§10) means a re-run after dropping a sidecar reuses all cached detection/tracking.
+
+### 14.3 Manual annotation format (ADR-19 — the client's own phrasing, parsed tolerantly)
+Sidecar file: `input/<video_basename>.annotations.txt` (UTF-8). Lines:
+```
+# comments and a source URL line are allowed and ignored by the parser
+https://www.youtube.com/watch?v=wzvM66c8ZmE
+Min 26:56 player #2 in white takes a touch
+Min 26:58 player #2 in white makes a pass
+Min 27:28 player #2 in white kicks the ball out of bounds
+```
+**Grammar (one event per line):** `[Min ]<TIME> player #<N> in <COLOUR> <ACTION PHRASE>`
+- `TIME` = `MM:SS` or `H:MM:SS`/`HH:MM:SS`; the literal `Min ` prefix is optional; seconds are converted to
+  a float offset from video start.
+- `#<N>` = target jersey number (integer). `<COLOUR>` = a free word (matched to the ADR-12 team cluster).
+- `<ACTION PHRASE>` = free text, mapped to an `EventType` via the **phrase map in `configs/annotations.yaml`**
+  (no magic strings in code). Starter map: `touch→TOUCH`, `pass→PASS`, `out of bounds→OUT_OF_BOUNDS`,
+  `shot|shoots→SHOT`, `goal|scores→GOAL`, `assist→ASSIST`, `tackle→TACKLE`, `save→SAVE`, `sprint|run→SPRINT`,
+  `dribble→DRIBBLE`, `celebrat→KEY_MOMENT` (rendered "Celebration" in the timeline — `_key_moment_label` reads
+  the annotation's own `action_phrase`, the same text heuristic already used for Gemini-classified key
+  moments, ADR-14 — deliberately NOT a new `CELEBRATION` `EventType`, to avoid two competing
+  representations of the same concept). An **unmapped phrase** ⇒ `EventType.KEY_MOMENT` with the raw text
+  kept in `evidence`, and it is **reported** in `annotation_report.json` (never silently dropped, §10).
+- Each parsed line → `Event(source="manual_annotation", confidence=annotations.default_confidence)`.
+- **Acceptance test (§9):** the three lines above parse to exactly `TOUCH@26:56 #2 white`,
+  `PASS@26:58 #2 white`, `OUT_OF_BOUNDS@27:28 #2 white`, and drive a `player_2/` output folder with a
+  `statcard.md` (Identity Status: `Human-provided (manual annotation)`), a `passes.mp4` containing the 26:58
+  event, and an `original_annotated_video.mp4` whose captions fire at all three timestamps.
