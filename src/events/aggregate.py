@@ -82,7 +82,54 @@ def compute_take_all_events(
             drops,
         )
     )
+    # ADR-20: a possession change can independently qualify as BOTH a TACKLE (detect_tackles,
+    # above) and a TURNOVER (detect_passes' own opposing-colour branch) since they share the same
+    # possession-run adjacency for this take — suppress the redundant TURNOVER so one real
+    # dispossession is never double-counted on two different players' stat cards.
+    events = suppress_turnovers_covered_by_tackles(events, events_cfg["turnover"], drops)
     return events, identity_of, identity_confidence
+
+
+def suppress_turnovers_covered_by_tackles(
+    events: list[Event], turnover_cfg: dict, drops: DropCounter | None = None
+) -> list[Event]:
+    """ADR-20: drop any `TURNOVER` whose possession-change transition is ALREADY covered by a
+    `TACKLE` elsewhere in `events` — otherwise one real dispossession double-counts as both a
+    Tackle (on the tackler's own stat card) and a Turnover (on the dispossessed player's), when
+    both `src/events/tackles.py::detect_tackles` and `src/events/possession.py::detect_passes`
+    fired on the exact same possession-run adjacency (they share the identical
+    `possession_runs_for_take` output for one take).
+
+    A `TURNOVER` is suppressed when some `TACKLE` in `events` has the IDENTICAL raw track-id pair
+    (`tackler_raw_track_id` == the turnover's own `receiving_raw_track_id`, `tackled_raw_track_id`
+    == the turnover's own `losing_raw_track_id`) whose own `t_end` sits within
+    `turnover_cfg['suppress_if_tackle_within_s']` seconds of the turnover's `t_end` — see that
+    config key's own comment for why the two are expected to land at (near-)identical timestamps
+    in the common case. Every suppression is logged via `drops`, never silently vanished (Golden
+    Rule 5 / CLAUDE.md §10).
+    """
+    window = turnover_cfg["suppress_if_tackle_within_s"]
+    tackles = [ev for ev in events if ev.type == EventType.TACKLE]
+
+    kept: list[Event] = []
+    for ev in events:
+        if ev.type != EventType.TURNOVER:
+            kept.append(ev)
+            continue
+        losing_raw = ev.evidence.get("losing_raw_track_id")
+        receiving_raw = ev.evidence.get("receiving_raw_track_id")
+        covered = any(
+            tk.evidence.get("tackler_raw_track_id") == receiving_raw
+            and tk.evidence.get("tackled_raw_track_id") == losing_raw
+            and abs(tk.t_end - ev.t_end) <= window
+            for tk in tackles
+        )
+        if covered:
+            if drops is not None:
+                drops.drop("turnover_suppressed_by_tackle")
+            continue
+        kept.append(ev)
+    return kept
 
 
 def target_identity_id(location_track_ids: list[int], identity_of: dict[int, int]) -> int | None:

@@ -4,7 +4,11 @@ GPU/network calls."""
 from __future__ import annotations
 
 from src.common.types import BBox, DetectionClass, Event, EventType, Track, TrackBox
-from src.events.aggregate import attribute_events_to_target, target_identity_id
+from src.events.aggregate import (
+    attribute_events_to_target,
+    suppress_turnovers_covered_by_tackles,
+    target_identity_id,
+)
 
 ATTRIBUTION_CFG = {"shot_proximity_bbox_heights": 4.0, "max_time_gap_s": 1.0}
 
@@ -119,6 +123,90 @@ def test_attribute_shot_uses_spatial_proximity():
         attribution_cfg=ATTRIBUTION_CFG,
     )
     assert result == [shot_event]
+
+
+def _turnover(losing_raw: int, receiving_raw: int, t_end: float) -> Event:
+    return Event(
+        id=f"turnover-{losing_raw}-{receiving_raw}-{t_end}",
+        type=EventType.TURNOVER,
+        t_start=t_end - 0.1,
+        t_end=t_end,
+        player_track_id=losing_raw,
+        take_id=0,
+        confidence=0.2,
+        source="possession_change_opposing_colour",
+        evidence={"losing_raw_track_id": losing_raw, "receiving_raw_track_id": receiving_raw},
+    )
+
+
+def _tackle(tackler_raw: int, tackled_raw: int, t_end: float) -> Event:
+    return Event(
+        id=f"tackle-{tackler_raw}-{tackled_raw}-{t_end}",
+        type=EventType.TACKLE,
+        t_start=t_end - 0.5,
+        t_end=t_end,
+        player_track_id=tackler_raw,
+        take_id=0,
+        confidence=0.25,
+        source="possession_change_closing_speed_heuristic",
+        evidence={"tackler_raw_track_id": tackler_raw, "tackled_raw_track_id": tackled_raw},
+    )
+
+
+# ---------------------------------------------------------------------------
+# suppress_turnovers_covered_by_tackles (ADR-20 §3, tackle/turnover double-count guard)
+# ---------------------------------------------------------------------------
+
+TURNOVER_CFG = {"suppress_if_tackle_within_s": 0.5}
+
+
+def test_suppress_turnovers_covered_by_tackles_removes_the_matching_one():
+    turnover = _turnover(losing_raw=1, receiving_raw=2, t_end=10.0)
+    tackle = _tackle(tackler_raw=2, tackled_raw=1, t_end=10.05)  # same transition, near-identical t
+    kept = suppress_turnovers_covered_by_tackles([turnover, tackle], TURNOVER_CFG)
+    assert kept == [tackle]
+
+
+def test_suppress_turnovers_covered_by_tackles_logs_the_drop():
+    from src.common.logging import DropCounter
+
+    turnover = _turnover(losing_raw=1, receiving_raw=2, t_end=10.0)
+    tackle = _tackle(tackler_raw=2, tackled_raw=1, t_end=10.0)
+    drops = DropCounter("test")
+    suppress_turnovers_covered_by_tackles([turnover, tackle], TURNOVER_CFG, drops)
+    assert drops.as_dict() == {"turnover_suppressed_by_tackle": 1}
+
+
+def test_suppress_turnovers_covered_by_tackles_keeps_unrelated_turnover():
+    # a tackle for a COMPLETELY different track pair must never suppress this turnover
+    turnover = _turnover(losing_raw=1, receiving_raw=2, t_end=10.0)
+    unrelated_tackle = _tackle(tackler_raw=5, tackled_raw=6, t_end=10.0)
+    kept = suppress_turnovers_covered_by_tackles([turnover, unrelated_tackle], TURNOVER_CFG)
+    assert turnover in kept
+
+
+def test_suppress_turnovers_covered_by_tackles_keeps_when_outside_time_window():
+    # same track pair, but the tackle happened well outside the configured window
+    turnover = _turnover(losing_raw=1, receiving_raw=2, t_end=10.0)
+    far_tackle = _tackle(tackler_raw=2, tackled_raw=1, t_end=20.0)
+    kept = suppress_turnovers_covered_by_tackles([turnover, far_tackle], TURNOVER_CFG)
+    assert turnover in kept
+
+
+def test_suppress_turnovers_covered_by_tackles_leaves_non_turnover_events_untouched():
+    touch = Event(
+        id="touch-1",
+        type=EventType.TOUCH,
+        t_start=1.0,
+        t_end=1.0,
+        player_track_id=1,
+        take_id=0,
+        confidence=0.3,
+        source="test",
+        evidence={},
+    )
+    kept = suppress_turnovers_covered_by_tackles([touch], TURNOVER_CFG)
+    assert kept == [touch]
 
 
 def test_attribute_shot_excluded_when_ball_far_from_target():

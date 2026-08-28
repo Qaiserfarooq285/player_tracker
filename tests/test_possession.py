@@ -167,14 +167,73 @@ def test_detect_passes_fires_between_confident_teammates():
     assert 0.0 <= ev.confidence <= cfg["pass"]["max_confidence"]
 
 
-def test_detect_passes_does_not_fire_between_opponents():
+def test_detect_passes_between_opponents_emits_turnover_not_pass():
+    """ADR-20 acceptance #3 (different-cluster case): a possession change to a confidently
+    OPPOSING colour cluster is a TURNOVER, never a PASS -- and must not be counted as a pass."""
     cfg = _events_config()
     a = _player(1, take_id=0, boxes=[_box(0.0, 100.0, 100.0)], team=0, team_confidence=0.9)
     b = _player(2, take_id=0, boxes=[_box(1.0, 200.0, 100.0)], team=1, team_confidence=0.9)
     balls = [_ball(0.0, 100.0, 100.0), _ball(1.0, 200.0, 100.0)]
     runs = possession.possession_runs_for_take(balls, [a, b], cfg)
     events = possession.detect_passes(runs, [a, b], take_id=0, events_cfg=cfg)
+
+    assert [ev.type for ev in events] == [EventType.TURNOVER]
+    turnover = events[0]
+    assert turnover.player_track_id == 1  # the player who LOST the ball
+    assert turnover.source == "possession_change_opposing_colour"
+    assert turnover.evidence["losing_identity"] == 1
+    assert turnover.evidence["receiving_identity"] == 2
+    assert turnover.evidence["losing_team"] == 0
+    assert turnover.evidence["receiving_team"] == 1
+    assert 0.0 <= turnover.confidence <= cfg["turnover"]["max_confidence"]
+    # never counted as a completed pass
+    assert sum(1 for ev in events if ev.type == EventType.PASS) == 0
+
+
+def test_detect_passes_same_cluster_receiver_still_fires_a_pass():
+    """ADR-20 acceptance #3 (same-cluster case, unchanged behaviour): a same-colour receiver still
+    fires a real PASS, not a turnover."""
+    cfg = _events_config()
+    a = _player(1, take_id=0, boxes=[_box(0.0, 100.0, 100.0)], team=0, team_confidence=0.9)
+    b = _player(2, take_id=0, boxes=[_box(1.0, 200.0, 100.0)], team=0, team_confidence=0.9)
+    balls = [_ball(0.0, 100.0, 100.0), _ball(1.0, 200.0, 100.0)]
+    runs = possession.possession_runs_for_take(balls, [a, b], cfg)
+    events = possession.detect_passes(runs, [a, b], take_id=0, events_cfg=cfg)
+    assert [ev.type for ev in events] == [EventType.PASS]
+
+
+def test_detect_passes_low_team_confidence_emits_neither_pass_nor_turnover():
+    """ADR-20 acceptance #3 (low-confidence case, unchanged): when the team signal itself isn't
+    trustworthy (`teammates_gate` returns `None`), neither a PASS nor a TURNOVER is ever guessed."""
+    cfg = _events_config()
+    a = _player(1, take_id=0, boxes=[_box(0.0, 100.0, 100.0)], team=0, team_confidence=0.1)
+    b = _player(2, take_id=0, boxes=[_box(1.0, 200.0, 100.0)], team=1, team_confidence=0.1)
+    balls = [_ball(0.0, 100.0, 100.0), _ball(1.0, 200.0, 100.0)]
+    runs = possession.possession_runs_for_take(balls, [a, b], cfg)
+    events = possession.detect_passes(runs, [a, b], take_id=0, events_cfg=cfg)
     assert events == []
+
+
+def test_detect_passes_turnover_disabled_by_config_drops_instead_of_emitting():
+    cfg = _events_config()
+    cfg = {**cfg, "turnover": {**cfg["turnover"], "enabled": False}}
+    a = _player(1, take_id=0, boxes=[_box(0.0, 100.0, 100.0)], team=0, team_confidence=0.9)
+    b = _player(2, take_id=0, boxes=[_box(1.0, 200.0, 100.0)], team=1, team_confidence=0.9)
+    balls = [_ball(0.0, 100.0, 100.0), _ball(1.0, 200.0, 100.0)]
+    runs = possession.possession_runs_for_take(balls, [a, b], cfg)
+    events = possession.detect_passes(runs, [a, b], take_id=0, events_cfg=cfg)
+    assert events == []
+
+
+def test_detect_passes_same_colour_required_false_treats_opposing_colour_as_pass():
+    cfg = _events_config()
+    cfg = {**cfg, "pass": {**cfg["pass"], "same_colour_required": False}}
+    a = _player(1, take_id=0, boxes=[_box(0.0, 100.0, 100.0)], team=0, team_confidence=0.9)
+    b = _player(2, take_id=0, boxes=[_box(1.0, 200.0, 100.0)], team=1, team_confidence=0.9)
+    balls = [_ball(0.0, 100.0, 100.0), _ball(1.0, 200.0, 100.0)]
+    runs = possession.possession_runs_for_take(balls, [a, b], cfg)
+    events = possession.detect_passes(runs, [a, b], take_id=0, events_cfg=cfg)
+    assert [ev.type for ev in events] == [EventType.PASS]
 
 
 def test_detect_passes_degrades_gracefully_on_low_team_confidence_never_assumes_team_zero():

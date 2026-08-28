@@ -276,6 +276,43 @@ pass:
   min_confidence: 0.1
   max_confidence: 0.35 # HARD CEILING — below `possession`'s, since a pass additionally depends on
   # the (soft, ADR-12) team signal on top of two chained possession-interval lookups.
+  same_colour_required: true # ADR-20 (owner, 2026-08-27): a completed PASS strictly requires the
+  # receiver to be the SAME ADR-12 colour cluster as the passer — the owner's own restated rule
+  # ("pass to the same jersey colour is a completed pass; to the other side is not"). This is an
+  # owner-facing escape hatch, not a tuned threshold: set False only if a specific video's own
+  # colour clustering turns out to be unreliable and you'd rather fall back to the pre-ADR-20
+  # behaviour (every possession change counted as a pass) than get spurious turnovers — none of
+  # this project's own clips need that today.
+
+turnover:
+  # ADR-20 (owner, 2026-08-27): the possession-change-to-a-DIFFERENT-colour-cluster case
+  # `detect_passes` used to drop as `"pass_not_teammates"` — now a real, traceable `EventType.
+  # TURNOVER` (Golden Rule 5: a lost ball is not "nothing happened", and hiding it would be a
+  # silent, dishonest filter; the owner's own words: "the other side is not a completed pass",
+  # i.e. still an event, just not that one). Reuses `pass.pass_max_dist`/`pass_max_gap_s`'s own
+  # adjacency eligibility (`turnover_confidence` shares `pass_confidence`'s exact closeness-by-
+  # travel shape) — the only thing that differs between a pass and a turnover is which colour
+  # cluster ended up with the ball, not how far/fast it moved.
+  enabled: true # a single kill switch for the whole category, independent of `same_colour_required`
+  # above (that flag changes whether an opposing-colour change is EVER distinguished from a pass at
+  # all; this flag changes whether a distinguished one gets emitted as an event or just dropped).
+  min_confidence: 0.1
+  max_confidence: 0.35 # HARD CEILING — same tier as `pass` (identical confidence-chain depth: one
+  # possession-change instant, two chained possession-interval qualities, one soft ADR-12 team
+  # check) — a turnover is not inherently less certain than a pass would have been, it just landed
+  # on the other colour.
+  suppress_if_tackle_within_s: 0.5 # ADR-20: `detect_tackles` (src/events/tackles.py) already
+  # detects the identical "possession changes to a confidently OPPOSING identity" transition, with
+  # its own additional closing-speed precondition — when BOTH fire for the same transition
+  # (`src/events/aggregate.py::suppress_turnovers_covered_by_tackles`: same take, tackler/tackled
+  # raw track ids match the turnover's own receiving/losing raw track ids, and the two events' own
+  # `t_end` sit within this many seconds of each other), the TURNOVER is suppressed — logged via
+  # DropCounter, never silently vanished — so one real dispossession is never double-counted as
+  # both a Tackle and a Turnover on the same player's stat card. 0.5s is a generous window given
+  # both events are keyed off the SAME `run_b.t_start` instant in the common case (they consume
+  # the identical `possession_runs_for_take` adjacency) — real floating-point/pipeline-order drift
+  # between the two computations should be well under a frame's worth of time, so this is not a
+  # tuned "how long a tackle takes" threshold, just slack for the two detectors' own bookkeeping.
 
 dribble:
   # A single possession interval by ONE identity, long enough (`dribble_min_duration_s`) with an

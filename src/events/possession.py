@@ -305,6 +305,20 @@ def pass_confidence(quality_a: float, quality_b: float, travel: float, pass_cfg:
     return min(pass_cfg["max_confidence"], max(pass_cfg["min_confidence"], raw))
 
 
+def turnover_confidence(
+    quality_a: float, quality_b: float, travel: float, pass_cfg: dict, turnover_cfg: dict
+) -> float:
+    """ADR-20: the SAME `closeness(travel) * mean(quality_a, quality_b)` shape as `pass_confidence`
+    (reuses `pass_cfg['pass_max_dist']` for the closeness term -- a turnover is measured against
+    the identical "is this ball travel plausible for one continuous possession change" scale a
+    pass is, it just landed on the WRONG colour), clamped to `turnover`'s own
+    `configs/events.yaml` ceiling instead of `pass`'s."""
+    max_d = pass_cfg["pass_max_dist"]
+    closeness = 1.0 - min(1.0, travel / max_d) if max_d > 0 else 1.0
+    raw = closeness * ((quality_a + quality_b) / 2.0)
+    return min(turnover_cfg["max_confidence"], max(turnover_cfg["min_confidence"], raw))
+
+
 def detect_passes(
     runs: list[PossessionRun],
     tracks: list[Track],
@@ -321,6 +335,14 @@ def detect_passes(
     `player_track_id` is the PASSER (run A's identity) — CLAUDE.md §13.2 lists "Passes" as a
     per-player stat, and the conventional football-stats reading credits the player who PLAYED the
     ball, not the one who received it; `Event.evidence` carries both identities regardless.
+
+    ADR-20: the `teammates_gate` tri-state now drives THREE outcomes, not two. `True` (same ADR-12
+    colour cluster) → `PASS`, unchanged. `False` (confidently OPPOSING cluster) → a NEW
+    `EventType.TURNOVER` — a real, traceable possession loss, logged with its own evidence rather
+    than silently dropped (Golden Rule 5: hiding a lost ball would be a dishonest filter, and the
+    owner's own framing is explicit that a turnover is "not a completed pass", not "not an event
+    at all"). `None` (team signal not trustworthy enough to judge either way) → unchanged: dropped,
+    never guessed as either outcome.
 
     Asserted defensively, same reasoning as `possession_runs_for_take`: `tracks` must be one
     take's own (raw ids reset per take, so a mixed-take list risks a wrong team lookup silently
@@ -355,40 +377,91 @@ def detect_passes(
         raw_b = run_b.samples[0][1]
         team_threshold = pass_cfg["team_confidence_threshold"]
         teammates = teammates_gate(raw_a, raw_b, tracks_by_id, team_threshold)
-        if teammates is not True:
+        if teammates is None:
             if drops is not None:
-                reason = (
-                    "pass_team_confidence_too_low" if teammates is None else "pass_not_teammates"
-                )
-                drops.drop(reason)
+                drops.drop("pass_team_confidence_too_low")
             continue
+
+        # ADR-20: `pass.same_colour_required` documents (and can relax) the design decision that a
+        # PASS strictly requires the SAME ADR-12 colour cluster. Defaulting True/absent preserves
+        # the exact pre-ADR-20 gate; an explicit False treats an opposing-colour possession change
+        # as a pass too (never emitting a TURNOVER at all) -- an owner-facing escape hatch for
+        # footage where the colour clustering itself turns out to be unreliable, not something any
+        # of this project's own clips currently need.
+        if teammates is False and not pass_cfg.get("same_colour_required", True):
+            teammates = True
 
         quality_a = possession_quality(run_a, possession_cfg, ball_fps)
         quality_b = possession_quality(run_b, possession_cfg, ball_fps)
         if identity_confidence is not None:
             quality_a *= identity_confidence.get(run_a.identity, 1.0)
             quality_b *= identity_confidence.get(run_b.identity, 1.0)
-        confidence = pass_confidence(quality_a, quality_b, travel, pass_cfg)
-        if confidence < min_emit:
-            if drops is not None:
-                drops.drop("pass_below_min_emit_confidence")
+
+        if teammates is True:
+            confidence = pass_confidence(quality_a, quality_b, travel, pass_cfg)
+            if confidence < min_emit:
+                if drops is not None:
+                    drops.drop("pass_below_min_emit_confidence")
+                continue
+            events.append(
+                Event(
+                    id=str(uuid.uuid4()),
+                    type=EventType.PASS,
+                    t_start=run_a.t_end,
+                    t_end=run_b.t_start,
+                    player_track_id=run_a.identity,
+                    take_id=take_id,
+                    confidence=confidence,
+                    source="possession_change_teammate_heuristic",
+                    evidence={
+                        "passer_identity": run_a.identity,
+                        "receiver_identity": run_b.identity,
+                        "passer_raw_track_id": raw_a,
+                        "receiver_raw_track_id": raw_b,
+                        "ball_travel_px": travel,
+                        "gap_s": gap,
+                        "calibrated": False,
+                        "unit": "pixels_at_detect_stage_resolution",
+                    },
+                )
+            )
             continue
 
+        # ADR-20: `teammates is False` -- a confidently OPPOSING-colour possession change. This is
+        # a TURNOVER (logged with full evidence, Golden Rule 5), never silently dropped and never
+        # counted toward `Passes` (CLAUDE.md §13.2's own template keeps the two lines separate).
+        # Reuses the exact same adjacency/gap/distance eligibility already checked above for a
+        # pass -- the only thing that differs is which colour cluster ended up with the ball.
+        turnover_cfg = events_cfg["turnover"]
+        if not turnover_cfg["enabled"]:
+            if drops is not None:
+                drops.drop("turnover_disabled")
+            continue
+        confidence = turnover_confidence(quality_a, quality_b, travel, pass_cfg, turnover_cfg)
+        if confidence < min_emit:
+            if drops is not None:
+                drops.drop("turnover_below_min_emit_confidence")
+            continue
+
+        team_a, _conf_a = track_team(raw_a, tracks_by_id)
+        team_b, _conf_b = track_team(raw_b, tracks_by_id)
         events.append(
             Event(
                 id=str(uuid.uuid4()),
-                type=EventType.PASS,
+                type=EventType.TURNOVER,
                 t_start=run_a.t_end,
                 t_end=run_b.t_start,
                 player_track_id=run_a.identity,
                 take_id=take_id,
                 confidence=confidence,
-                source="possession_change_teammate_heuristic",
+                source="possession_change_opposing_colour",
                 evidence={
-                    "passer_identity": run_a.identity,
-                    "receiver_identity": run_b.identity,
-                    "passer_raw_track_id": raw_a,
-                    "receiver_raw_track_id": raw_b,
+                    "losing_identity": run_a.identity,
+                    "receiving_identity": run_b.identity,
+                    "losing_raw_track_id": raw_a,
+                    "receiving_raw_track_id": raw_b,
+                    "losing_team": team_a,
+                    "receiving_team": team_b,
                     "ball_travel_px": travel,
                     "gap_s": gap,
                     "calibrated": False,
