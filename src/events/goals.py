@@ -45,6 +45,7 @@ and `src.pipeline.extended_output` (ADR-15's filename-less flow) call identicall
 
 from __future__ import annotations
 
+import math
 import re
 import uuid
 from pathlib import Path
@@ -55,7 +56,7 @@ from pydantic import BaseModel
 
 from src.common.logging import get_logger
 from src.common.types import BallDetection, Event, EventType, Take, Track
-from src.common.video import decode_frames
+from src.common.video import decode_frames, probe
 from src.events.possession import (
     detect_passes,
     detect_possession,
@@ -64,6 +65,7 @@ from src.events.possession import (
 )
 from src.events.segments import find_threshold_segments
 from src.events.shots import ball_speed_series
+from src.goal.detect import GoalStructure, goal_bbox_at, take_motion_score
 from src.identity.jersey_ocr import free_easyocr_reader, load_easyocr_reader
 
 logger = get_logger(__name__)
@@ -526,12 +528,20 @@ def detect_goals_goal_region(
     slug: str,
     region_cfg: dict,
     take_id: int | None,
+    source_label: str = "manual",
 ) -> list[Event]:
-    """ADR-20 -- the human-marked goal-mouth-region occurrence detector: a SECOND, independent
-    "did a goal occur" source alongside `detect_goals_scoreboard_delta`, for the static-camera
-    footage that has no scoreboard at all (the owner's own `configs/goal_region.yaml`, one or more
-    hand-drawn polygons per video slug -- CLAUDE.md ADR-3's own human-in-the-loop, no-training
-    pattern, never an auto-detected goal line/net).
+    """ADR-20 -- the goal-mouth-region occurrence detector: a SECOND, independent "did a goal
+    occur" source alongside `detect_goals_scoreboard_delta`, for the static-camera footage that has
+    no scoreboard at all.
+
+    **`source_label` ("streamed-gathering-treehouse" plan, Stage D)**: the geometry test itself
+    (`_point_in_polygon`) never changes -- only WHERE `region_cfg['regions']` came from does. The
+    caller (`detect_goals_for_take`) passes `"detected"` when `region_cfg['regions'][slug]` came
+    from Stage C's auto-tracked goal structure (`src/goal/detect.py`), or the default `"manual"`
+    when it came from the owner's own hand-drawn `configs/goal_region.yaml` polygon (ADR-3's
+    human-in-the-loop, no-training pattern, kept alive as an explicit fallback for a camera angle
+    where auto-detection can't see the goal). Recorded verbatim in each emitted event's own
+    `evidence['goal_region_source']` (Golden Rule 5 -- provenance is always auditable).
 
     `region_cfg['regions']` is `{slug: [[(x, y), ...], ...]}`, `(x, y)` as FRACTIONS of the
     detect-stage frame (same coordinate space as `configs/events.yaml: goal.candidate_regions`) --
@@ -596,13 +606,74 @@ def detect_goals_goal_region(
                     "ball_cy": ball.bbox.cy,
                     "fast_ball_window_t_end": fast_window_t_end,
                     "shot_window_s": window,
-                    "goal_region_source": "manual",
+                    "goal_region_source": source_label,
                     "slug": slug,
                 },
             )
         )
         debounce_until = ball.t + window
     return events
+
+
+# ---------------------------------------------------------------------------
+# Stage D ("streamed-gathering-treehouse" plan) -- feed detect_goals_goal_region from Stage C's
+# auto-tracked goal structure instead of only the static configs/goal_region.yaml polygon.
+# ---------------------------------------------------------------------------
+
+
+def _tracked_polygons_for_take(
+    goal_structure: GoalStructure,
+    video_path: str | Path,
+    take: Take,
+    hardware_cfg: dict,
+    profile_cfg: dict,
+    goal_structure_cfg: dict,
+    frame_width: float,
+    frame_height: float,
+    use_nvdec: bool = True,
+) -> list[list[tuple[float, float]]]:
+    """Query Stage C's tracked goal structure (`src/goal/detect.py`) at a handful of
+    evenly-spaced instants across `take` (bounded -- never a per-ball-sample lookup) and convert
+    each into a rectangle polygon in the SAME detect-stage-pixel coordinate space
+    `detect_goals_goal_region`'s own manual polygons already use. `_point_in_polygon` itself never
+    changes (Stage D's own scope, per the plan) -- a ball crossing ANY of these anchor-instant
+    polygons counts, which is an honest approximation of "the goal moved with the camera" without
+    needing a per-ball-sample affine lookup.
+
+    Number of anchors is driven by THIS TAKE's own measured motion score (`src/goal/detect.
+    take_motion_score`, ADR-11: never a fixed interval or the coarse static/panning label) via
+    `goal_structure_cfg['tracking']`'s own `min_reestimate_interval_s`/`max_reestimate_interval_s`
+    -- capped at 10 total anchors regardless (a reasoned bound on decode/affine-hop cost for a
+    long, high-motion take; each anchor is one `goal_bbox_at` query, itself at most one short
+    frame-grab + affine fit per side, see that function's own docstring for its cost).
+    """
+    tracking_cfg = goal_structure_cfg["tracking"]
+    motion_cfg = profile_cfg["motion"]
+    motion_score = take_motion_score(video_path, take, hardware_cfg, profile_cfg, use_nvdec)
+
+    interval = (
+        tracking_cfg["min_reestimate_interval_s"]
+        if motion_score > tracking_cfg["reestimate_motion_score_threshold"]
+        else tracking_cfg["max_reestimate_interval_s"]
+    )
+    duration = max(take.t_end - take.t_start, 1e-3)
+    n_anchors = max(1, min(10, math.ceil(duration / interval)))
+    anchor_ts = [take.t_start + duration * (i + 0.5) / n_anchors for i in range(n_anchors)]
+
+    native_meta = probe(video_path)
+    native_w, native_h = native_meta["width"], native_meta["height"]
+
+    polygons: list[list[tuple[float, float]]] = []
+    for t in anchor_ts:
+        native_bbox = goal_bbox_at(
+            goal_structure, video_path, t, take, motion_score, tracking_cfg, motion_cfg, use_nvdec
+        )
+        x1 = (native_bbox.x1 / native_w) * frame_width
+        x2 = (native_bbox.x2 / native_w) * frame_width
+        y1 = (native_bbox.y1 / native_h) * frame_height
+        y2 = (native_bbox.y2 / native_h) * frame_height
+        polygons.append([(x1, y1), (x2, y1), (x2, y2), (x1, y2)])
+    return polygons
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +694,10 @@ def detect_goals_for_take(
     frame_height: float | None = None,
     goal_region_cfg: dict | None = None,
     slug: str | None = None,
+    goal_structure: GoalStructure | None = None,
+    goal_structure_cfg: dict | None = None,
+    hardware_cfg: dict | None = None,
+    profile_cfg: dict | None = None,
 ) -> tuple[list[Event], dict]:
     """Full ADR-17 pipeline for ONE take: decode a low-fps frame series spanning it, run the
     scoreboard occurrence scan, and — ONLY when at least one occurrence event (scoreboard- OR
@@ -652,6 +727,17 @@ def detect_goals_for_take(
     `identity_of` is the SAME `build_take_identities` partition the caller's own event pipeline
     uses for this take (`None` for the original Phase-1 flow, which has no identity-stitching
     step at all and uses raw `Track.id`s directly, exactly like `detect_sprints` already does).
+
+    **Stage D ("streamed-gathering-treehouse" plan)**: `goal_structure` (Stage C's own
+    `src/goal/detect.GoalStructure` for THIS take, or `None`) supplies a THIRD, auto-tracked
+    geometry source. Priority, per take: a confident `goal_structure` wins over the manual
+    `configs/goal_region.yaml` polygon (`raw_polygons`) when both exist; the manual polygon is kept
+    as an explicit fallback for a camera angle Stage C couldn't confidently localize (ADR-20's own
+    human-in-the-loop escape hatch, still valuable); neither present -> the region source is
+    skipped entirely, exactly as before this plan. `goal_structure_cfg`/`hardware_cfg`/
+    `profile_cfg` are only needed alongside `goal_structure` (to query
+    `src/goal/detect.goal_bbox_at` at a handful of instants across the take) — any of them being
+    `None` falls back to the manual-polygon-or-nothing behaviour, never a crash.
     """
     goal_cfg = events_cfg["goal"]
     assist_cfg = events_cfg["assist"]
@@ -682,24 +768,57 @@ def detect_goals_for_take(
     # `detect_goals_goal_region`, which expects all of them on one dict.
     region_behavior_cfg = events_cfg.get("goal_region", {})
     raw_polygons = (goal_region_cfg or {}).get("regions", {}).get(slug) if slug else None
+
+    # Stage D: a confident Stage C goal_structure supplies DETECTED polygons, tracked across the
+    # take; configs/goal_region.yaml's own hand-drawn polygon is kept as an explicit fallback for
+    # a camera angle Stage C couldn't confidently localize (ADR-20's human-in-the-loop escape
+    # hatch). Detected wins over manual when both are available for this take.
+    detected_polygons: list[list[tuple[float, float]]] | None = None
     if (
-        goal_region_cfg is not None
-        and slug is not None
+        goal_structure is not None
+        and goal_structure_cfg is not None
+        and hardware_cfg is not None
+        and profile_cfg is not None
         and frame_width is not None
         and frame_height is not None
-        and region_behavior_cfg.get("enabled", True)
-        and raw_polygons
     ):
-        region_attempted = True
-        # `configs/goal_region.yaml` polygons are authored as [0,1] FRACTIONS of the frame (so one
+        detected_polygons = _tracked_polygons_for_take(
+            goal_structure,
+            video_path,
+            take,
+            hardware_cfg,
+            profile_cfg,
+            goal_structure_cfg,
+            frame_width,
+            frame_height,
+            use_nvdec,
+        )
+
+    if detected_polygons:
+        polygons_to_use: list[list[tuple[float, float]]] | None = detected_polygons
+        source_label = "detected"
+    elif raw_polygons:
+        # configs/goal_region.yaml polygons are authored as [0,1] FRACTIONS of the frame (so one
         # polygon travels correctly across a re-run at a different decode scale_width) --
         # `detect_goals_goal_region` itself is unit-agnostic (it just compares ball coordinates
         # against polygon coordinates directly), so the fraction -> pixel scaling happens exactly
-        # once, here, into a per-call copy of the config rather than mutating the shared one.
-        scaled_polygons = [
+        # once, here, into a per-call copy rather than mutating the shared config.
+        polygons_to_use = [
             [(x * frame_width, y * frame_height) for x, y in poly] for poly in raw_polygons
         ]
-        scaled_region_cfg = {**region_behavior_cfg, "regions": {slug: scaled_polygons}}
+        source_label = "manual"
+    else:
+        polygons_to_use = None
+        source_label = "manual"
+
+    if (
+        polygons_to_use
+        and frame_width is not None
+        and frame_height is not None
+        and region_behavior_cfg.get("enabled", True)
+    ):
+        region_attempted = True
+        scaled_region_cfg = {**region_behavior_cfg, "regions": {slug: polygons_to_use}}
         shot_cfg = events_cfg["shot"]
         times, speeds, _dxs = ball_speed_series(
             take_balls,
@@ -715,10 +834,16 @@ def detect_goals_for_take(
             shot_cfg["merge_gap_s"],
         )
         region_events = detect_goals_goal_region(
-            take_balls, fast_ball_windows, slug, scaled_region_cfg, take.id
+            take_balls,
+            fast_ball_windows,
+            slug,
+            scaled_region_cfg,
+            take.id,
+            source_label=source_label,
         )
     debug["goal_region_attempted"] = region_attempted
     debug["goal_region_events_found"] = len(region_events)
+    debug["goal_region_source"] = source_label if region_attempted else None
 
     if not occurrence_events and not region_events:
         return [], debug
@@ -844,20 +969,26 @@ def detect_goals_for_video(
     frame_height: float | None = None,
     goal_region_cfg: dict | None = None,
     slug: str | None = None,
+    goal_structures_by_take: dict[int, GoalStructure] | None = None,
+    goal_structure_cfg: dict | None = None,
+    hardware_cfg: dict | None = None,
+    profile_cfg: dict | None = None,
 ) -> GoalDetectionResult:
     """ADR-17's real, per-video goal+assist detector (ADR-20 adds the human-marked goal-region
-    source alongside it) — the single entrypoint both `src.pipeline.run` (the 5 original
-    filename-based clips) and `src.pipeline.extended_output` (ADR-15's filename-less flow) call
-    identically. Loads ONE EasyOCR reader for the whole video (CLAUDE.md §11: never reload
-    per-take), matching `src/identity/verify.py`'s own load-once/free-in-`finally` convention.
+    source; Stage D of the "streamed-gathering-treehouse" plan adds Stage C's auto-tracked one
+    alongside it) — the single entrypoint both `src.pipeline.run` (the 5 original filename-based
+    clips) and `src.pipeline.extended_output` (ADR-15's filename-less flow) call identically.
+    Loads ONE EasyOCR reader for the whole video (CLAUDE.md §11: never reload per-take), matching
+    `src/identity/verify.py`'s own load-once/free-in-`finally` convention.
 
     Never trusts `RunProfile.profile` (ADR-11's own lesson): every take gets the SAME measured
     region-activation scan regardless of what the source profiler labeled the video.
 
-    `frame_width`/`frame_height`/`goal_region_cfg`/`slug` (ADR-20) are all optional and default to
-    `None` -- omitting any of them simply skips the goal-region source entirely (never a crash,
-    never a fabricated region), which is exactly what every caller that doesn't yet pass them gets
-    (safe, behaviour-preserving default for any pre-ADR-20 call site).
+    `frame_width`/`frame_height`/`goal_region_cfg`/`slug` (ADR-20) and `goal_structures_by_take`/
+    `goal_structure_cfg`/`hardware_cfg`/`profile_cfg` (Stage D) are all optional and default to
+    `None` -- omitting any of them simply skips that source entirely (never a crash, never a
+    fabricated region), which is exactly what every caller that doesn't yet pass them gets (safe,
+    behaviour-preserving default for any pre-ADR-20/pre-Stage-D call site).
     """
     goal_cfg = events_cfg["goal"]
     goal_region_configured = bool(slug and (goal_region_cfg or {}).get("regions", {}).get(slug))
@@ -891,6 +1022,10 @@ def detect_goals_for_video(
                 frame_height=frame_height,
                 goal_region_cfg=goal_region_cfg,
                 slug=slug,
+                goal_structure=(goal_structures_by_take or {}).get(take.id),
+                goal_structure_cfg=goal_structure_cfg,
+                hardware_cfg=hardware_cfg,
+                profile_cfg=profile_cfg,
             )
             if debug.get("activated_region") is not None:
                 activated_any = True

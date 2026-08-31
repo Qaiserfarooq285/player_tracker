@@ -680,6 +680,194 @@ def test_detect_goals_for_take_region_sourced_goal_gets_full_attribution_when_su
     assert assist_events[0].player_track_id == 1  # the passer credited with the assist
 
 
+# ---------------------------------------------------------------------------
+# _tracked_polygons_for_take / detect_goals_for_take -- Stage D ("streamed-gathering-treehouse"
+# plan): Stage C's auto-tracked goal structure feeds detect_goals_goal_region's geometry, with
+# configs/goal_region.yaml kept as an explicit manual fallback.
+# ---------------------------------------------------------------------------
+
+
+def _goal_structure_cfg() -> dict:
+    return load_yaml(REPO_ROOT / "configs" / "goal_structure.yaml")
+
+
+def _goal_structure(**overrides) -> goals_mod.GoalStructure:
+    from src.goal.detect import GoalStructure
+
+    defaults = dict(
+        take_id=0,
+        t_anchor=5.0,
+        bbox=BBox(x1=1920.0, y1=1080.0, x2=2112.0, y2=1188.0),
+        crossbar=(1920.0, 1080.0, 2112.0, 1080.0),
+        posts=[(1920.0, 1080.0, 1920.0, 1188.0), (2112.0, 1080.0, 2112.0, 1188.0)],
+        confidence=1.0,
+        n_corroborating_frames=2,
+        n_frames_sampled=2,
+    )
+    defaults.update(overrides)
+    return GoalStructure(**defaults)
+
+
+def test_tracked_polygons_for_take_converts_native_bbox_into_detect_pixel_fractions(monkeypatch):
+    monkeypatch.setattr(goals_mod, "probe", lambda path: {"width": 3840, "height": 2160})
+    monkeypatch.setattr(goals_mod, "take_motion_score", lambda *a, **k: 0.0)  # static -> 1 anchor
+    fixed_bbox = BBox(x1=1920.0, y1=1080.0, x2=2112.0, y2=1188.0)
+    monkeypatch.setattr(goals_mod, "goal_bbox_at", lambda *a, **k: fixed_bbox)
+
+    take = Take(id=0, t_start=0.0, t_end=10.0, frame_start=0, frame_end=100, kind="main")
+    polygons = goals_mod._tracked_polygons_for_take(
+        _goal_structure(),
+        "fake.mp4",
+        take,
+        hardware_cfg={"stages": {"profile": {"fps_sample": 2}}},
+        profile_cfg={"motion": {}},
+        goal_structure_cfg=_goal_structure_cfg(),
+        frame_width=1920.0,
+        frame_height=1080.0,
+        use_nvdec=False,
+    )
+    assert len(polygons) == 1
+    # native x1=1920/3840=0.5 -> *1920 detect-width = 960; y1=1080/2160=0.5 -> *1080 = 540
+    # native x2=2112/3840=0.55 -> *1920 = 1056; y2=1188/2160=0.55 -> *1080 = 594
+    assert polygons[0] == [(960.0, 540.0), (1056.0, 540.0), (1056.0, 594.0), (960.0, 594.0)]
+
+
+def test_tracked_polygons_for_take_uses_more_anchors_under_high_motion(monkeypatch):
+    monkeypatch.setattr(goals_mod, "probe", lambda path: {"width": 3840, "height": 2160})
+    tracking_cfg = _goal_structure_cfg()["tracking"]
+    above_threshold = tracking_cfg["reestimate_motion_score_threshold"] + 1.0
+    monkeypatch.setattr(goals_mod, "take_motion_score", lambda *a, **k: above_threshold)
+    monkeypatch.setattr(goals_mod, "goal_bbox_at", lambda *a, **k: _goal_structure().bbox)
+
+    take = Take(id=0, t_start=0.0, t_end=10.0, frame_start=0, frame_end=100, kind="main")
+    polygons = goals_mod._tracked_polygons_for_take(
+        _goal_structure(),
+        "fake.mp4",
+        take,
+        hardware_cfg={"stages": {"profile": {"fps_sample": 2}}},
+        profile_cfg={"motion": {}},
+        goal_structure_cfg=_goal_structure_cfg(),
+        frame_width=1920.0,
+        frame_height=1080.0,
+        use_nvdec=False,
+    )
+    # duration=10.0, min_reestimate_interval_s=5.0 -> ceil(10/5)=2 anchors, more than the 1 anchor
+    # a near-static take gets (previous test) -- ADR-11: consume the measured signal.
+    assert len(polygons) == 2
+
+
+def test_detect_goals_for_take_prefers_detected_polygon_over_manual(monkeypatch):
+    """When Stage C found a confident goal_structure for this take, its tracked polygon must be
+    used INSTEAD of the manual configs/goal_region.yaml one, even when both exist -- proven here by
+    placing the ball crossing where ONLY the detected polygon (not the manual one) covers it."""
+    monkeypatch.setattr(goals_mod, "decode_frames", _no_scoreboard_decode)
+    # Detected polygon covers the LEFT 15% of frame; manual polygon covers the RIGHT 15% (disjoint)
+    # -- a ball crossing on the left can only fire via the DETECTED polygon.
+    # NOTE: `_tracked_polygons_for_take` returns polygons already in DETECT-PIXEL coordinates (the
+    # real implementation scales native bbox -> fraction -> detect pixels itself), unlike
+    # `configs/goal_region.yaml`'s own [0,1]-fraction polygons that `detect_goals_for_take` scales
+    # itself -- so this mock returns PIXEL coordinates directly (frame is 1000x1000 below).
+    detected_polygon = [[(0.0, 0.0), (150.0, 0.0), (150.0, 1000.0), (0.0, 1000.0)]]
+    monkeypatch.setattr(goals_mod, "_tracked_polygons_for_take", lambda *a, **k: detected_polygon)
+
+    events_cfg = _events_config()
+    take = Take(id=0, t_start=0.0, t_end=1.0, frame_start=0, frame_end=10, kind="main")
+    frame_width, frame_height = 1000.0, 1000.0
+
+    balls = [
+        BallDetection(
+            bbox=BBox(x1=910.0 - i * 90.0 - 5, y1=45.0, x2=910.0 - i * 90.0 + 5, y2=55.0),
+            conf=0.9,
+            frame_index=i,
+            t=i * 0.1,
+        )
+        for i in range(10)
+    ]  # a sustained LEFTWARD run (same speed magnitude as the reference rightward-run test, just
+    # mirrored) ending inside the left 15% of frame (x~100 -> x~10)
+
+    manual_polygon = [(0.85, 0.0), (1.0, 0.0), (1.0, 1.0), (0.85, 1.0)]  # right 15% -- disjoint
+    goal_region_cfg = {"regions": {"testslug": [manual_polygon]}}
+
+    monkeypatch.setattr(goals_mod, "possession_runs_for_take", lambda *a, **k: [])
+    monkeypatch.setattr(goals_mod, "detect_possession", lambda *a, **k: [])
+    monkeypatch.setattr(goals_mod, "detect_passes", lambda *a, **k: [])
+
+    events, debug = goals_mod.detect_goals_for_take(
+        reader=_EmptyReader(),
+        video_path="fake.mp4",
+        take=take,
+        take_tracks=[],
+        take_balls=balls,
+        events_cfg=events_cfg,
+        identity_of=None,
+        use_nvdec=False,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        goal_region_cfg=goal_region_cfg,
+        slug="testslug",
+        goal_structure=_goal_structure(),
+        goal_structure_cfg=_goal_structure_cfg(),
+        hardware_cfg={"stages": {"profile": {"fps_sample": 2}}},
+        profile_cfg={"motion": {}},
+    )
+
+    goal_events = [e for e in events if e.type == EventType.GOAL]
+    assert len(goal_events) == 1
+    assert goal_events[0].evidence["goal_region_source"] == "detected"
+    assert debug["goal_region_source"] == "detected"
+
+
+def test_detect_goals_for_take_falls_back_to_manual_when_no_goal_structure(monkeypatch):
+    """No Stage C goal_structure for this take (e.g. Stage C never corroborated one) -> the manual
+    configs/goal_region.yaml polygon is used exactly as before this plan -- the human-in-the-loop
+    escape hatch stays alive."""
+    monkeypatch.setattr(goals_mod, "decode_frames", _no_scoreboard_decode)
+
+    events_cfg = _events_config()
+    take = Take(id=0, t_start=0.0, t_end=1.0, frame_start=0, frame_end=10, kind="main")
+    frame_width, frame_height = 1000.0, 1000.0
+
+    balls = [
+        BallDetection(
+            bbox=BBox(x1=100.0 + i * 90.0 - 5, y1=45.0, x2=100.0 + i * 90.0 + 5, y2=55.0),
+            conf=0.9,
+            frame_index=i,
+            t=i * 0.1,
+        )
+        for i in range(10)
+    ]
+    manual_polygon = [(0.85, 0.0), (1.0, 0.0), (1.0, 1.0), (0.85, 1.0)]
+    goal_region_cfg = {"regions": {"testslug": [manual_polygon]}}
+
+    monkeypatch.setattr(goals_mod, "possession_runs_for_take", lambda *a, **k: [])
+    monkeypatch.setattr(goals_mod, "detect_possession", lambda *a, **k: [])
+    monkeypatch.setattr(goals_mod, "detect_passes", lambda *a, **k: [])
+
+    events, debug = goals_mod.detect_goals_for_take(
+        reader=_EmptyReader(),
+        video_path="fake.mp4",
+        take=take,
+        take_tracks=[],
+        take_balls=balls,
+        events_cfg=events_cfg,
+        identity_of=None,
+        use_nvdec=False,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        goal_region_cfg=goal_region_cfg,
+        slug="testslug",
+        goal_structure=None,  # Stage C found nothing confident for this take
+        goal_structure_cfg=_goal_structure_cfg(),
+        hardware_cfg={"stages": {"profile": {"fps_sample": 2}}},
+        profile_cfg={"motion": {}},
+    )
+
+    goal_events = [e for e in events if e.type == EventType.GOAL]
+    assert len(goal_events) == 1
+    assert goal_events[0].evidence["goal_region_source"] == "manual"
+    assert debug["goal_region_source"] == "manual"
+
+
 def test_detect_goals_for_take_skips_possession_computation_when_no_goals_of_either_kind(
     monkeypatch,
 ):

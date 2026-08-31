@@ -59,6 +59,7 @@ from src.events.key_moments import classify_candidate_windows, find_candidate_wi
 from src.events.possession import compute_distance_covered
 from src.events.shots import detect_shots
 from src.events.sprints import detect_sprints
+from src.goal.detect import detect_goal_structures_for_video
 from src.highlights.cutting import cut_clips
 from src.highlights.ranking import rank_events
 from src.highlights.reel import build_reel, select_for_export
@@ -295,7 +296,37 @@ def run_pipeline_for_video(
         )
     )
 
-    # --- Stage 4b: goals + assists (ADR-17, cached) --------------------------------------------
+    # --- Stage C: auto-tracked goal structure ("streamed-gathering-treehouse" plan) ------------
+    # VLM-localize + native-res-CV-refine (src/goal/detect.py). Manages its own resumable cache
+    # (work/<slug>/goal/goal_structures.json); an absent GEMINI_API_KEY makes every take's own
+    # attempt an honest, cheap no-op (checked BEFORE any decode -- see that function's own
+    # docstring), so this is safe to call unconditionally, same "cheap and harmless when unused"
+    # discipline as the other optional stages.
+    goal_structure_gemini_key = os.environ.get("GEMINI_API_KEY") or None
+    if not goal_structure_gemini_key:
+        logger.warning(
+            "GEMINI_API_KEY not set for %s -- goal-structure auto-detection (Stage C) skipped; "
+            "goal/assist detection falls back to configs/goal_region.yaml's manual polygon (if "
+            "any) for this video",
+            video_path.name,
+        )
+    tracks_by_take_for_goal_structure: dict[int, list[Track]] = defaultdict(list)
+    for tr in tracks:
+        tracks_by_take_for_goal_structure[tr.take_id].append(tr)
+    goal_structure_report = detect_goal_structures_for_video(
+        video_path,
+        takes,
+        dict(tracks_by_take_for_goal_structure),
+        frame_width,
+        frame_height,
+        configs["goal_structure"],
+        goal_structure_gemini_key,
+        work_root=work_root,
+        use_nvdec=use_nvdec,
+    )
+    goal_structures_by_take = {gs.take_id: gs for gs in goal_structure_report.takes}
+
+    # --- Stage 4b: goals + assists (ADR-17, extended by ADR-20 + Stage D, cached) --------------
     # Real detection now (see src/events/goals.py) -- still correctly reports "not available" on
     # this footage (measured, CLAUDE.md §3.2(3)), just for a specific, auditable reason instead of
     # an unconditional stub. Cached like `events` above: cheap (low-fps decode + corner-crop OCR
@@ -310,6 +341,10 @@ def run_pipeline_for_video(
         # goal_region.yaml file -- editing another video's polygon must not invalidate this one's
         # cache, but editing (or newly adding) this slug's own polygon must.
         "goal_region_polygon": configs["goal_region"].get("regions", {}).get(work_dir.name),
+        # Stage D: Stage C's own detected structures feed the SAME cache key as the manual
+        # polygon above -- a fresh/changed detection must invalidate this cache exactly like a
+        # newly-drawn manual polygon does.
+        "goal_structures": [gs.model_dump(mode="json") for gs in goal_structure_report.takes],
         "n_tracks": len(tracks),
         "n_balls": len(balls),
         "n_takes": len(takes),
@@ -340,6 +375,10 @@ def run_pipeline_for_video(
             frame_height=frame_height,
             goal_region_cfg=configs["goal_region"],
             slug=work_dir.name,
+            goal_structures_by_take=goal_structures_by_take,
+            goal_structure_cfg=configs["goal_structure"],
+            hardware_cfg=configs["hardware"],
+            profile_cfg=configs["profile"],
         )
         save_json(goal_result.model_dump(mode="json"), goals_path)
         goals_cache.write_meta()
@@ -720,6 +759,11 @@ def _load_all_configs() -> dict[str, dict]:
         # is present next to the input, CLAUDE.md §14.1) -- loaded here unconditionally, same
         # "cheap and harmless when unused" reasoning as "identity"/"key_moments" above.
         "annotations": load_yaml("configs/annotations.yaml"),
+        # Stage C ("streamed-gathering-treehouse" plan) -- VLM-localize + native-res-CV-refine
+        # goal-structure detection (src/goal/detect.py). Loaded unconditionally, same "cheap and
+        # harmless when unused" reasoning as the other stage-optional configs above; only actually
+        # exercised when GEMINI_API_KEY is set (src/goal/detect.py's own honest no-op otherwise).
+        "goal_structure": load_yaml("configs/goal_structure.yaml"),
     }
 
 

@@ -48,6 +48,7 @@ from src.events.aggregate import (
 from src.events.goals import detect_goals_for_video
 from src.events.key_moments import classify_candidate_windows, find_candidate_windows
 from src.events.possession import compute_distance_covered
+from src.goal.detect import detect_goal_structures_for_video
 from src.identity.verify import IdentityReport, verify_identities_for_video
 from src.pipeline.annotated_video import render_full_annotated_video
 from src.pipeline.player_output import write_player_output
@@ -235,6 +236,21 @@ def run_extended_pipeline_for_video(
         take.id: build_take_identities(tracks_by_take.get(take.id, []), selection_cfg)[0]
         for take in takes
     }
+    # Stage C ("streamed-gathering-treehouse" plan): auto-tracked goal structure, same
+    # "cheap/no-op without GEMINI_API_KEY" discipline as src/pipeline/run.py's own call -- reuses
+    # the SAME `gemini_api_key` already fetched above for identity verification.
+    goal_structure_report = detect_goal_structures_for_video(
+        video_path,
+        takes,
+        dict(tracks_by_take),
+        frame_width,
+        frame_height,
+        configs["goal_structure"],
+        gemini_api_key,
+        work_root=work_root,
+        use_nvdec=use_nvdec,
+    )
+    goal_structures_by_take = {gs.take_id: gs for gs in goal_structure_report.takes}
     goal_result = detect_goals_for_video(
         video_path,
         takes,
@@ -248,6 +264,10 @@ def run_extended_pipeline_for_video(
         frame_height=frame_height,
         goal_region_cfg=configs["goal_region"],
         slug=work_dir.name,
+        goal_structures_by_take=goal_structures_by_take,
+        goal_structure_cfg=configs["goal_structure"],
+        hardware_cfg=configs["hardware"],
+        profile_cfg=configs["profile"],
     )
     logger.info("goal detection: %s (%.1fs)", goal_result.reason, time.time() - t0)
     goal_assist_by_take: dict[int, list[Event]] = defaultdict(list)
