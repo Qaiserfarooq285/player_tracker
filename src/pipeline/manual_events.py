@@ -378,16 +378,6 @@ def run_manual_events_pipeline_for_video(
     jersey_numbers = sorted(events_by_number.keys())
     for number in jersey_numbers:
         events = events_by_number[number]
-        goal_count = sum(1 for ev in events if ev.type.value == "goal")
-        goal_reason = (
-            None
-            if goal_count > 0
-            else (
-                "not available (no GOAL annotation was present in the manual-annotation sidecar "
-                "for this player -- ADR-19: manual mode never runs the scoreboard/goal-region "
-                "auto-detectors, the client's own sidecar is the sole authoritative event source)"
-            )
-        )
         player_dir = output_dir / "players" / f"player_{number}"
         write_player_output(
             player_dir,
@@ -398,7 +388,11 @@ def run_manual_events_pipeline_for_video(
             takes_by_id=takes_by_id,
             video_path=final_video_path,
             highlights_cfg=configs["highlights"],
-            goal_reason=goal_reason,
+            # Bug fix 2026-08-31: `goal_reason=None` unconditionally in manual mode -- the sidecar
+            # is the sole, authoritative event source (Golden Rule 4), so a player with zero GOAL
+            # annotations genuinely has zero goals, not an "uncertain"/"not available" zero. See
+            # `render_statcard_markdown`'s own docstring for how `None` is now interpreted.
+            goal_reason=None,
             identity_status="Human-provided (manual annotation)",
         )
         logger.info(

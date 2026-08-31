@@ -89,8 +89,14 @@ def test_render_statcard_markdown_uses_exact_template_headers():
     assert "**Passes:** 1" in md
     assert "**Turnovers:** 0" in md  # ADR-20: own line, never fabricated -- genuinely zero
     assert "**Sprints/Runs:** 0" in md  # never fabricated -- genuinely zero, reported as such
-    assert "**Goals:** not available" in md
-    assert "**Assists:** not available" in md
+    # Bug fix 2026-08-31: no `goal_reason` supplied at all (the default, `None`) now means "there
+    # is nothing uncertain about this zero" -- the real count "0" is shown, same as every other
+    # stat, rather than the old unconditional "not available" (see render_statcard_markdown's own
+    # docstring). A genuinely-uncertain auto-mode zero is covered separately below by
+    # test_render_statcard_markdown_not_available_carries_the_specific_reason, which DOES pass a
+    # non-None goal_reason.
+    assert "**Goals:** 0" in md
+    assert "**Assists:** 0" in md
     assert "**Possession Time:** 12.5s" in md
     assert "(uncalibrated)" in md
     assert "## Event Timeline" in md
@@ -189,6 +195,24 @@ def test_render_statcard_markdown_shows_real_goal_and_assist_counts_when_present
     )
     assert "**Goals:** 1" in md
     assert "**Assists:** 1" in md
+    assert "not available" not in md
+
+
+def test_render_statcard_markdown_zero_goals_with_no_reason_shows_real_zero():
+    # Bug fix 2026-08-31 (ADR-19 manual mode): `goal_reason=None` with a zero count means the
+    # event source is authoritative (e.g. the client's own sidecar) and simply recorded no goal --
+    # the honest answer is a real "0", never "not available".
+    md = render_statcard_markdown(
+        jersey_number=2,
+        counts={"touch": 1},
+        possession_seconds=None,
+        distance_result=None,
+        timeline_rows=[],
+        goal_reason=None,
+        identity_status="Human-provided (manual annotation)",
+    )
+    assert "**Goals:** 0" in md
+    assert "**Assists:** 0" in md
     assert "not available" not in md
 
 

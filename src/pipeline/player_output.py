@@ -125,13 +125,23 @@ def render_statcard_markdown(
 ) -> str:
     """The owner's EXACT `statcard.md` template (CLAUDE.md §13.2, revised 2026-08-27), filled with
     real computed values. `Goals`/`Assists` are REAL computed counts (ADR-17) when the scoreboard
-    detector actually found something for this run; otherwise the existing "not available" text,
-    now carrying `goal_reason`'s specific, auditable explanation (Golden Rule 5) instead of a bare
-    unconditional string. `goal_reason` (when unavailable) is `GoalDetectionResult.reason` VERBATIM
-    -- it already reads as a complete "not available (...)" sentence (`src/events/goals.py`), so
-    it is used as-is here rather than re-wrapped in a second "not available (...)" layer. On this
-    project's own footage `goal_reason` measurably explains "not available" every time (§3.2(3):
-    no scoreboard anywhere) -- a data ceiling, not a missing feature.
+    detector actually found something for this run; when the count is genuinely zero,
+    `goal_reason` decides what that zero MEANS: a non-`None` `goal_reason` (auto mode's
+    `GoalDetectionResult.reason` VERBATIM -- always a complete "not available (...)" sentence, see
+    `src/events/goals.py`) means the zero is genuinely UNCERTAIN (no scoreboard/goal-region source
+    ran at all), so the reason text is shown instead of a bare number that would overclaim
+    certainty. `goal_reason=None` (bug fix 2026-08-31 -- the manual-events caller,
+    `src.pipeline.manual_events`) means there is nothing uncertain about the zero: the event source
+    for this run (the client's own sidecar) is authoritative and complete, so a real `0` is shown,
+    exactly like every other stat (Touches/Passes/Sprints/...) already does when its own count is
+    zero. Previously `manual_events.py` forced a "not available" string even when its own event
+    list was authoritative and simply had no GOAL line -- this was backwards (Golden Rule 4: a
+    human directly watching the footage and reporting no goal IS the answer "0", not "unknown").
+
+    `goal_reason` (when it IS supplied and the count is zero) is used as-is here rather than
+    re-wrapped in a second "not available (...)" layer. On this project's own auto-mode footage
+    `goal_reason` measurably explains "not available" every time (§3.2(3): no scoreboard anywhere)
+    -- a data ceiling, not a missing feature.
 
     `identity_status` (ADR-19) is `"Verified"` by default (the existing ADR-15 auto path --
     `TakeIdentityResult.status` only has two literal values, `verified`/`unverified`, and an
@@ -147,15 +157,15 @@ def render_statcard_markdown(
     """
     goals_count = counts.get("goal", 0)
     assists_count = counts.get("assist", 0)
+    # goal_reason is None => the event source for this run is authoritative (bug fix 2026-08-31,
+    # see docstring) => a zero count is the real, honest answer "0", not "not available".
     goals_line = (
-        f"**Goals:** {goals_count}"
-        if goals_count > 0
-        else f"**Goals:** {goal_reason}" if goal_reason else "**Goals:** not available"
+        f"**Goals:** {goals_count}" if goals_count > 0 or goal_reason is None
+        else f"**Goals:** {goal_reason}"
     )
     assists_line = (
-        f"**Assists:** {assists_count}"
-        if assists_count > 0
-        else f"**Assists:** {goal_reason}" if goal_reason else "**Assists:** not available"
+        f"**Assists:** {assists_count}" if assists_count > 0 or goal_reason is None
+        else f"**Assists:** {goal_reason}"
     )
     lines = [
         "# Player Statistics",

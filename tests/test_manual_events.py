@@ -436,5 +436,9 @@ def test_run_manual_events_pipeline_smoke(tmp_path, monkeypatch):
     assert written["possession_seconds"] is None
     assert written["distance_result"] is None
     assert written["identity_status"] == "Human-provided (manual annotation)"
-    assert written["goal_reason"] is not None  # no GOAL annotation -> explicit reason, never blank
-    assert "not available" in written["goal_reason"]
+    # Bug fix 2026-08-31: manual mode's sidecar is the authoritative event source, so a player
+    # with no GOAL annotation has a real "0" goals, not an "uncertain"/"not available" placeholder
+    # -- `goal_reason=None` unconditionally is what tells render_statcard_markdown to show that
+    # real zero (see src/pipeline/player_output.py's own docstring). This is an intentional
+    # behaviour change from the old pinned "not available" assertion.
+    assert written["goal_reason"] is None
