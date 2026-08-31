@@ -617,13 +617,19 @@ def detect_goals_for_take(
 
     region_events: list[Event] = []
     region_attempted = False
+    # ADR-20's own config split (CLAUDE.md §5.1): `configs/goal_region.yaml` (`goal_region_cfg`
+    # here) carries ONLY human-marked polygons (`{regions: {slug: [...]}}`), never thresholds --
+    # `enabled`/`shot_window_s`/`confidence` live in `configs/events.yaml`'s own `goal_region:`
+    # block (`events_cfg["goal_region"]`). The two must be merged before calling
+    # `detect_goals_goal_region`, which expects all of them on one dict.
+    region_behavior_cfg = events_cfg.get("goal_region", {})
     raw_polygons = (goal_region_cfg or {}).get("regions", {}).get(slug) if slug else None
     if (
         goal_region_cfg is not None
         and slug is not None
         and frame_width is not None
         and frame_height is not None
-        and goal_region_cfg.get("enabled", True)
+        and region_behavior_cfg.get("enabled", True)
         and raw_polygons
     ):
         region_attempted = True
@@ -635,7 +641,7 @@ def detect_goals_for_take(
         scaled_polygons = [
             [(x * frame_width, y * frame_height) for x, y in poly] for poly in raw_polygons
         ]
-        scaled_region_cfg = {**goal_region_cfg, "regions": {slug: scaled_polygons}}
+        scaled_region_cfg = {**region_behavior_cfg, "regions": {slug: scaled_polygons}}
         take_shots = detect_shots(take_balls, take.id, frame_width, events_cfg)
         region_events = detect_goals_goal_region(
             take_balls, take_shots, slug, scaled_region_cfg, take.id
