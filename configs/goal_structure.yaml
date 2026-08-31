@@ -19,13 +19,31 @@ vlm:
   # camera motion (motion_score 12.70 px/frame, the highest of all 5 owner clips) smears thin
   # posts under a temporal median. The VLM step exists specifically to supply the rough location
   # classical CV cannot find on its own on this footage.
-  model: "gemini-flash-lite-latest" # MEASURED 2026-08-31: this model successfully localized the
-  # goal on both `clip1 43.mp4` (t=3.0s/7.0s/10.0s tried; 7.0/10.0 succeeded, 3.0s returned NONE
-  # -- a genuinely different camera angle at that timestamp, not a model failure) and, on a
-  # different venue/lighting entirely, `input/video2/chelsea_burnley_target10.mp4` (t=5.0s/10.0s,
-  # both succeeded). Reuse the SAME model-fallback-list pattern already in
-  # `src/identity/jersey_vlm.py`/`configs/identity.yaml: vlm` for quota resilience -- do not
-  # hardcode a single model with no fallback.
+  # ⚠️ FIX (execution session, first real GPU run 2026-08-31): the planning session's own comment
+  # right below already said to "reuse the SAME model-fallback-list pattern... for quota
+  # resilience -- do not hardcode a single model with no fallback", but the key it actually wrote
+  # was the singular `model:` -- `src/common/gemini.py::call_gemini_vision` requires the FULL
+  # plumbing set (`models` as a LIST, `api_url_template`, `timeout_s`, `max_retries`,
+  # `retry_backoff_base_s`, `temperature`, `jpeg_quality`) that every other VLM caller in this repo
+  # already carries. Caught immediately by a real run (`KeyError: 'jpeg_quality'` on the very
+  # first Gemini call for `clip1 43.mp4`), fixed here by copying `configs/identity.yaml: vlm`'s
+  # own already-tested values VERBATIM (not a new calibration -- these are generic HTTP-call
+  # plumbing constants, identical across every Gemini caller in this codebase, not something this
+  # stage measures independently).
+  models:
+    - gemini-flash-lite-latest # MEASURED 2026-08-31: this model successfully localized the goal
+      # on both `clip1 43.mp4` (t=3.0s/7.0s/10.0s tried; 7.0/10.0 succeeded, 3.0s returned NONE --
+      # a genuinely different camera angle at that timestamp, not a model failure) and, on a
+      # different venue/lighting entirely, `input/video2/chelsea_burnley_target10.mp4`
+      # (t=5.0s/10.0s, both succeeded).
+    - gemini-3.1-flash-lite # same ordered fallback list as configs/identity.yaml: vlm.models,
+    - gemini-3.6-flash # for the same measured daily-quota-exhaustion reason (ADR-15).
+  api_url_template: "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+  timeout_s: 30
+  max_retries: 3
+  retry_backoff_base_s: 2.0
+  temperature: 0.0
+  jpeg_quality: 90
   prompt: >
     This is a frame from a soccer match. Locate the SOCCER GOAL structure (the white goalposts,
     crossbar and net forming the goal mouth). Do NOT return the goalkeeper or any player.
