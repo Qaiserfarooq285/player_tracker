@@ -429,27 +429,13 @@ def _region_ball(t: float, cx: float, cy: float = 0.5) -> BallDetection:
     )
 
 
-def _shot_event(t_end: float) -> Event:
-    return Event(
-        id=f"shot-{t_end}",
-        type=EventType.SHOT,
-        t_start=t_end - 0.5,
-        t_end=t_end,
-        player_track_id=None,
-        take_id=0,
-        confidence=0.2,
-        source="ball_speed_direction_heuristic",
-        evidence={},
-    )
-
-
 SQUARE_POLYGON = [(0.8, 0.0), (1.0, 0.0), (1.0, 1.0), (0.8, 1.0)]  # right-edge 20% of frame
 
 
 def test_detect_goals_goal_region_no_polygon_configured_returns_empty():
     cfg = _goal_region_cfg(regions={})
     balls = [_region_ball(1.0, cx=950.0)]
-    events = detect_goals_goal_region(balls, [_shot_event(0.9)], "someslug", cfg, take_id=0)
+    events = detect_goals_goal_region(balls, [(0.0, 0.9)], "someslug", cfg, take_id=0)
     assert events == []
 
 
@@ -458,8 +444,9 @@ def test_detect_goals_goal_region_crossing_inside_shot_window_fires_one_goal():
     # ball centroid at cx=950 on an implicit 1000-wide frame (cx/cy passed as already-scaled
     # coordinates, matching how detect_goals_for_take feeds it -- polygon fractions * frame_width)
     balls = [_region_ball(t=1.0, cx=0.95 * 1.0)]  # cx as a FRACTION here (polygon test is unitless)
-    shots = [_shot_event(t_end=0.5)]  # ended 0.5s before the crossing, inside shot_window_s=3.0
-    events = detect_goals_goal_region(balls, shots, "someslug", cfg, take_id=7)
+    # a raw fast-ball-motion window ending 0.5s before the crossing, inside shot_window_s=3.0
+    fast_ball_windows = [(0.0, 0.5)]
+    events = detect_goals_goal_region(balls, fast_ball_windows, "someslug", cfg, take_id=7)
     assert len(events) == 1
     ev = events[0]
     assert ev.type == EventType.GOAL
@@ -471,10 +458,11 @@ def test_detect_goals_goal_region_crossing_inside_shot_window_fires_one_goal():
     assert ev.evidence["slug"] == "someslug"
 
 
-def test_detect_goals_goal_region_crossing_without_preceding_shot_does_not_fire():
+def test_detect_goals_goal_region_crossing_without_preceding_fast_window_does_not_fire():
     cfg = _goal_region_cfg(regions={"someslug": [SQUARE_POLYGON]})
     balls = [_region_ball(t=10.0, cx=0.95)]
-    # no shots at all -- ball merely sitting/rolling in the region is not a goal on its own
+    # no fast-ball-motion windows at all -- ball merely sitting/rolling in the region is not a
+    # goal on its own
     events = detect_goals_goal_region(balls, [], "someslug", cfg, take_id=0)
     assert events == []
 
@@ -482,24 +470,24 @@ def test_detect_goals_goal_region_crossing_without_preceding_shot_does_not_fire(
 def test_detect_goals_goal_region_crossing_outside_shot_window_does_not_fire():
     cfg = _goal_region_cfg(regions={"someslug": [SQUARE_POLYGON]})
     balls = [_region_ball(t=10.0, cx=0.95)]
-    shots = [_shot_event(t_end=1.0)]  # 9s before the crossing -- far outside shot_window_s=3.0
-    events = detect_goals_goal_region(balls, shots, "someslug", cfg, take_id=0)
+    fast_ball_windows = [(0.5, 1.0)]  # ended 9s before the crossing -- far outside shot_window_s=3.0
+    events = detect_goals_goal_region(balls, fast_ball_windows, "someslug", cfg, take_id=0)
     assert events == []
 
 
 def test_detect_goals_goal_region_ball_outside_polygon_does_not_fire():
     cfg = _goal_region_cfg(regions={"someslug": [SQUARE_POLYGON]})
     balls = [_region_ball(t=1.0, cx=0.1)]  # far from the polygon (right 20% of frame)
-    shots = [_shot_event(t_end=0.5)]
-    events = detect_goals_goal_region(balls, shots, "someslug", cfg, take_id=0)
+    fast_ball_windows = [(0.0, 0.5)]
+    events = detect_goals_goal_region(balls, fast_ball_windows, "someslug", cfg, take_id=0)
     assert events == []
 
 
 def test_detect_goals_goal_region_debounces_one_continuous_crossing():
     cfg = _goal_region_cfg(regions={"someslug": [SQUARE_POLYGON]})
-    shots = [_shot_event(t_end=0.5)]
+    fast_ball_windows = [(0.0, 0.5)]
     balls = [_region_ball(t, cx=0.95) for t in (1.0, 1.2, 1.4, 1.6)]  # one continuous crossing
-    events = detect_goals_goal_region(balls, shots, "someslug", cfg, take_id=0)
+    events = detect_goals_goal_region(balls, fast_ball_windows, "someslug", cfg, take_id=0)
     assert len(events) == 1
 
 

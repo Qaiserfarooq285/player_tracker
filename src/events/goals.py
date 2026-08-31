@@ -57,7 +57,8 @@ from src.common.logging import get_logger
 from src.common.types import BallDetection, Event, EventType, Take, Track
 from src.common.video import decode_frames
 from src.events.possession import detect_passes, detect_possession, possession_runs_for_take
-from src.events.shots import detect_shots
+from src.events.segments import find_threshold_segments
+from src.events.shots import ball_speed_series
 from src.identity.jersey_ocr import free_easyocr_reader, load_easyocr_reader
 
 logger = get_logger(__name__)
@@ -484,7 +485,7 @@ def _point_in_polygon(x: float, y: float, polygon: list[tuple[float, float]]) ->
 
 def detect_goals_goal_region(
     balls: list[BallDetection],
-    shots: list[Event],
+    fast_ball_windows: list[tuple[float, float]],
     slug: str,
     region_cfg: dict,
     take_id: int | None,
@@ -502,10 +503,20 @@ def detect_goals_goal_region(
     never a guessed default region).
 
     A ball sample counts as a goal candidate only when its centroid falls inside ANY of the
-    slug's own polygons AND a `SHOT` event (`shots`, this take's own `detect_shots` output) ended
-    within `region_cfg['shot_window_s']` seconds before it -- the shot-window gate is what
-    distinguishes an actual strike finding the net from the ball merely sitting/rolling through
-    the marked area (a goal kick, a keeper's distribution, a corner taken from behind the line).
+    slug's own polygons AND `fast_ball_windows` (this take's own RAW sustained fast-ball-motion
+    segments -- `find_threshold_segments` over `ball_speed_series`, computed BEFORE
+    `detect_shots`'s own `direction_consistency_ratio` filtering) has a window that ENDED within
+    `region_cfg['shot_window_s']` seconds before it. This is deliberately NOT gated on a
+    fully-formed `SHOT` `Event`: `detect_shots`'s direction-consistency filter is calibrated for a
+    different, stricter purpose (a countable Shots stat/highlight category) and this project's own
+    measured data shows it can reject nearly an entire take's ball motion as "not consistent
+    enough" (`configs/events.yaml: shot.direction_consistency_ratio`, CLAUDE.md's own note on
+    `clip2`) -- which would silently starve this precondition of any qualifying window regardless
+    of where the polygon is placed. The raw fast-motion segment is a more permissive plausibility
+    gate: "was the ball moving fast right before this crossing" (a goal kick, a keeper's
+    distribution, or a corner taken from behind the line rolling slowly through the marked area
+    would NOT clear this), without also requiring the ball's own direction to have stayed
+    consistent throughout — a struck ball can still curve or deflect on its way into the net.
     Consecutive qualifying samples from the SAME continuous crossing are debounced into one event
     (`shot_window_s` is reused as the debounce gap too -- a real goal is one instant, not one event
     per ~0.03s ball sample crossing the line).
@@ -515,7 +526,7 @@ def detect_goals_goal_region(
         return []
 
     window = region_cfg["shot_window_s"]
-    shot_ends = sorted(s.t_end for s in shots)
+    fast_window_ends = sorted(end for _start, end in fast_ball_windows)
 
     events: list[Event] = []
     debounce_until = float("-inf")
@@ -525,16 +536,18 @@ def detect_goals_goal_region(
         inside = any(_point_in_polygon(ball.bbox.cx, ball.bbox.cy, poly) for poly in polygons)
         if not inside:
             continue
-        preceding_shot_ends = [t for t in shot_ends if t <= ball.t and (ball.t - t) <= window]
-        if not preceding_shot_ends:
+        preceding_fast_window_ends = [
+            t for t in fast_window_ends if t <= ball.t and (ball.t - t) <= window
+        ]
+        if not preceding_fast_window_ends:
             continue
 
-        shot_t_end = max(preceding_shot_ends)
+        fast_window_t_end = max(preceding_fast_window_ends)
         events.append(
             Event(
                 id=str(uuid.uuid4()),
                 type=EventType.GOAL,
-                t_start=shot_t_end,
+                t_start=fast_window_t_end,
                 t_end=ball.t,
                 player_track_id=None,
                 take_id=take_id,
@@ -544,7 +557,7 @@ def detect_goals_goal_region(
                     "ball_t": ball.t,
                     "ball_cx": ball.bbox.cx,
                     "ball_cy": ball.bbox.cy,
-                    "shot_t_end": shot_t_end,
+                    "fast_ball_window_t_end": fast_window_t_end,
                     "shot_window_s": window,
                     "goal_region_source": "manual",
                     "slug": slug,
@@ -584,12 +597,18 @@ def detect_goals_for_take(
 
     ADR-20 adds a SECOND, independent occurrence source alongside the scoreboard scan: when
     `goal_region_cfg`/`slug`/`frame_width` are given and a polygon exists for `slug`
-    (`detect_goals_goal_region`), this take's own `SHOT` events are computed (lazily, only then --
-    `frame_width` being `None` skips this path entirely, same "don't pay for what isn't
-    configured" discipline as the scoreboard branch above) and checked for a ball-crossing goal.
-    Region-sourced `GOAL`s never go through team/scorer/assist attribution (they carry no
-    possession-run context of their own to attribute from) -- they are appended to the result
-    as-is, occurrence-only, exactly per ADR-20's own scope.
+    (`detect_goals_goal_region`), this take's own RAW sustained fast-ball-motion segments are
+    computed (lazily, only then -- `frame_width` being `None` skips this path entirely, same
+    "don't pay for what isn't configured" discipline as the scoreboard branch above) via the exact
+    same `ball_speed_series` + `find_threshold_segments` primitives `detect_shots` itself uses,
+    BEFORE `detect_shots`'s own stricter `direction_consistency_ratio` filtering (see
+    `detect_goals_goal_region`'s own docstring for why: that filter is calibrated for a different,
+    countable-stat purpose and this project's own measured data shows it can reject nearly a whole
+    take's ball motion, which would silently starve the goal-region precondition regardless of
+    polygon placement) -- and checked for a ball-crossing goal. Region-sourced `GOAL`s still never
+    go through team/scorer/assist attribution here (they carry no possession-run context of their
+    own to attribute from) -- they are appended to the result as-is, occurrence-only, exactly per
+    ADR-20's own scope.
 
     `identity_of` is the SAME `build_take_identities` partition the caller's own event pipeline
     uses for this take (`None` for the original Phase-1 flow, which has no identity-stitching
@@ -642,9 +661,22 @@ def detect_goals_for_take(
             [(x * frame_width, y * frame_height) for x, y in poly] for poly in raw_polygons
         ]
         scaled_region_cfg = {**region_behavior_cfg, "regions": {slug: scaled_polygons}}
-        take_shots = detect_shots(take_balls, take.id, frame_width, events_cfg)
+        shot_cfg = events_cfg["shot"]
+        times, speeds, _dxs = ball_speed_series(
+            take_balls,
+            frame_width,
+            shot_cfg["smoothing_window_frames"],
+            shot_cfg["min_ball_conf"],
+        )
+        fast_ball_windows = find_threshold_segments(
+            times,
+            speeds,
+            shot_cfg["ball_speed_threshold"],
+            shot_cfg["min_duration_s"],
+            shot_cfg["merge_gap_s"],
+        )
         region_events = detect_goals_goal_region(
-            take_balls, take_shots, slug, scaled_region_cfg, take.id
+            take_balls, fast_ball_windows, slug, scaled_region_cfg, take.id
         )
     debug["goal_region_attempted"] = region_attempted
     debug["goal_region_events_found"] = len(region_events)
