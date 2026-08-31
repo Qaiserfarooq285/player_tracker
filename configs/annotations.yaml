@@ -20,6 +20,25 @@ time_pattern: '(?:\d{1,2}:)?\d{1,2}:\d{2}' # MM:SS or H:MM:SS/HH:MM:SS, converte
 # seconds-from-video-start offset (src/annotations/parse.py::_parse_time). Deliberately permissive
 # on hour-digit count (1 or 2) since a client is very unlikely to annotate a 100+ hour clip.
 
+# Grammar extension 2026-08-31 (CLAUDE.md §14.3): real client phrasing (input/video1/instruction)
+# uses an em-dash between the time and the rest of the line ("Min 0:15 — Player ...") instead of a
+# plain space. A plain space is always accepted regardless of this list (src/annotations/
+# parse.py::_strip_separator lstrips first); this is only the extra literal separators beyond
+# that. Checked longest-first by the parser itself, not by this list's own ordering.
+line_separators:
+  - "—" # em-dash
+  - "-" # plain hyphen (kept distinct from "—" since some editors/clients use ASCII "-" instead)
+  - ":" # colon, e.g. a hypothetical "Min 0:15: Player ..."
+
+unspecified_colour: "unspecified" # CLAUDE.md §14.3 grammar extension 2026-08-31: the colour
+# clause ("in <colour>") is OPTIONAL -- a real client line can name no colour at all
+# ("Player #11 scores goal", input/video1/instruction). `Annotation.team_colour` is a required
+# `str` field (src/common/types.py), so this sentinel records "no colour was given" without
+# fabricating one. Deliberately NOT a key in `colour_reference_lab` below, so Stage 4's
+# `nearest_track_by_colour` (src/annotations/associate.py) can never spuriously resolve it to a
+# real reference colour -- it correctly falls through to `(None, None)`, the same honest
+# "no confident colour match" result as any other unknown colour word (Golden Rule 5).
+
 # Ordered phrase -> EventType map (CLAUDE.md §14.3's "starter map"), checked TOP TO BOTTOM against
 # the lower-cased action-phrase text via substring containment — order matters where one phrase is
 # a substring of another's plausible phrasing (e.g. "out of bounds" must be checked as its own
@@ -89,6 +108,10 @@ colour_reference_lab:
   cyan: [91.11, -48.09, -14.13]
   purple: [29.78, 58.93, -36.49]
   pink: [60.32, 98.23, -60.83]
+  light blue: [83.92, -11.0, -11.0] # added 2026-08-31 for real client phrasing (§3.5/video1)
+  # that names two-word colours; same "canonical sRGB -> OpenCV CIELAB" derivation as every other
+  # entry in this table (sRGB ~(173,216,230), a standard "light blue"/powder-blue reference).
+  dark green: [36.08, -43.0, 42.0] # same derivation, sRGB ~(0,100,0), a standard "dark green".
 
 colour_match_max_distance: 40.0 # ⚠️ REASONED-BUT-UNMEASURED: a candidate track's own measured
 # torso Lab must sit within this CIELAB Euclidean distance of the named colour's reference above

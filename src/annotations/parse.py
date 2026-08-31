@@ -6,16 +6,36 @@ malformed line and never silently drops one either -- anything that looks like c
 match the grammar is returned in `problems` (CLAUDE.md §10 "log everything dropped. Silent
 filtering = hidden bugs.").
 
-Grammar (one event per line): ``[<time_prefix>]<TIME> player #<N> in <COLOUR> <ACTION PHRASE>``
+Grammar (one event per line): ``[<time_prefix>]<TIME>[<separator>][player ][<colour clause>]
+#<N>[<colour clause>] <ACTION PHRASE>`` where ``<colour clause>`` is ``in <COLOUR>`` and may
+appear either immediately before or immediately after ``#<N>`` (or not at all).
 - ``TIME`` = ``MM:SS`` or ``H:MM:SS``/``HH:MM:SS`` (`configs/annotations.yaml: time_pattern`),
   converted to a float seconds-from-video-start offset.
-- ``#<N>`` = the target's jersey number (integer), exactly as the client wrote it.
-- ``COLOUR`` = a single free word -- this parser records it verbatim; a LATER stage (Stage 4's
-  manual-mode wiring) is the one that matches it against an ADR-12 team-colour cluster (Golden
-  Rule 5: this module only records what was written, never resolves it against tracking data).
-- ``ACTION PHRASE`` = free text, mapped to an `EventType` via `configs/annotations.yaml:
+- an optional literal separator between the time and the rest of the content
+  (`configs/annotations.yaml: line_separators`, e.g. an em-dash) beyond a plain space.
+- the literal word "player" (any case) is optional -- structural grammar, not client-tunable data,
+  same treatment as the literal "#"/"in" connectors below.
+- ``#<N>`` = the target's jersey number (integer), exactly as the client wrote it. REQUIRED --
+  a line with no jersey token is not parseable and lands in `problems`.
+- ``COLOUR`` = one entry from the known-colour vocabulary (`configs/annotations.yaml:
+  colour_reference_lab` keys -- reused as-is rather than duplicated in a second list, CLAUDE.md
+  §10), one OR two words (e.g. "white", "light blue"), matched longest-first so "light blue" is
+  never shadowed by a bare "blue". Optional -- a line naming no colour still parses ("Player #11
+  scores goal"). This parser only records the word verbatim; a LATER stage (Stage 4's manual-mode
+  wiring) is the one that matches it against an ADR-12 team-colour cluster (Golden Rule 5: this
+  module only records what was written, never resolves it against tracking data).
+- ``ACTION PHRASE`` = whatever free text remains after the time/separator/player-word/jersey/
+  colour tokens above are removed, mapped to an `EventType` via `configs/annotations.yaml:
   phrase_map` (first matching entry wins, case-insensitive substring match) or
   `unmapped_event_type` when no entry matches.
+
+Token-extraction approach (CLAUDE.md §14.3, extended 2026-08-31 for real client phrasing that
+doesn't fit one fixed-order regex -- see `input/video1/instruction`: an em-dash separator, a
+colour clause that can appear either before OR after the jersey number within the SAME file, an
+optional "Player" word, and multi-word colours): find and strip the time, then find and strip the
+jersey token and the colour clause independently of each other's position, then whatever remains
+is the action phrase. This is deliberately NOT a single anchored regex -- a fixed field order
+cannot express "colour before OR after jersey number, both occurring in the same sidecar".
 
 No new dependency (ADR-19): stdlib `re` only.
 """
@@ -29,6 +49,9 @@ from pathlib import Path
 from src.common.types import Annotation, Event, EventType
 
 _URL_PREFIXES = ("http://", "https://")
+
+_PLAYER_WORD_RE = re.compile(r"^\s*player\b\s*", re.IGNORECASE)
+_JERSEY_RE = re.compile(r"#\s*(\d+)")
 
 
 def _strip_time_prefix(line: str, time_prefixes: list[str]) -> str:
@@ -51,17 +74,62 @@ def _parse_time(time_str: str) -> float:
     return float(hours * 3600 + minutes * 60 + seconds)
 
 
-def _line_regex(cfg: dict) -> re.Pattern[str]:
-    """Build the whole-line grammar regex around `configs/annotations.yaml: time_pattern` -- the
-    time sub-pattern is config-owned (CLAUDE.md §10: no magic numbers/patterns in code) while the
-    surrounding ``player #<N> in <colour> <phrase>`` structure is the parser's own fixed grammar
-    (CLAUDE.md §14.3), not something a client would ever need to retune."""
-    time_pattern = cfg["time_pattern"]
-    return re.compile(
-        rf"^(?P<time>{time_pattern})\s+player\s+#(?P<jersey>\d+)\s+in\s+(?P<colour>\S+)\s+"
-        rf"(?P<phrase>.+)$",
-        re.IGNORECASE,
-    )
+def _time_regex(cfg: dict) -> re.Pattern[str]:
+    """Anchor just the TIME token at the head of the (prefix-stripped) line -- everything after it
+    is handled by the token-extraction helpers below, since jersey/colour ordering varies (see
+    module docstring)."""
+    return re.compile(rf"^(?P<time>{cfg['time_pattern']})(?P<rest>.*)$", re.IGNORECASE | re.DOTALL)
+
+
+def _strip_separator(rest: str, separators: list[str]) -> str:
+    """Strip one optional literal separator (`configs/annotations.yaml: line_separators`, e.g. an
+    em-dash) between the TIME token and the rest of the content, beyond the plain space that is
+    always implicitly accepted. Checked longest-first so a longer separator can never be shadowed
+    by a shorter one that happens to be its own prefix."""
+    stripped = rest.lstrip()
+    for sep in sorted(separators, key=len, reverse=True):
+        if stripped.startswith(sep):
+            return stripped[len(sep) :].lstrip()
+    return stripped
+
+
+def _colour_pattern(colour_words: list[str]) -> re.Pattern[str] | None:
+    """One alternation over the known colour vocabulary, longest phrase first (so "light blue"
+    wins over a bare "blue"), each optionally preceded by the connector "in " -- both the "in" and
+    the colour phrase itself are held to whole-word boundaries (`\\b`) so e.g. "win" never matches
+    the connector and "blues" never matches the colour "blue". `None` when the vocabulary is
+    empty (defensive; `colour_reference_lab` is never actually empty in practice)."""
+    if not colour_words:
+        return None
+    alternatives = sorted((re.escape(c) for c in colour_words), key=len, reverse=True)
+    return re.compile(r"\b(?:in\s+)?(" + "|".join(alternatives) + r")\b", re.IGNORECASE)
+
+
+def _extract_colour(text: str, colour_words: list[str]) -> tuple[str | None, str]:
+    """Find a known colour word/phrase anywhere in `text` -- independent of whether it sits before
+    or after the jersey token (CLAUDE.md §14.3's grammar note) -- and return
+    ``(colour_lowercased, text_with_the_clause_removed)``. ``(None, text)`` unchanged when no known
+    colour word appears."""
+    pattern = _colour_pattern(colour_words)
+    if pattern is None:
+        return None, text
+    match = pattern.search(text)
+    if match is None:
+        return None, text
+    colour = match.group(1).lower()
+    remaining = text[: match.start()] + text[match.end() :]
+    return colour, remaining
+
+
+def _extract_jersey(text: str) -> tuple[int | None, str]:
+    """Find ``#<N>`` anywhere in `text` and return ``(jersey_number, text_with_token_removed)``.
+    ``(None, text)`` unchanged when no jersey token appears at all -- the caller treats that as a
+    malformed line (a jersey number is the one truly required piece of this grammar)."""
+    match = _JERSEY_RE.search(text)
+    if match is None:
+        return None, text
+    remaining = text[: match.start()] + text[match.end() :]
+    return int(match.group(1)), remaining
 
 
 def _event_type_for_phrase(phrase: str, cfg: dict) -> EventType:
@@ -88,8 +156,10 @@ def parse_annotations(path: str | Path, cfg: dict) -> tuple[list[Annotation], li
     line and it is not "malformed", it is intentionally-ignored context.
     """
     text = Path(path).read_text(encoding="utf-8")
-    pattern = _line_regex(cfg)
+    time_pattern = _time_regex(cfg)
     time_prefixes = cfg["time_prefixes"]
+    separators = cfg["line_separators"]
+    colour_words = list(cfg["colour_reference_lab"].keys())
 
     annotations: list[Annotation] = []
     problems: list[str] = []
@@ -100,17 +170,33 @@ def parse_annotations(path: str | Path, cfg: dict) -> tuple[list[Annotation], li
             continue
 
         candidate = _strip_time_prefix(line, time_prefixes)
-        match = pattern.match(candidate)
-        if match is None:
+        time_match = time_pattern.match(candidate)
+        if time_match is None:
             problems.append(f"line {lineno}: {raw_line}")
             continue
 
-        phrase = match.group("phrase").strip()
+        content = _strip_separator(time_match.group("rest"), separators)
+        content = _PLAYER_WORD_RE.sub("", content, count=1)
+        colour, content = _extract_colour(content, colour_words)
+        if colour is None:
+            # Grammar note (CLAUDE.md §14.3): the colour clause is optional -- a line naming no
+            # colour at all ("Player #11 scores goal", input/video1/instruction) still parses.
+            # `Annotation.team_colour` is a required `str`, so a config-owned sentinel (never a
+            # real colour word, so it can never spuriously match a `colour_reference_lab` entry
+            # downstream) records "no colour was given" rather than fabricating one.
+            colour = cfg["unspecified_colour"]
+        jersey, content = _extract_jersey(content)
+        if jersey is None:
+            # The one truly required token (a jersey number) never appeared -- not parseable.
+            problems.append(f"line {lineno}: {raw_line}")
+            continue
+
+        phrase = re.sub(r"\s+", " ", content).strip()
         annotations.append(
             Annotation(
-                t=_parse_time(match.group("time")),
-                jersey_number=int(match.group("jersey")),
-                team_colour=match.group("colour").lower(),
+                t=_parse_time(time_match.group("time")),
+                jersey_number=jersey,
+                team_colour=colour,
                 action_phrase=phrase,
                 event_type=_event_type_for_phrase(phrase, cfg),
                 raw_line=raw_line,
