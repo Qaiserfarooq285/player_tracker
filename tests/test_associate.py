@@ -16,13 +16,16 @@ import src.annotations.associate as associate_mod
 from src.annotations.associate import (
     associate_annotation_to_track,
     candidate_tracks_near_time,
+    expanded_bbox_region,
     nearest_track_by_arrow_hint,
     nearest_track_by_colour,
     opencv_lab_to_cielab,
+    read_jersey_number_for_candidates,
 )
 from src.common.io import load_yaml
 from src.common.types import Annotation, BBox, EventType, Take, Track, TrackBox
 from src.detect.overlay_mask import ArrowHint
+from src.identity.jersey_ocr import OcrRead
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -368,3 +371,302 @@ def test_associate_annotation_to_track_converts_units_before_colour_match_real_p
     assert track_id == 42
     assert distance is not None and distance < cfg["colour_match_max_distance"]
     assert evidence["agreement"] == "colour_only"
+
+
+# ---------------------------------------------------------------------------
+# expanded_bbox_region (pure geometry)
+# ---------------------------------------------------------------------------
+
+
+def test_expanded_bbox_region_grows_by_fraction_on_each_side():
+    bbox = BBox(x1=100.0, y1=100.0, x2=200.0, y2=300.0)  # width=100, height=200
+    region = expanded_bbox_region(bbox, expand_frac=0.1)
+    assert region.x1 == 90.0  # 100 - 0.1*100
+    assert region.x2 == 210.0  # 200 + 0.1*100
+    assert region.y1 == 80.0  # 100 - 0.1*200
+    assert region.y2 == 320.0  # 300 + 0.1*200
+
+
+def test_expanded_bbox_region_zero_fraction_is_a_no_op():
+    bbox = BBox(x1=10.0, y1=20.0, x2=30.0, y2=90.0)
+    region = expanded_bbox_region(bbox, expand_frac=0.0)
+    assert (region.x1, region.y1, region.x2, region.y2) == (10.0, 20.0, 30.0, 90.0)
+
+
+# ---------------------------------------------------------------------------
+# read_jersey_number_for_candidates (Stage B, "streamed-gathering-treehouse" plan) -- mocked
+# OCR/VLM and `decode_frames`, no GPU/live network. Two non-overlapping candidate boxes are
+# stamped with distinct marker pixel values in a synthetic frame (`expand_frac=0.0` so the crop
+# geometry is exact); a fake `read_jersey_digits`/`classify_jersey_number` reads the marker back
+# out of `crop[0, 0, 0]` to decide which "digits" that candidate produces -- deterministic, no
+# real OCR/VLM model involved.
+# ---------------------------------------------------------------------------
+
+
+def _jersey_reid_identity_cfg() -> dict:
+    return {
+        "crop": {"torso_crop_expand": 0.0, "min_crop_height_frac": 0.05},
+        "ocr": {},
+        "vlm": {},
+    }
+
+
+def _jersey_reid_cfg(max_vlm: int = 2) -> dict:
+    return {"enabled": True, "max_vlm_escalations_per_call": max_vlm}
+
+
+def _marker_frame(height: int = 100, width: int = 300) -> np.ndarray:
+    return np.zeros((height, width, 3), dtype=np.uint8)
+
+
+def _stamp_box(frame: np.ndarray, box: BBox, marker: int) -> None:
+    x1, y1, x2, y2 = int(box.x1), int(box.y1), int(box.x2), int(box.y2)
+    frame[y1:y2, x1:x2, 0] = marker
+
+
+def _candidate(track_id: int, t: float, box: BBox) -> Track:
+    return Track(id=track_id, take_id=0, boxes=[TrackBox(frame_index=0, t=t, bbox=box, conf=0.9)])
+
+
+def _take_for_reid() -> Take:
+    return Take(id=0, t_start=0.0, t_end=10.0, frame_start=0, frame_end=100, kind="main")
+
+
+_SAMPLING_CFG = {"match_tolerance_s": 0.5, "window_s": 1.0, "fps_sample": 5}
+_DECODE_CFG: dict = {}
+
+
+def _fake_ocr_by_marker(marker_to_digits: dict[int, str | None]):
+    def _fake(reader, crop, ocr_cfg):
+        marker = int(crop[0, 0, 0])
+        digits = marker_to_digits.get(marker)
+        return OcrRead(
+            digits=digits, confidence=0.9 if digits else 0.0, is_confident=digits is not None
+        )
+
+    return _fake
+
+
+def test_read_jersey_number_for_candidates_no_candidates_short_circuits(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("decode_frames must not be called with zero candidates")
+
+    monkeypatch.setattr(associate_mod, "decode_frames", _boom)
+    track_id, source, evidence = read_jersey_number_for_candidates(
+        "fake.mp4",
+        _take_for_reid(),
+        [],
+        t=5.0,
+        claimed_jersey_number=7,
+        identity_cfg=_jersey_reid_identity_cfg(),
+        jersey_reid_cfg=_jersey_reid_cfg(),
+        decode_cfg=_DECODE_CFG,
+        sampling_cfg=_SAMPLING_CFG,
+        reader=None,
+        gemini_api_key=None,
+    )
+    assert (track_id, source) == (None, None)
+    assert evidence["outcome"] == "no_candidates"
+
+
+def test_read_jersey_number_for_candidates_matches_single_confident_ocr(monkeypatch):
+    box_a = BBox(x1=10, y1=10, x2=40, y2=70)  # height 60
+    box_b = BBox(x1=100, y1=10, x2=130, y2=70)
+    frame = _marker_frame()
+    _stamp_box(frame, box_a, marker=1)  # will read "7"
+    _stamp_box(frame, box_b, marker=2)  # will read "3"
+    monkeypatch.setattr(associate_mod, "decode_frames", lambda *a, **k: iter([(0, 5.0, frame)]))
+    monkeypatch.setattr(associate_mod, "read_jersey_digits", _fake_ocr_by_marker({1: "7", 2: "3"}))
+
+    track_a = _candidate(1, 5.0, box_a)
+    track_b = _candidate(2, 5.0, box_b)
+    track_id, source, evidence = read_jersey_number_for_candidates(
+        "fake.mp4",
+        _take_for_reid(),
+        [track_a, track_b],
+        t=5.0,
+        claimed_jersey_number=7,
+        identity_cfg=_jersey_reid_identity_cfg(),
+        jersey_reid_cfg=_jersey_reid_cfg(),
+        decode_cfg=_DECODE_CFG,
+        sampling_cfg=_SAMPLING_CFG,
+        reader=object(),
+        gemini_api_key=None,
+    )
+    assert (track_id, source) == (1, "ocr")
+    assert evidence["outcome"] == "matched"
+    assert evidence["n_ocr_confident"] == 2
+    assert evidence["n_vlm_calls"] == 0
+
+
+def test_read_jersey_number_for_candidates_no_match_stays_honest(monkeypatch):
+    box_a = BBox(x1=10, y1=10, x2=40, y2=70)
+    box_b = BBox(x1=100, y1=10, x2=130, y2=70)
+    frame = _marker_frame()
+    _stamp_box(frame, box_a, marker=1)
+    _stamp_box(frame, box_b, marker=2)
+    monkeypatch.setattr(associate_mod, "decode_frames", lambda *a, **k: iter([(0, 5.0, frame)]))
+    monkeypatch.setattr(associate_mod, "read_jersey_digits", _fake_ocr_by_marker({1: "3", 2: "4"}))
+
+    track_a = _candidate(1, 5.0, box_a)
+    track_b = _candidate(2, 5.0, box_b)
+    track_id, source, evidence = read_jersey_number_for_candidates(
+        "fake.mp4",
+        _take_for_reid(),
+        [track_a, track_b],
+        t=5.0,
+        claimed_jersey_number=7,
+        identity_cfg=_jersey_reid_identity_cfg(),
+        jersey_reid_cfg=_jersey_reid_cfg(),
+        decode_cfg=_DECODE_CFG,
+        sampling_cfg=_SAMPLING_CFG,
+        reader=object(),
+        gemini_api_key=None,
+    )
+    assert (track_id, source) == (None, None)
+    assert evidence["outcome"] == "no_match"
+
+
+def test_read_jersey_number_for_candidates_ambiguous_when_two_candidates_match(monkeypatch):
+    box_a = BBox(x1=10, y1=10, x2=40, y2=70)
+    box_b = BBox(x1=100, y1=10, x2=130, y2=70)
+    frame = _marker_frame()
+    _stamp_box(frame, box_a, marker=1)
+    _stamp_box(frame, box_b, marker=2)
+    monkeypatch.setattr(associate_mod, "decode_frames", lambda *a, **k: iter([(0, 5.0, frame)]))
+    monkeypatch.setattr(associate_mod, "read_jersey_digits", _fake_ocr_by_marker({1: "7", 2: "7"}))
+
+    track_a = _candidate(1, 5.0, box_a)
+    track_b = _candidate(2, 5.0, box_b)
+    track_id, source, evidence = read_jersey_number_for_candidates(
+        "fake.mp4",
+        _take_for_reid(),
+        [track_a, track_b],
+        t=5.0,
+        claimed_jersey_number=7,
+        identity_cfg=_jersey_reid_identity_cfg(),
+        jersey_reid_cfg=_jersey_reid_cfg(),
+        decode_cfg=_DECODE_CFG,
+        sampling_cfg=_SAMPLING_CFG,
+        reader=object(),
+        gemini_api_key=None,
+    )
+    assert (track_id, source) == (None, None)
+    assert evidence["outcome"] == "ambiguous_multiple_candidates_matched"
+    assert evidence["ambiguous_track_ids"] == [1, 2]
+
+
+def test_read_jersey_number_for_candidates_too_small_crop_is_skipped(monkeypatch):
+    # height 60*0.05 gate would need frame_height*0.05 <= box height; make the box itself tiny.
+    box_a = BBox(x1=10, y1=10, x2=15, y2=12)  # height=2, far below any real gate
+    frame = _marker_frame()
+    monkeypatch.setattr(associate_mod, "decode_frames", lambda *a, **k: iter([(0, 5.0, frame)]))
+
+    def _boom(*a, **k):
+        raise AssertionError("OCR must never be called on a crop that fails the size gate")
+
+    monkeypatch.setattr(associate_mod, "read_jersey_digits", _boom)
+
+    track_a = _candidate(1, 5.0, box_a)
+    track_id, source, evidence = read_jersey_number_for_candidates(
+        "fake.mp4",
+        _take_for_reid(),
+        [track_a],
+        t=5.0,
+        claimed_jersey_number=7,
+        identity_cfg=_jersey_reid_identity_cfg(),
+        jersey_reid_cfg=_jersey_reid_cfg(),
+        decode_cfg=_DECODE_CFG,
+        sampling_cfg=_SAMPLING_CFG,
+        reader=object(),
+        gemini_api_key=None,
+    )
+    assert (track_id, source) == (None, None)
+    assert evidence["n_too_small"] == 1
+    assert evidence["n_crops_considered"] == 0
+
+
+def test_read_jersey_number_for_candidates_escalates_ambiguous_ocr_to_vlm(monkeypatch):
+    box_a = BBox(x1=10, y1=10, x2=40, y2=70)
+    box_b = BBox(x1=100, y1=10, x2=130, y2=70)
+    frame = _marker_frame()
+    _stamp_box(frame, box_a, marker=1)  # VLM will read "7" -- matches
+    _stamp_box(frame, box_b, marker=2)  # VLM will read "3" -- no match
+    monkeypatch.setattr(associate_mod, "decode_frames", lambda *a, **k: iter([(0, 5.0, frame)]))
+    # OCR is always ambiguous here, forcing VLM escalation for every candidate.
+    monkeypatch.setattr(
+        associate_mod,
+        "read_jersey_digits",
+        lambda reader, crop, cfg: OcrRead(digits=None, confidence=0.0, is_confident=False),
+    )
+
+    def _fake_vlm(crop, api_key, vlm_cfg):
+        marker = int(crop[0, 0, 0])
+        digits = {1: "7", 2: "3"}[marker]
+        return digits, 0.75, f"[model=fake] NUMBER={digits}"
+
+    monkeypatch.setattr(associate_mod, "classify_jersey_number", _fake_vlm)
+
+    track_a = _candidate(1, 5.0, box_a)
+    track_b = _candidate(2, 5.0, box_b)
+    track_id, source, evidence = read_jersey_number_for_candidates(
+        "fake.mp4",
+        _take_for_reid(),
+        [track_a, track_b],
+        t=5.0,
+        claimed_jersey_number=7,
+        identity_cfg=_jersey_reid_identity_cfg(),
+        jersey_reid_cfg=_jersey_reid_cfg(max_vlm=2),
+        decode_cfg=_DECODE_CFG,
+        sampling_cfg=_SAMPLING_CFG,
+        reader=object(),
+        gemini_api_key="fake-key",
+    )
+    assert (track_id, source) == (1, "vlm")
+    assert evidence["outcome"] == "matched"
+    assert evidence["n_vlm_calls"] == 2
+
+
+def test_read_jersey_number_for_candidates_vlm_budget_bounds_real_cost(monkeypatch):
+    """Cost-bound proof: with the VLM escalation cap set to 1, only the FIRST candidate (by
+    deterministic track-id order) is ever sent to Gemini -- even though the SECOND candidate is
+    the one that would have matched. The honest result is "no_match", not a guess -- this is the
+    documented, accepted trade-off of bounding cost (CLAUDE.md Golden Rule 5: an honest miss, never
+    a fabricated hit)."""
+    box_a = BBox(x1=10, y1=10, x2=40, y2=70)  # track 1 -- checked first, does NOT match
+    box_b = BBox(x1=100, y1=10, x2=130, y2=70)  # track 2 -- would match, but budget runs out first
+    frame = _marker_frame()
+    _stamp_box(frame, box_a, marker=1)
+    _stamp_box(frame, box_b, marker=2)
+    monkeypatch.setattr(associate_mod, "decode_frames", lambda *a, **k: iter([(0, 5.0, frame)]))
+    monkeypatch.setattr(
+        associate_mod,
+        "read_jersey_digits",
+        lambda reader, crop, cfg: OcrRead(digits=None, confidence=0.0, is_confident=False),
+    )
+
+    def _fake_vlm(crop, api_key, vlm_cfg):
+        marker = int(crop[0, 0, 0])
+        digits = {1: "3", 2: "7"}[marker]
+        return digits, 0.75, f"[model=fake] NUMBER={digits}"
+
+    monkeypatch.setattr(associate_mod, "classify_jersey_number", _fake_vlm)
+
+    track_a = _candidate(1, 5.0, box_a)
+    track_b = _candidate(2, 5.0, box_b)
+    track_id, source, evidence = read_jersey_number_for_candidates(
+        "fake.mp4",
+        _take_for_reid(),
+        [track_a, track_b],
+        t=5.0,
+        claimed_jersey_number=7,
+        identity_cfg=_jersey_reid_identity_cfg(),
+        jersey_reid_cfg=_jersey_reid_cfg(max_vlm=1),
+        decode_cfg=_DECODE_CFG,
+        sampling_cfg=_SAMPLING_CFG,
+        reader=object(),
+        gemini_api_key="fake-key",
+    )
+    assert (track_id, source) == (None, None)
+    assert evidence["outcome"] == "no_match"
+    assert evidence["n_vlm_calls"] == 1  # budget of 1 spent on track 1, track 2 never checked

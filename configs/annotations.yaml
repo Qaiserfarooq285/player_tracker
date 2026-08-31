@@ -184,3 +184,39 @@ event_window_seconds: 1.0 # An annotation records a single INSTANT the client wa
 # post_roll_s, which are added on top of this) has a non-degenerate [t_start, t_end] to work with,
 # short enough that it stays "this instant", not a fabricated multi-second duration the client
 # never actually specified.
+
+# ---------------------------------------------------------------------------------------------
+# Jersey-number OCR/VLM as a periodic re-identification signal ("streamed-gathering-treehouse"
+# plan, Stage B). Real testing on broadcast footage (chelsea_burnley_target10/target2) found the
+# identity LOCK (above) is correct but locks onto a raw ByteTrack chain with real, large coverage
+# gaps (26.6%/52.0% of a 61.3s take) -- dense, visually-similar players fragment the tracker
+# badly, exactly where goals happen. Two teammates in identical kit are only distinguishable by
+# the printed number, which colour-matching structurally cannot read -- so `src.annotations.
+# associate.read_jersey_number_for_candidates` reuses the SAME OCR-first/VLM-escalation stack
+# ADR-15 already built (`src/identity/jersey_ocr.py`, `jersey_vlm.py`), at two decision points
+# only (never a per-frame scan across the whole video, cost bounded by design):
+#   1. Establishing the INITIAL LOCK for a jersey number in a take -- a confident digit read
+#      matching the annotation's own claimed number is preferred over/corroborates the colour
+#      pick (a printed number is stronger evidence than kit colour, which several teammates share).
+#   2. RE-ACQUIRING after the locked chain has no member near a later annotation's own instant --
+#      before giving up (the honest "locked_identity_absent_at_instant" result), the search
+#      reopens among ALL near-time candidates, but is allowed to accept one ONLY on a confident
+#      jersey-number match (never on colour proximity alone outside the lock -- that would
+#      reintroduce the exact cross-player swap the lock itself was built to prevent).
+# Reuses `identity.yaml: crop.min_crop_height_frac`/`ocr`/`vlm` verbatim for the size gate and the
+# OCR/VLM engines themselves (one calibrated pair of thresholds, not two divergent copies) --
+# the only NEW knob this stage needs is how many Gemini calls a SINGLE lock/reacquisition attempt
+# may spend, scoped much tighter than ADR-15's own per-TAKE budget (`vlm.max_escalations_per_take:
+# 6`) since this fires at most twice per jersey number per take (once at lock, once per
+# reacquisition gap), not continuously across a whole take's worth of frames.
+jersey_reid:
+  enabled: true # global off-switch: when false, manual-mode identity association falls back to
+  # the pre-Stage-B colour(+arrow)-only behaviour unconditionally (e.g. no GEMINI_API_KEY
+  # available at all makes VLM escalation moot, but OCR alone still runs when enabled).
+  max_vlm_escalations_per_call: 2 # cost bound for ONE `read_jersey_number_for_candidates` call
+  # (one lock attempt, or one reacquisition attempt for one annotation): at most this many
+  # OCR-ambiguous candidate crops are ever escalated to Gemini before giving up on that call.
+  # Deliberately much smaller than identity.yaml's per-TAKE cap of 6 -- this call already only
+  # fires at lock-establishment and at a reacquisition gap (bounded to at most a handful of times
+  # per take), so even a small per-call budget keeps the whole-video VLM cost low; measured real
+  # cost per test video is reported in the plan's own verification stage, not assumed here.

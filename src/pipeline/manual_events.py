@@ -17,18 +17,24 @@ for lack of a verified identity (there is nothing to verify in the first place).
 
 from __future__ import annotations
 
+import os
 import shutil
 import time
 from collections import defaultdict
 from pathlib import Path
 
-from src.annotations.associate import associate_annotation_to_track
+from src.annotations.associate import (
+    associate_annotation_to_track,
+    candidate_tracks_near_time,
+    read_jersey_number_for_candidates,
+)
 from src.annotations.parse import annotation_to_event, parse_annotations
 from src.common.io import load_models_parquet, save_json, work_dir_for
 from src.common.logging import get_logger
 from src.common.types import Annotation, BallDetection, Event, Take, Track
 from src.common.video import probe
 from src.detect.overlay_mask import ArrowHint
+from src.identity.jersey_ocr import free_easyocr_reader, load_easyocr_reader
 from src.identity.verify import TakeIdentityResult
 from src.pipeline.annotated_video import render_full_annotated_video
 from src.pipeline.player_output import write_player_output
@@ -80,6 +86,7 @@ def build_manual_identity_by_take(
     configs: dict,
     use_nvdec: bool = True,
     arrow_hints: list[ArrowHint] | None = None,
+    gemini_api_key: str | None = None,
 ) -> tuple[dict[int, TakeIdentityResult], dict[str, dict]]:
     """Best-effort per-take track association (ADR-19): try to associate EACH of a take's own
     annotations to a real track by colour+timing (`src.annotations.associate`), CORROBORATED by
@@ -127,117 +134,248 @@ def build_manual_identity_by_take(
     `configs["highlights"]["selection"]`, e.g. a minimal test config), `build_take_identities` has
     no thresholds to stitch with, so this take falls back to the pre-fix independent-search
     behaviour for every annotation -- exactly as before this fix, never a crash.
+
+    **Jersey-number OCR/VLM re-identification, Stage B ("streamed-gathering-treehouse" plan,
+    2026-08-31).** Real testing on broadcast footage found the identity LOCK above is correct but
+    locks onto a raw ByteTrack chain with real, large coverage gaps (26.6%/52.0% of a 61.3s take)
+    -- dense, visually-similar players fragment the tracker badly, exactly where goals happen. Two
+    teammates in identical kit are only distinguishable by the printed number, which colour
+    matching structurally cannot read. `src.annotations.associate.read_jersey_number_for_candidates`
+    (ADR-15's own OCR-first/VLM-escalation stack, reused verbatim) is now consulted at exactly two
+    points, never a per-frame scan:
+    (1) **establishing the initial lock** -- alongside colour(+arrow), a confident digit read
+    matching the annotation's own claimed jersey number is preferred over/corroborates the colour
+    pick (`association_signal="jersey_ocr"|"jersey_vlm"` when it wins, `"colour"` when only the
+    colour/arrow test resolved something, `"none"` when neither did);
+    (2) **re-acquiring after the locked chain is absent at a later instant** -- before falling back
+    to the honest `"locked_identity_absent_at_instant"` result, the search reopens among ALL
+    near-time candidate tracks (not just the locked chain), but is accepted ONLY on a confident
+    jersey-number match (`association_signal="jersey_ocr_reacquired"|"jersey_vlm_reacquired"`) --
+    NEVER on colour proximity alone outside the lock, which would reintroduce the exact
+    cross-player swap the lock itself exists to prevent.
+    Gated on `configs["identity"]` being present AND `configs["annotations"]["jersey_reid"]
+    ["enabled"]` (both absent in older/minimal test configs -- falls back to the pre-Stage-B
+    colour(+arrow)-only behaviour unconditionally, never a crash). `gemini_api_key=None` (no
+    `GEMINI_API_KEY` set) still allows the cheap, local EasyOCR half of the signal to run; only the
+    VLM escalation is skipped. `association_signal` is recorded in `debug` for every annotation
+    (Golden Rule 5 -- full audit trail even when the outcome is "none").
     """
     colour_cfg = configs["annotations"]
     sampling_cfg = configs["annotations"]["track_association"]
     decode_cfg = configs["hardware"]["decode"]
     selection_cfg = configs.get("highlights", {}).get("selection")
+    identity_cfg = configs.get("identity")
+    jersey_reid_cfg = configs["annotations"].get("jersey_reid", {})
+    jersey_reid_enabled = bool(identity_cfg) and jersey_reid_cfg.get("enabled", False)
 
     identity_by_take: dict[int, TakeIdentityResult] = {}
     debug: dict[str, dict] = {}
     takes_by_id = {t.id: t for t in takes}
 
-    for take_id, anns in annotations_by_take.items():
-        take = takes_by_id.get(take_id)
-        take_tracks = tracks_by_take.get(take_id, [])
-        if take is None or not anns:
-            continue
+    # One EasyOCR reader for the whole video (loading it is the expensive part) -- only created
+    # when Stage B's jersey-reid signal is actually enabled and there is at least one annotation to
+    # process; freed in the `finally` below regardless of how the loop below exits.
+    reader = None
+    if jersey_reid_enabled and any(annotations_by_take.values()):
+        reader = load_easyocr_reader(identity_cfg["ocr"])
 
-        # Stitched "same physical player" chains for this take, computed once (pure, no I/O).
-        # `identity_of` is `{}` whenever `selection_cfg` is unavailable -- see docstring -- and the
-        # lock logic below is a no-op in that case (falls through to independent search always).
-        identity_of: dict[int, int] = {}
-        if selection_cfg:
-            identity_of, _identity_confidence = build_take_identities(take_tracks, selection_cfg)
+    # Only needed when Stage B's jersey-reid signal is enabled (see the two call sites below) --
+    # computed defensively via `.get` so a minimal test config without this key (jersey_reid
+    # disabled in that case anyway) never KeyErrors on an unused value.
+    tolerance_s = sampling_cfg.get("match_tolerance_s")
+    try:
+        for take_id, anns in annotations_by_take.items():
+            take = takes_by_id.get(take_id)
+            take_tracks = tracks_by_take.get(take_id, [])
+            if take is None or not anns:
+                continue
 
-        associated_ids: set[int] = set()
-        locked_chain_id_by_jersey: dict[int, int] = {}
-        for ann in sorted(anns, key=lambda a: a.t):
-            locked_chain_id = locked_chain_id_by_jersey.get(ann.jersey_number) if identity_of else None
-
-            if locked_chain_id is not None:
-                # Restricted search: only candidates that are members of the SAME stitched chain
-                # the jersey number already locked onto earlier in this take.
-                locked_tracks = [
-                    tr for tr in take_tracks if identity_of.get(tr.id) == locked_chain_id
-                ]
-                track_id, distance, arrow_evidence = associate_annotation_to_track(
-                    video_path,
-                    take,
-                    locked_tracks,
-                    ann,
-                    colour_cfg,
-                    decode_cfg,
-                    sampling_cfg,
-                    use_nvdec,
-                    arrow_hints=arrow_hints,
-                    selection_cfg=selection_cfg,
+            # Stitched "same physical player" chains for this take, computed once (pure, no I/O).
+            # `identity_of` is `{}` whenever `selection_cfg` is unavailable -- see docstring -- and
+            # the lock logic below is a no-op in that case (falls through to independent search
+            # always).
+            identity_of: dict[int, int] = {}
+            if selection_cfg:
+                identity_of, _identity_confidence = build_take_identities(
+                    take_tracks, selection_cfg
                 )
-                if track_id is None:
-                    # Honest caption-only: the locked identity has no visible candidate near this
-                    # instant -- never fall back to an unrestricted search (that would silently
-                    # reopen the exact cross-player swap this fix closes).
-                    arrow_evidence = {
-                        **arrow_evidence,
-                        "agreement": "locked_identity_absent_at_instant",
-                    }
-                arrow_evidence = {**arrow_evidence, "locked_chain_id": locked_chain_id}
-            else:
-                # No lock yet for this jersey number in this take -- fresh independent search
-                # across every candidate near this instant (the pre-fix behaviour).
-                track_id, distance, arrow_evidence = associate_annotation_to_track(
-                    video_path,
-                    take,
-                    take_tracks,
-                    ann,
-                    colour_cfg,
-                    decode_cfg,
-                    sampling_cfg,
-                    use_nvdec,
-                    arrow_hints=arrow_hints,
-                    selection_cfg=selection_cfg,
+
+            associated_ids: set[int] = set()
+            locked_chain_id_by_jersey: dict[int, int] = {}
+            for ann in sorted(anns, key=lambda a: a.t):
+                locked_chain_id = (
+                    locked_chain_id_by_jersey.get(ann.jersey_number) if identity_of else None
                 )
-                if track_id is not None and identity_of:
-                    # First confident resolution for this jersey number in this take -- lock its
-                    # STITCHED chain id (not the bare raw track id) for every later annotation of
-                    # the same jersey number in this take.
-                    chain_id = identity_of.get(track_id, track_id)
-                    locked_chain_id_by_jersey[ann.jersey_number] = chain_id
-                    arrow_evidence = {**arrow_evidence, "locked_chain_id": chain_id}
+                association_signal = "none"
 
-            debug[f"{take_id}:{ann.t:.2f}"] = {
-                "track_id": track_id,
-                "distance": distance,
-                **arrow_evidence,
-            }
-            if track_id is not None:
-                associated_ids.add(track_id)
+                if locked_chain_id is not None:
+                    # Restricted search: only candidates that are members of the SAME stitched
+                    # chain the jersey number already locked onto earlier in this take.
+                    locked_tracks = [
+                        tr for tr in take_tracks if identity_of.get(tr.id) == locked_chain_id
+                    ]
+                    track_id, distance, arrow_evidence = associate_annotation_to_track(
+                        video_path,
+                        take,
+                        locked_tracks,
+                        ann,
+                        colour_cfg,
+                        decode_cfg,
+                        sampling_cfg,
+                        use_nvdec,
+                        arrow_hints=arrow_hints,
+                        selection_cfg=selection_cfg,
+                    )
+                    if track_id is not None:
+                        association_signal = "locked_chain"
+                    else:
+                        # Stage B re-acquisition: before giving up, reopen the search among ALL
+                        # near-time candidates (not just the locked chain) -- but accept a result
+                        # ONLY on a confident jersey-number match, never on colour proximity alone
+                        # outside the lock (that would reintroduce the exact cross-player swap the
+                        # lock exists to prevent).
+                        reacq_evidence: dict | None = None
+                        if jersey_reid_enabled:
+                            all_candidates = candidate_tracks_near_time(
+                                take_tracks, ann.t, tolerance_s
+                            )
+                            reacq_id, reacq_source, reacq_evidence = (
+                                read_jersey_number_for_candidates(
+                                    video_path,
+                                    take,
+                                    all_candidates,
+                                    ann.t,
+                                    ann.jersey_number,
+                                    identity_cfg,
+                                    jersey_reid_cfg,
+                                    decode_cfg,
+                                    sampling_cfg,
+                                    reader,
+                                    gemini_api_key,
+                                    use_nvdec,
+                                )
+                            )
+                            if reacq_id is not None:
+                                track_id = reacq_id
+                                association_signal = f"jersey_{reacq_source}_reacquired"
+                        # Honest caption-only when re-acquisition also found nothing: the locked
+                        # identity has no visible/confirmable candidate near this instant.
+                        arrow_evidence = {
+                            **arrow_evidence,
+                            "agreement": (
+                                "locked_identity_absent_at_instant"
+                                if track_id is None
+                                else arrow_evidence.get("agreement")
+                            ),
+                        }
+                        if reacq_evidence is not None:
+                            arrow_evidence = {
+                                **arrow_evidence,
+                                "jersey_reid_evidence": reacq_evidence,
+                            }
+                    arrow_evidence = {**arrow_evidence, "locked_chain_id": locked_chain_id}
+                else:
+                    # No lock yet for this jersey number in this take -- fresh independent search
+                    # across every candidate near this instant (the pre-fix behaviour), now
+                    # corroborated/overridden by a jersey-number read when Stage B is enabled.
+                    track_id, distance, arrow_evidence = associate_annotation_to_track(
+                        video_path,
+                        take,
+                        take_tracks,
+                        ann,
+                        colour_cfg,
+                        decode_cfg,
+                        sampling_cfg,
+                        use_nvdec,
+                        arrow_hints=arrow_hints,
+                        selection_cfg=selection_cfg,
+                    )
+                    association_signal = "colour" if track_id is not None else "none"
 
-        if not associated_ids:
-            logger.info(
-                "manual mode take=%d: none of its %d annotation(s) could be confidently "
-                "associated to a track by colour -- events for this take will render as "
-                "captions only, no red box (Golden Rule 5)",
-                take_id,
-                len(anns),
+                    if jersey_reid_enabled:
+                        candidates = candidate_tracks_near_time(take_tracks, ann.t, tolerance_s)
+                        jersey_id, jersey_source, jersey_evidence = (
+                            read_jersey_number_for_candidates(
+                                video_path,
+                                take,
+                                candidates,
+                                ann.t,
+                                ann.jersey_number,
+                                identity_cfg,
+                                jersey_reid_cfg,
+                                decode_cfg,
+                                sampling_cfg,
+                                reader,
+                                gemini_api_key,
+                                use_nvdec,
+                            )
+                        )
+                        arrow_evidence = {
+                            **arrow_evidence,
+                            "jersey_reid_evidence": jersey_evidence,
+                        }
+                        if jersey_id is not None:
+                            # A confident digit read matching the annotation's own claimed number
+                            # is the strongest available signal -- it wins over (and, when the two
+                            # agree, corroborates) the colour/arrow pick. Any disagreement is
+                            # logged, never silently dropped (Golden Rule 5).
+                            if track_id is not None and track_id != jersey_id:
+                                arrow_evidence = {
+                                    **arrow_evidence,
+                                    "jersey_colour_disagreement": {
+                                        "colour_track_id": track_id,
+                                        "jersey_track_id": jersey_id,
+                                    },
+                                }
+                            track_id = jersey_id
+                            association_signal = f"jersey_{jersey_source}"
+
+                    if track_id is not None and identity_of:
+                        # First confident resolution for this jersey number in this take -- lock
+                        # its STITCHED chain id (not the bare raw track id) for every later
+                        # annotation of the same jersey number in this take.
+                        chain_id = identity_of.get(track_id, track_id)
+                        locked_chain_id_by_jersey[ann.jersey_number] = chain_id
+                        arrow_evidence = {**arrow_evidence, "locked_chain_id": chain_id}
+
+                debug[f"{take_id}:{ann.t:.2f}"] = {
+                    "track_id": track_id,
+                    "distance": distance,
+                    "association_signal": association_signal,
+                    **arrow_evidence,
+                }
+                if track_id is not None:
+                    associated_ids.add(track_id)
+
+            if not associated_ids:
+                logger.info(
+                    "manual mode take=%d: none of its %d annotation(s) could be confidently "
+                    "associated to a track by colour -- events for this take will render as "
+                    "captions only, no red box (Golden Rule 5)",
+                    take_id,
+                    len(anns),
+                )
+                continue
+
+            # A take's annotations should all name the same target jersey number in practice; if
+            # the client's own lines disagree, the lowest number is used as a deterministic,
+            # documented tiebreak (never an arbitrary dict-ordering accident) -- the FULL
+            # per-number event split still happens correctly downstream regardless
+            # (events_by_number groups by each annotation's OWN jersey_number, not by this
+            # take-level identity record).
+            jersey_number = min(a.jersey_number for a in anns)
+            identity_by_take[take_id] = TakeIdentityResult(
+                take_id=take_id,
+                jersey_number=jersey_number,
+                status="verified",  # ADR-19: human-provided identity needs no further verification
+                confidence=1.0,  # a human directly watching the footage, Golden Rule 4
+                evidence_frames=[],
+                location_method="manual_annotation_colour_match",
+                location_track_ids=sorted(associated_ids),
             )
-            continue
-
-        # A take's annotations should all name the same target jersey number in practice; if the
-        # client's own lines disagree, the lowest number is used as a deterministic, documented
-        # tiebreak (never an arbitrary dict-ordering accident) -- the FULL per-number event split
-        # still happens correctly downstream regardless (events_by_number groups by each
-        # annotation's OWN jersey_number, not by this take-level identity record).
-        jersey_number = min(a.jersey_number for a in anns)
-        identity_by_take[take_id] = TakeIdentityResult(
-            take_id=take_id,
-            jersey_number=jersey_number,
-            status="verified",  # ADR-19: human-provided identity needs no further verification
-            confidence=1.0,  # a human directly watching the footage, Golden Rule 4
-            evidence_frames=[],
-            location_method="manual_annotation_colour_match",
-            location_track_ids=sorted(associated_ids),
-        )
+    finally:
+        if reader is not None:
+            free_easyocr_reader(reader)
 
     return identity_by_take, debug
 
@@ -323,6 +461,17 @@ def run_manual_events_pipeline_for_video(
             n_unassigned,
         )
 
+    # Stage B ("streamed-gathering-treehouse" plan): jersey-number OCR/VLM re-identification.
+    # Same env-var convention as src/pipeline/run.py / extended_output.py -- absent key still
+    # allows the cheap, local EasyOCR half of the signal to run, only VLM escalation is skipped.
+    gemini_api_key = os.environ.get("GEMINI_API_KEY") or None
+    jersey_reid_cfg = configs.get("annotations", {}).get("jersey_reid", {})
+    if not gemini_api_key and configs.get("identity") and jersey_reid_cfg.get("enabled", False):
+        logger.warning(
+            "GEMINI_API_KEY not set -- jersey-number re-identification (Stage B) proceeds on "
+            "EasyOCR alone (no VLM escalation for OCR-ambiguous crops)"
+        )
+
     identity_by_take, association_debug = build_manual_identity_by_take(
         takes,
         dict(tracks_by_take),
@@ -331,6 +480,7 @@ def run_manual_events_pipeline_for_video(
         configs,
         use_nvdec,
         arrow_hints=arrow_hints,
+        gemini_api_key=gemini_api_key,
     )
 
     annotation_report = {

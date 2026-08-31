@@ -442,3 +442,216 @@ def test_run_manual_events_pipeline_smoke(tmp_path, monkeypatch):
     # real zero (see src/pipeline/player_output.py's own docstring). This is an intentional
     # behaviour change from the old pinned "not available" assertion.
     assert written["goal_reason"] is None
+
+
+# ---------------------------------------------------------------------------
+# Stage B ("streamed-gathering-treehouse" plan) -- jersey-number OCR/VLM re-identification,
+# wired into build_manual_identity_by_take's lock/reacquisition orchestration. Both
+# `associate_annotation_to_track` (colour+arrow) and `read_jersey_number_for_candidates`
+# (jersey read) are monkeypatched -- no real decode/OCR/VLM -- to isolate the DECISION logic:
+# which signal wins, and when reacquisition is allowed to accept a non-locked-chain candidate.
+# ---------------------------------------------------------------------------
+
+
+def _stub_easyocr(monkeypatch) -> None:
+    """These tests exercise the LOCK/REACQUISITION decision logic with
+    `read_jersey_number_for_candidates` itself monkeypatched -- the real EasyOCR reader
+    (`load_easyocr_reader`) must never actually load a model here, only be created/freed as a
+    cheap placeholder object."""
+    monkeypatch.setattr(me_mod, "load_easyocr_reader", lambda ocr_cfg: object())
+    monkeypatch.setattr(me_mod, "free_easyocr_reader", lambda reader: None)
+
+
+def _jersey_reid_configs(selection_cfg: dict) -> dict:
+    return {
+        "annotations": {
+            "track_association": {"match_tolerance_s": 0.2},
+            "jersey_reid": {"enabled": True, "max_vlm_escalations_per_call": 2},
+        },
+        "hardware": {"decode": {}},
+        "highlights": {"selection": selection_cfg},
+        "identity": {"ocr": {}},
+    }
+
+
+def test_initial_lock_prefers_confident_jersey_read_over_colour_pick(monkeypatch):
+    """A confident jersey-number read matching the annotation's own claimed number is the
+    strongest signal available -- it must win over a DIFFERENT colour pick, and the disagreement
+    must be logged (Golden Rule 5), never silently dropped."""
+    _stub_easyocr(monkeypatch)
+    take = _take(0, 0.0, 10.0)
+    track_colour_pick = _track(5, 1.0)
+    track_jersey_pick = _track(9, 1.0)
+    anns = [_annotation(1.0, jersey=7)]
+
+    monkeypatch.setattr(
+        me_mod,
+        "associate_annotation_to_track",
+        lambda *a, **k: (
+            5,
+            10.0,
+            {"arrow_track_id": None, "arrow_distance_px": None, "agreement": "colour_only"},
+        ),
+    )
+    monkeypatch.setattr(
+        me_mod,
+        "read_jersey_number_for_candidates",
+        lambda *a, **k: (9, "ocr", {"outcome": "matched"}),
+    )
+
+    identity_by_take, debug = me_mod.build_manual_identity_by_take(
+        [take],
+        {0: [track_colour_pick, track_jersey_pick]},
+        {0: anns},
+        "fake.mp4",
+        _jersey_reid_configs(_selection_cfg()),
+    )
+
+    entry = debug["0:1.00"]
+    assert entry["track_id"] == 9  # jersey read wins over colour's pick of 5
+    assert entry["association_signal"] == "jersey_ocr"
+    assert entry["jersey_colour_disagreement"] == {"colour_track_id": 5, "jersey_track_id": 9}
+    assert identity_by_take[0].location_track_ids == [9]
+
+
+def test_initial_lock_falls_back_to_colour_when_jersey_read_finds_nothing(monkeypatch):
+    _stub_easyocr(monkeypatch)
+    take = _take(0, 0.0, 10.0)
+    track = _track(5, 1.0)
+    anns = [_annotation(1.0, jersey=7)]
+
+    monkeypatch.setattr(
+        me_mod,
+        "associate_annotation_to_track",
+        lambda *a, **k: (
+            5,
+            10.0,
+            {"arrow_track_id": None, "arrow_distance_px": None, "agreement": "colour_only"},
+        ),
+    )
+    monkeypatch.setattr(
+        me_mod,
+        "read_jersey_number_for_candidates",
+        lambda *a, **k: (None, None, {"outcome": "no_match"}),
+    )
+
+    identity_by_take, debug = me_mod.build_manual_identity_by_take(
+        [take],
+        {0: [track]},
+        {0: anns},
+        "fake.mp4",
+        _jersey_reid_configs(_selection_cfg()),
+    )
+
+    entry = debug["0:1.00"]
+    assert entry["track_id"] == 5
+    assert entry["association_signal"] == "colour"
+    assert "jersey_colour_disagreement" not in entry
+
+
+def test_reacquisition_accepts_jersey_confirmed_candidate_outside_locked_chain(monkeypatch):
+    """Once jersey #10 locks onto track 100's chain at the first annotation, if NO member of that
+    chain is visible near a LATER instant, a fresh jersey-number read confirming a DIFFERENT,
+    non-locked-chain candidate (track 200) must still be accepted -- this is the honest
+    re-acquisition Stage B adds, distinct from (and never substituted by) a bare colour guess."""
+    _stub_easyocr(monkeypatch)
+    take = _take(0, 0.0, 10.0)
+    track_a = Track(id=100, take_id=0, boxes=[_box_at(1.0, 50, 50)])
+    track_b = Track(id=200, take_id=0, boxes=[_box_at(5.0, 500, 500)])
+    anns = [_annotation(1.0, jersey=10), _annotation(5.0, jersey=10)]
+
+    def fake_associate(video_path, take, candidates, ann, *args, **kwargs):
+        ids = {tr.id for tr in candidates}
+        if ids == {100, 200} and ann.t < 3.0:
+            # first annotation, no lock yet -- fresh search over the FULL take_tracks pool.
+            return (
+                100,
+                5.0,
+                {"arrow_track_id": None, "arrow_distance_px": None, "agreement": "colour_only"},
+            )
+        if ids == {100} and ann.t >= 3.0:
+            # restricted search: locked chain (100) has no candidate near this later instant.
+            return (
+                None,
+                None,
+                {
+                    "arrow_track_id": None,
+                    "arrow_distance_px": None,
+                    "agreement": "no_confident_signal",
+                },
+            )
+        raise AssertionError(f"unexpected candidate id set {ids} for ann.t={ann.t}")
+
+    def fake_jersey_read(video_path, take, candidates, t, claimed_jersey_number, *args, **kwargs):
+        ids = {tr.id for tr in candidates}
+        if t < 3.0:
+            # first annotation: jersey read finds nothing near t=1.0 -- colour's pick (100) wins.
+            assert ids == {100}
+            return None, None, {"outcome": "no_match"}
+        # second annotation: track_a (100) has no box near t=5.0 at all, so the re-opened
+        # near-time pool is just {200} here -- the key behaviour under test is that 200 (NOT a
+        # member of the locked chain) is still eligible and gets accepted purely on the
+        # jersey-number match.
+        assert ids == {200}
+        return 200, "vlm", {"outcome": "matched"}
+
+    monkeypatch.setattr(me_mod, "associate_annotation_to_track", fake_associate)
+    monkeypatch.setattr(me_mod, "read_jersey_number_for_candidates", fake_jersey_read)
+
+    identity_by_take, debug = me_mod.build_manual_identity_by_take(
+        [take],
+        {0: [track_a, track_b]},
+        {0: anns},
+        "fake.mp4",
+        _jersey_reid_configs(_selection_cfg()),
+    )
+
+    assert debug["0:1.00"]["track_id"] == 100
+    assert debug["0:5.00"]["track_id"] == 200
+    assert debug["0:5.00"]["association_signal"] == "jersey_vlm_reacquired"
+    assert set(identity_by_take[0].location_track_ids) == {100, 200}
+
+
+def test_reacquisition_stays_caption_only_when_jersey_read_also_fails(monkeypatch):
+    """When re-opening the search finds no jersey-confirmed candidate either, the honest result is
+    unchanged from the pre-Stage-B behaviour: caption-only, no fabricated box."""
+    _stub_easyocr(monkeypatch)
+    take = _take(0, 0.0, 10.0)
+    track_a = Track(id=100, take_id=0, boxes=[_box_at(1.0, 50, 50)])
+    track_b = Track(id=200, take_id=0, boxes=[_box_at(5.0, 500, 500)])
+    anns = [_annotation(1.0, jersey=10), _annotation(5.0, jersey=10)]
+
+    def fake_associate(video_path, take, candidates, ann, *args, **kwargs):
+        ids = {tr.id for tr in candidates}
+        if ids == {100, 200} and ann.t < 3.0:
+            return (
+                100,
+                5.0,
+                {"arrow_track_id": None, "arrow_distance_px": None, "agreement": "colour_only"},
+            )
+        return (
+            None,
+            None,
+            {"arrow_track_id": None, "arrow_distance_px": None, "agreement": "no_confident_signal"},
+        )
+
+    monkeypatch.setattr(me_mod, "associate_annotation_to_track", fake_associate)
+    monkeypatch.setattr(
+        me_mod,
+        "read_jersey_number_for_candidates",
+        lambda *a, **k: (None, None, {"outcome": "no_match"}),
+    )
+
+    identity_by_take, debug = me_mod.build_manual_identity_by_take(
+        [take],
+        {0: [track_a, track_b]},
+        {0: anns},
+        "fake.mp4",
+        _jersey_reid_configs(_selection_cfg()),
+    )
+
+    assert debug["0:1.00"]["track_id"] == 100
+    assert debug["0:5.00"]["track_id"] is None
+    assert debug["0:5.00"]["agreement"] == "locked_identity_absent_at_instant"
+    assert debug["0:5.00"]["association_signal"] == "none"
+    assert identity_by_take[0].location_track_ids == [100]

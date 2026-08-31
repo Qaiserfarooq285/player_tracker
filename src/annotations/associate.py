@@ -34,18 +34,22 @@ from pathlib import Path
 
 import numpy as np
 
-from src.common.types import Annotation, Take, Track
+from src.common.types import Annotation, BBox, Take, Track
 from src.common.video import decode_frames
 from src.detect.overlay_mask import ArrowHint
 from src.highlights.selection import _center_distance, _contains, _nearest_box
+from src.identity.jersey_ocr import read_jersey_digits
+from src.identity.jersey_vlm import classify_jersey_number
 from src.team.classifier import per_track_lab_median, torso_region
 
 __all__ = [
     "associate_annotation_to_track",
     "candidate_tracks_near_time",
+    "expanded_bbox_region",
     "nearest_track_by_arrow_hint",
     "nearest_track_by_colour",
     "opencv_lab_to_cielab",
+    "read_jersey_number_for_candidates",
 ]
 
 
@@ -165,6 +169,175 @@ def nearest_track_by_arrow_hint(
     if nearest_id is not None and nearest_dist is not None and nearest_dist <= max_dist_px:
         return nearest_id, nearest_dist
     return None, None
+
+
+def expanded_bbox_region(bbox: BBox, expand_frac: float) -> BBox:
+    """The FULL player bbox, expanded by `expand_frac` on each side -- the crop shape ADR-15's own
+    `src.identity.verify._scale_bbox_to_native` uses for jersey OCR/VLM, deliberately NOT
+    `torso_region`'s tighter chest-band crop (`configs/annotations.yaml: track_association.
+    torso_top_frac/torso_bottom_frac/torso_x_inset_frac`, tuned for CIELAB colour sampling, not
+    digit legibility -- a jersey number printed low on the back or large on the chest can sit
+    outside that band, or be clipped by its own `x_inset_frac`). Pure geometry, no clipping to
+    frame bounds (the caller clips, since that needs the frame's own shape) -- same split as
+    `torso_region` itself.
+    """
+    width = bbox.x2 - bbox.x1
+    height = bbox.y2 - bbox.y1
+    return BBox(
+        x1=bbox.x1 - width * expand_frac,
+        y1=bbox.y1 - height * expand_frac,
+        x2=bbox.x2 + width * expand_frac,
+        y2=bbox.y2 + height * expand_frac,
+    )
+
+
+def read_jersey_number_for_candidates(
+    video_path: str | Path,
+    take: Take,
+    candidates: list[Track],
+    t: float,
+    claimed_jersey_number: int,
+    identity_cfg: dict,
+    jersey_reid_cfg: dict,
+    decode_cfg: dict,
+    sampling_cfg: dict,
+    reader,
+    gemini_api_key: str | None,
+    use_nvdec: bool = True,
+) -> tuple[int | None, str | None, dict]:
+    """Stage B ("streamed-gathering-treehouse" plan) -- best-effort jersey-NUMBER read across
+    `candidates` near time `t`, looking specifically for a confident digit read matching
+    `claimed_jersey_number` (the annotation's own stated number): the strongest possible
+    re-identification signal available, since two teammates in identical kit are only
+    distinguishable by the printed number, not by colour.
+
+    Decodes ONE short window (`sampling_cfg['window_s']` either side of `t`, clamped into the
+    take -- the SAME convention `associate_annotation_to_track` already uses for its own colour
+    decode) at `decode_cfg`'s own resolution (matching whatever resolution `candidates`' own boxes
+    are already expressed in -- no separate native-4K re-decode like ADR-15's `verify.py`, since a
+    re-identification CONFIRMATION doesn't need the sharpest possible pixels, only "does the
+    visible digit match the one already claimed", and reusing tracking's own resolution keeps this
+    genuinely cheap). For each candidate, only its SINGLE crop nearest in time to `t` is read (not
+    every decoded frame for every candidate) -- this is what keeps the cost bounded to at most
+    `len(candidates)` OCR calls plus up to `jersey_reid_cfg['max_vlm_escalations_per_call']` Gemini
+    calls for this ONE invocation, never a per-frame scan.
+
+    A candidate's crop is skipped (counted in `n_too_small`) when it doesn't clear
+    `identity_cfg['crop']['min_crop_height_frac']` of THIS frame's own height (Stage A's
+    resolution-aware gate, reused verbatim -- no separate threshold for this stage). EasyOCR runs
+    first (cheap, local, mirrors `src.identity.verify._collect_reads_for_take`'s own
+    OCR-first/VLM-escalate pattern); a crop is escalated to Gemini only when OCR is
+    ambiguous/silent, bounded by `max_vlm_escalations_per_call` total calls for this invocation.
+
+    Returns `(track_id, source, evidence)`:
+    - `(track_id, "ocr"|"vlm", evidence)` when EXACTLY ONE candidate's read confidently equals
+      `str(claimed_jersey_number)`.
+    - `(None, None, evidence)` when no candidate matches, OR when more than one candidate's read
+      matches (an honest "can't disambiguate", never an arbitrary pick among two same-number
+      reads -- Golden Rule 5; `evidence['outcome']` names which case happened).
+    `evidence` always carries `{n_crops_considered, n_too_small, n_ocr_confident, n_vlm_calls,
+    n_vlm_failed, reads: [{track_id, source, digits, confidence}, ...], outcome}` -- the FULL
+    per-candidate trail, not just the winner (Golden Rule 5).
+    """
+    evidence: dict = {
+        "n_crops_considered": 0,
+        "n_too_small": 0,
+        "n_ocr_confident": 0,
+        "n_vlm_calls": 0,
+        "n_vlm_failed": 0,
+        "reads": [],
+    }
+    if not candidates:
+        evidence["outcome"] = "no_candidates"
+        return None, None, evidence
+
+    tolerance_s = sampling_cfg["match_tolerance_s"]
+    window_s = sampling_cfg["window_s"]
+    start = max(take.t_start, t - window_s)
+    end = min(take.t_end, t + window_s)
+    expand = identity_cfg["crop"]["torso_crop_expand"]
+    min_height_frac = identity_cfg["crop"]["min_crop_height_frac"]
+    ocr_cfg = identity_cfg["ocr"]
+    vlm_cfg = identity_cfg["vlm"]
+    max_vlm = jersey_reid_cfg["max_vlm_escalations_per_call"]
+    claimed_digits = str(claimed_jersey_number)
+
+    # ONE representative crop per candidate: whichever decoded frame sits closest in time to `t`
+    # among that candidate's own boxes within `tolerance_s` -- bounds cost to len(candidates) OCR
+    # calls regardless of how many frames the window decodes.
+    best_by_track: dict[int, tuple[float, np.ndarray]] = {}
+    for _idx, frame_t, frame in decode_frames(
+        video_path,
+        fps=sampling_cfg["fps_sample"],
+        start=start,
+        end=end,
+        scale_width=decode_cfg.get("scale_width"),
+        use_nvdec=use_nvdec,
+    ):
+        height, width = frame.shape[:2]
+        min_height_px = min_height_frac * height
+        dt = abs(frame_t - t)
+        for tr in candidates:
+            box = next((b for b in tr.boxes if abs(b.t - frame_t) <= tolerance_s), None)
+            if box is None:
+                continue
+            existing = best_by_track.get(tr.id)
+            if existing is not None and existing[0] <= dt:
+                continue  # already have an equal-or-closer frame for this candidate
+            region = expanded_bbox_region(box.bbox, expand)
+            x1, y1 = max(0, int(round(region.x1))), max(0, int(round(region.y1)))
+            x2, y2 = min(width, int(round(region.x2))), min(height, int(round(region.y2)))
+            if x2 - x1 < 2 or (y2 - y1) < min_height_px:
+                continue
+            best_by_track[tr.id] = (dt, frame[y1:y2, x1:x2].copy())
+
+    evidence["n_crops_considered"] = len(best_by_track)
+    evidence["n_too_small"] = len(candidates) - len(best_by_track)
+
+    matches: list[tuple[int, str, float]] = []
+    vlm_budget = max_vlm
+    for tr_id in sorted(best_by_track):  # deterministic order, never dict-insertion-order luck
+        _dt, crop = best_by_track[tr_id]
+        ocr_read = read_jersey_digits(reader, crop, ocr_cfg)
+        if ocr_read.is_confident:
+            evidence["n_ocr_confident"] += 1
+            evidence["reads"].append(
+                {
+                    "track_id": tr_id,
+                    "source": "ocr",
+                    "digits": ocr_read.digits,
+                    "confidence": ocr_read.confidence,
+                }
+            )
+            if ocr_read.digits == claimed_digits:
+                matches.append((tr_id, "ocr", ocr_read.confidence))
+            continue
+
+        if gemini_api_key and vlm_budget > 0:
+            vlm_budget -= 1
+            evidence["n_vlm_calls"] += 1
+            digits, conf, raw = classify_jersey_number(crop, gemini_api_key, vlm_cfg)
+            if raw.startswith("CALL_FAILED"):
+                evidence["n_vlm_failed"] += 1
+            evidence["reads"].append(
+                {"track_id": tr_id, "source": "vlm", "digits": digits, "confidence": conf}
+            )
+            if digits == claimed_digits:
+                matches.append((tr_id, "vlm", conf))
+
+    if not matches:
+        evidence["outcome"] = "no_match"
+        return None, None, evidence
+
+    matching_ids = sorted({m[0] for m in matches})
+    if len(matching_ids) > 1:
+        evidence["outcome"] = "ambiguous_multiple_candidates_matched"
+        evidence["ambiguous_track_ids"] = matching_ids
+        return None, None, evidence
+
+    track_id, source, _conf = matches[0]
+    evidence["outcome"] = "matched"
+    return track_id, source, evidence
 
 
 def associate_annotation_to_track(
