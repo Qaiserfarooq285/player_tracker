@@ -85,16 +85,24 @@ unmapped_event_type: KEY_MOMENT # CLAUDE.md §14.3: a phrase matching none of th
 # ---------------------------------------------------------------------------------------------
 
 colour_reference_lab:
-  # ⚠️ REASONED-BUT-UNMEASURED (same epistemic status as `goal_region.confidence`/
-  # `save.save_gk_proximity_px` in configs/events.yaml -- no real client-annotated footage exists
-  # on this project yet to measure actual jersey-colour Lab values against). These are the
-  # standard CIELAB (D65) conversions of canonical sRGB primary/secondary/named colours -- a
-  # reasonable STARTING reference for "does this track's own measured torso Lab read as roughly
-  # this colour", not a promise that any given kit's exact shade matches these numbers precisely.
-  # Revisit the moment a real client sidecar + footage exists to check real jersey Lab values
-  # against (same "revisit when real data exists" discipline as those two other blocks).
+  # ⚠️ REASONED-BUT-UNMEASURED, except `blue` below (measured 2026-08-31, see its own comment):
+  # these remaining entries carry the same epistemic status as `goal_region.confidence`/
+  # `save.save_gk_proximity_px` in configs/events.yaml -- standard CIELAB (D65) conversions of
+  # canonical sRGB primary/secondary/named colours, a reasonable STARTING reference, not a promise
+  # that any given kit's exact shade matches these numbers. `blue`'s own real measurement (below)
+  # shows this gap can be large: a real broadcast jersey reads far less saturated than an idealized
+  # colour-chip swatch (compression, lighting, motion blur, torso-crop background bleed) -- so
+  # treat every OTHER entry here as similarly optimistic until it, too, gets a real measurement.
+  # Revisit each one the moment real footage naming that colour exists (same "revisit when real
+  # data exists" discipline as those two other config blocks).
   white: [100.0, 0.0, 0.0]
-  black: [0.0, 0.0, 0.0]
+  black: [0.0, 0.0, 0.0] # ⚠️ a real (if single, noisy) data point suggests this one is ALSO badly
+  # off: a referee track in `chelsea_burnley_target10` (t=57.0s, track 187 -- visually confirmed
+  # black kit) measured (post opencv_lab_to_cielab fix) [51.56, -10.25, 12.18], not near [0,0,0] --
+  # but this is ONE crop, possibly contaminated by grass/background bleed into the torso region
+  # (CLAUDE.md §3.2's own documented failure mode), so it is NOT corrected here (that would be
+  # guessing from n=1) -- flagged as a known follow-up, not fixed, per the same "don't guess"
+  # discipline as everything else in this file.
   grey: [53.59, 0.0, 0.0]
   gray: [53.59, 0.0, 0.0] # US spelling alias -- the client's own wording is not policed
   red: [53.24, 80.09, 67.20]
@@ -102,7 +110,18 @@ colour_reference_lab:
   orange: [74.94, 23.93, 78.95]
   yellow: [97.14, -21.55, 94.48]
   green: [87.73, -86.18, 83.18]
-  blue: [32.30, 79.19, -107.86]
+  blue: [52.76, -2.70, -3.38] # ⚠️ CORRECTED 2026-08-31, MEASURED (bug fix, see
+  # src/annotations/associate.py::opencv_lab_to_cielab's own docstring for the underlying unit bug
+  # this replaces). Real data: `chelsea_burnley_target10` (video2), t=57.0s, `work/
+  # chelsea_burnley_target10/track/tracks.parquet` -- 6 candidate tracks near that instant were
+  # visually confirmed as genuine Chelsea-blue kit (track ids 188/208/210/215/219/221, cross-
+  # checked against cropped frame images, not guessed from Lab values alone); this is the MEDIAN
+  # of their own per-track median-of-crops true CIELAB (after the opencv_lab_to_cielab fix). The
+  # previous value [32.30, 79.19, -107.86] was an idealized pure-sRGB-blue colour chip -- 130+
+  # units away from this real measurement, which is exactly why colour association was silently
+  # failing on every blue-named annotation before this fix. See `colour_match_max_distance` below
+  # for the corroborating cross-check against real non-blue (claret/maroon) tracks in the same
+  # frame.
   navy: [12.97, 47.53, -64.70]
   sky: [91.11, -48.09, -14.13]
   cyan: [91.11, -48.09, -14.13]
@@ -111,10 +130,26 @@ colour_reference_lab:
   light blue: [83.92, -11.0, -11.0] # added 2026-08-31 for real client phrasing (§3.5/video1)
   # that names two-word colours; same "canonical sRGB -> OpenCV CIELAB" derivation as every other
   # entry in this table (sRGB ~(173,216,230), a standard "light blue"/powder-blue reference).
+  # ⚠️ Given `blue`'s own measured correction above, treat this one as similarly optimistic until
+  # real light-blue-kit footage exists to check it against.
   dark green: [36.08, -43.0, 42.0] # same derivation, sRGB ~(0,100,0), a standard "dark green".
+  # Same caveat as `light blue` above -- unmeasured against real footage.
 
-colour_match_max_distance: 40.0 # ⚠️ REASONED-BUT-UNMEASURED: a candidate track's own measured
-# torso Lab must sit within this CIELAB Euclidean distance of the named colour's reference above
+colour_match_max_distance: 8.0 # ⚠️ CORRECTED 2026-08-31, MEASURED (was 40.0, reasoned-but-
+# unmeasured -- see git history for that value's original "half the smallest gap between two
+# reference colours" reasoning, now superseded). Real data, same instant as `blue`'s own
+# measurement above (`chelsea_burnley_target10`, t=57.0s): of the 6 confirmed-blue tracks, 4 sit
+# within 1.25-4.16 units of the corrected `blue` reference; the OTHER 8 candidate tracks at that
+# instant, visually confirmed as the opposing team's claret/maroon kit (NOT blue), sit no closer
+# than 12.1 units away. 40.0 (or even the old idealized `blue` reference's own ~130-unit gap) would
+# have let every one of those maroon tracks pass as a confident "blue" match -- a real, measured
+# false-positive risk, not a hypothetical one. 8.0 sits with a safety margin below that measured
+# 12.1 floor: it reliably keeps out every real non-blue track observed so far, at the honest cost
+# of missing 2 of the 6 blue tracks whose crops were more motion-blurred/occluded (13.0 and 16.4
+# units away) -- an acceptable "no confident match" (Golden Rule 5) rather than a false positive.
+# Revisit once more named colours have their own real measurement (see `colour_reference_lab`'s
+# own per-entry caveats above) -- this number is calibrated against ONE colour pair (blue vs
+# claret) on ONE instant of ONE match, not a general-purpose constant.
 # to count as a confident match -- otherwise `nearest_track_by_colour` returns `None` (Golden
 # Rule 5: caption-only, no red box, rather than a forced guess). 40 sits at roughly half the
 # smallest gap between any two of this table's OWN reference colours (e.g. white/grey = 46.4,

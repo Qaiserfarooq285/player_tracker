@@ -45,6 +45,7 @@ __all__ = [
     "candidate_tracks_near_time",
     "nearest_track_by_arrow_hint",
     "nearest_track_by_colour",
+    "opencv_lab_to_cielab",
 ]
 
 
@@ -52,6 +53,31 @@ def candidate_tracks_near_time(tracks: list[Track], t: float, tolerance_s: float
     """Every track with at least one box within `tolerance_s` seconds of `t` -- the LOCATION
     candidate pool for one annotation instant (pure, no I/O, directly unit-testable)."""
     return [tr for tr in tracks if any(abs(b.t - t) <= tolerance_s for b in tr.boxes)]
+
+
+def opencv_lab_to_cielab(raw_lab: np.ndarray) -> np.ndarray:
+    """Convert `src.team.classifier.crop_lab_mean`'s own OpenCV-scaled output into TRUE CIELAB
+    units.
+
+    **Bug fix, 2026-08-31.** OpenCV's `COLOR_BGR2LAB` returns an 8-bit-scaled encoding, not true
+    CIELAB: ``L_cv = L_true * 255/100``, ``a_cv = a_true + 128``, ``b_cv = b_true + 128`` (OpenCV's
+    own documented convention). `crop_lab_mean`/`per_track_lab_median` never undo this scaling --
+    correctly so, since every OTHER consumer of those functions (ADR-12's own team-colour
+    clustering in `src.team.classifier`) only ever compares tracks against EACH OTHER in that same
+    raw scale, which is perfectly self-consistent and must NOT be changed here. But
+    `configs/annotations.yaml: colour_reference_lab` is written in TRUE CIELAB units (e.g.
+    ``white: [100.0, 0.0, 0.0]``, standard sRGB -> CIELAB conversions -- see that file's own
+    comment), and `nearest_track_by_colour` compares a track's Lab directly against that table.
+    Without this conversion the two sides are in different units: confirmed on real cached data
+    (`work/chelsea_burnley_target10/track/tracks.parquet`, t=57.0s) where every candidate track's
+    raw L value came out 126-146 -- impossible for true CIELAB, which caps at 100 -- inflating
+    every distance by roughly 100+ units and silently defeating `colour_match_max_distance` for
+    every colour, on every video. This is the one conversion point that fixes it; apply it ONLY
+    where a track's own measured Lab is about to be compared against `colour_reference_lab` (i.e.
+    here, in `associate_annotation_to_track`), never inside `src.team.classifier` itself.
+    """
+    l_cv, a_cv, b_cv = raw_lab
+    return np.array([l_cv * 100.0 / 255.0, a_cv - 128.0, b_cv - 128.0])
 
 
 def nearest_track_by_colour(
@@ -222,7 +248,10 @@ def associate_annotation_to_track(
     for tid, crops in crops_by_track.items():
         lab = per_track_lab_median(crops)
         if lab is not None:
-            lab_by_track_id[tid] = lab
+            # Bug fix 2026-08-31 (see opencv_lab_to_cielab's own docstring): per_track_lab_median
+            # returns raw OpenCV-scaled Lab; colour_reference_lab is true CIELAB. Convert HERE,
+            # at the point of comparison, never inside src.team.classifier itself.
+            lab_by_track_id[tid] = opencv_lab_to_cielab(lab)
 
     colour_track_id, colour_distance = nearest_track_by_colour(
         lab_by_track_id, annotation.team_colour, colour_cfg

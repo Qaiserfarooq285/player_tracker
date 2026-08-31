@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 import src.annotations.associate as associate_mod
@@ -17,6 +18,7 @@ from src.annotations.associate import (
     candidate_tracks_near_time,
     nearest_track_by_arrow_hint,
     nearest_track_by_colour,
+    opencv_lab_to_cielab,
 )
 from src.common.io import load_yaml
 from src.common.types import Annotation, BBox, EventType, Take, Track, TrackBox
@@ -56,6 +58,44 @@ def test_candidate_tracks_near_time_multiple_candidates():
     a, b, c = _track(1, [10.0]), _track(2, [10.05]), _track(3, [50.0])
     result = candidate_tracks_near_time([a, b, c], t=10.0, tolerance_s=0.2)
     assert result == [a, b]
+
+
+# ---------------------------------------------------------------------------
+# opencv_lab_to_cielab -- bug fix 2026-08-31 (CLAUDE.md's own "no fabricated stats" rule caught a
+# real unit mismatch: crop_lab_mean/per_track_lab_median return OpenCV's 8-bit-scaled Lab, while
+# colour_reference_lab is written in TRUE CIELAB units -- see the function's own docstring).
+# ---------------------------------------------------------------------------
+
+
+def test_opencv_lab_to_cielab_white_round_trips_to_true_white():
+    """Pure white through OpenCV's own BGR2LAB is exactly [255, 128, 128] -- must convert to true
+    CIELAB [100, 0, 0], matching `colour_reference_lab: white`."""
+    raw = cv2.cvtColor(np.uint8([[[255, 255, 255]]]), cv2.COLOR_BGR2LAB).astype(np.float64)[0, 0]
+    true_lab = opencv_lab_to_cielab(raw)
+    assert np.allclose(true_lab, [100.0, 0.0, 0.0], atol=0.5)
+
+
+def test_opencv_lab_to_cielab_black_round_trips_to_true_black():
+    raw = cv2.cvtColor(np.uint8([[[0, 0, 0]]]), cv2.COLOR_BGR2LAB).astype(np.float64)[0, 0]
+    true_lab = opencv_lab_to_cielab(raw)
+    assert np.allclose(true_lab, [0.0, 0.0, 0.0], atol=0.5)
+
+
+def test_opencv_lab_to_cielab_matches_the_documented_scaling_formula():
+    """L_true = L_cv*100/255, a_true = a_cv-128, b_true = b_cv-128 -- verified directly against
+    an arbitrary raw value, not just the two degenerate white/black cases above."""
+    raw = np.array([130.0, 150.0, 90.0])
+    true_lab = opencv_lab_to_cielab(raw)
+    assert np.allclose(true_lab, [130.0 * 100.0 / 255.0, 150.0 - 128.0, 90.0 - 128.0])
+
+
+def test_opencv_lab_to_cielab_rejects_impossible_raw_values_as_the_smoking_gun():
+    """A raw OpenCV L of 130-146 (measured on real cached data, see the config's own comment) is
+    IMPOSSIBLE for true CIELAB (which caps at 100) -- this is exactly the tell that caught the
+    original bug. After conversion it must land back in the valid [0, 100] range."""
+    raw = np.array([140.0, 120.0, 135.0])  # measured-shape value, would be invalid as true CIELAB
+    true_lab = opencv_lab_to_cielab(raw)
+    assert 0.0 <= true_lab[0] <= 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -281,3 +321,50 @@ def test_combination_neither_signal_confident_stays_caption_only(monkeypatch):
     )
     assert (track_id, distance) == (None, None)
     assert evidence["agreement"] == "no_confident_signal"
+
+
+# ---------------------------------------------------------------------------
+# Regression test for the unit-mismatch bug (2026-08-31): runs the REAL colour pipeline end to
+# end (per_track_lab_median -> opencv_lab_to_cielab -> nearest_track_by_colour), only mocking
+# `decode_frames` with a synthetic single-colour frame -- no live video I/O, but nothing about the
+# Lab computation itself is mocked away. Before the fix this test fails (a raw, unconverted white
+# crop sits ~232 units from the true-CIELAB white reference, far past any sane
+# colour_match_max_distance); after the fix it must pass.
+# ---------------------------------------------------------------------------
+
+
+def test_associate_annotation_to_track_converts_units_before_colour_match_real_pipeline(
+    monkeypatch,
+):
+    frame = np.full((200, 200, 3), 255, dtype=np.uint8)  # solid white BGR
+    monkeypatch.setattr(associate_mod, "decode_frames", lambda *a, **k: iter([(0, 5.0, frame)]))
+
+    take = Take(id=0, t_start=0.0, t_end=10.0, frame_start=0, frame_end=100, kind="main")
+    box = TrackBox(
+        frame_index=50, t=5.0, bbox=BBox(x1=50, y1=50, x2=150, y2=190), conf=0.9
+    )  # height=140 >= min_box_height_px=25
+    track = Track(id=42, take_id=0, boxes=[box])
+    ann = Annotation(
+        t=5.0,
+        jersey_number=1,
+        team_colour="white",
+        action_phrase="takes a touch",
+        event_type=EventType.TOUCH,
+        raw_line="Min 0:05 player #1 in white takes a touch",
+    )
+    cfg = _annotations_config()
+
+    track_id, distance, evidence = associate_annotation_to_track(
+        "fake.mp4",
+        take,
+        [track],
+        ann,
+        colour_cfg=cfg,
+        decode_cfg={},
+        sampling_cfg=cfg["track_association"],
+        use_nvdec=False,
+    )
+
+    assert track_id == 42
+    assert distance is not None and distance < cfg["colour_match_max_distance"]
+    assert evidence["agreement"] == "colour_only"
