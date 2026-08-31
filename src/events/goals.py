@@ -588,12 +588,13 @@ def detect_goals_for_take(
     slug: str | None = None,
 ) -> tuple[list[Event], dict]:
     """Full ADR-17 pipeline for ONE take: decode a low-fps frame series spanning it, run the
-    scoreboard occurrence scan, and — ONLY when at least one occurrence event is actually found —
-    lazily compute this take's own possession runs + passes (`src/events/possession.py`) purely to
-    attribute team/scorer/assist. A take with no scoreboard activation or no increment never pays
-    that extra cost, which is what keeps this cheap on scoreboard-less footage (measured true for
-    every take of all 5 original clips + `jordan_thomas_highlight_video`, this task's own
-    verification run).
+    scoreboard occurrence scan, and — ONLY when at least one occurrence event (scoreboard- OR
+    region-sourced) is actually found — lazily compute this take's own possession runs + passes
+    (`src/events/possession.py`) to attribute team/scorer/assist for EVERY goal found, from
+    whichever source. A take with no scoreboard activation, no increment, and no region-sourced
+    goal either never pays that extra cost, which is what keeps this cheap on goal-less footage
+    (measured true for every take of all 5 original clips + `jordan_thomas_highlight_video`, this
+    task's own verification run).
 
     ADR-20 adds a SECOND, independent occurrence source alongside the scoreboard scan: when
     `goal_region_cfg`/`slug`/`frame_width` are given and a polygon exists for `slug`
@@ -605,10 +606,11 @@ def detect_goals_for_take(
     `detect_goals_goal_region`'s own docstring for why: that filter is calibrated for a different,
     countable-stat purpose and this project's own measured data shows it can reject nearly a whole
     take's ball motion, which would silently starve the goal-region precondition regardless of
-    polygon placement) -- and checked for a ball-crossing goal. Region-sourced `GOAL`s still never
-    go through team/scorer/assist attribution here (they carry no possession-run context of their
-    own to attribute from) -- they are appended to the result as-is, occurrence-only, exactly per
-    ADR-20's own scope.
+    polygon placement) -- and checked for a ball-crossing goal. Region-sourced `GOAL`s now go
+    through the SAME team/scorer/assist attribution as scoreboard-sourced ones (their own lower
+    `occurrence_confidence`, i.e. `configs/events.yaml: goal_region.confidence`, still stacks DOWN
+    through the identical attribution multipliers, so a region-sourced goal's final confidence
+    stays honestly lower than a scoreboard-sourced one's).
 
     `identity_of` is the SAME `build_take_identities` partition the caller's own event pipeline
     uses for this take (`None` for the original Phase-1 flow, which has no identity-stitching
@@ -681,8 +683,8 @@ def detect_goals_for_take(
     debug["goal_region_attempted"] = region_attempted
     debug["goal_region_events_found"] = len(region_events)
 
-    if not occurrence_events:
-        return region_events, debug
+    if not occurrence_events and not region_events:
+        return [], debug
 
     tracks_by_id = {tr.id: tr for tr in take_tracks}
     runs = possession_runs_for_take(take_balls, take_tracks, events_cfg, identity_of)
@@ -691,13 +693,13 @@ def detect_goals_for_take(
     debug["n_possession_runs"] = len(runs)
 
     events: list[Event] = []
-    for occ in occurrence_events:
+    for occ in occurrence_events + region_events:
         attributed = attribute_goal_team_and_scorer(occ, possession_events, tracks_by_id, goal_cfg)
         events.append(attributed)
         assist_event = find_assist_event(attributed, pass_events, assist_cfg)
         if assist_event is not None:
             events.append(assist_event)
-    return events + region_events, debug
+    return events, debug
 
 
 # ---------------------------------------------------------------------------

@@ -492,6 +492,131 @@ def test_detect_goals_goal_region_debounces_one_continuous_crossing():
 
 
 # ---------------------------------------------------------------------------
+# detect_goals_for_take -- Gap-2 fix: region-sourced goals now get full attribution,
+# and lazy possession/pass computation is still skipped when there is truly nothing to attribute.
+# ---------------------------------------------------------------------------
+
+
+def _no_scoreboard_decode(video_path, fps=None, start=None, end=None, scale_width=None, use_nvdec=True):
+    for i in range(2):
+        yield i, float(i), np.zeros((10, 10, 3), dtype=np.uint8)
+
+
+class _EmptyReader:
+    def readtext(self, crop):
+        return []
+
+
+def test_detect_goals_for_take_region_sourced_goal_gets_full_attribution_when_supported(
+    monkeypatch,
+):
+    """Gap 2: a region-sourced GOAL (zero scoreboard occurrence events at all) must flow through
+    the exact same team/scorer/assist attribution a scoreboard-sourced goal gets, when possession/
+    pass data supports it -- not the old, deliberately-incomplete "region goals are occurrence-only"
+    behaviour."""
+    monkeypatch.setattr(goals_mod, "decode_frames", _no_scoreboard_decode)
+
+    events_cfg = _events_config()
+    take = Take(id=0, t_start=0.0, t_end=1.0, frame_start=0, frame_end=10, kind="main")
+    frame_width = 1000.0
+    frame_height = 1000.0
+
+    # A fast, sustained rightward ball run ending inside the marked polygon's right-hand 15% of
+    # the frame -- same synthetic trajectory as the existing goal-region end-to-end test, so it is
+    # already known to fire exactly one region-sourced GOAL.
+    balls = [
+        BallDetection(
+            bbox=BBox(x1=100.0 + i * 90.0 - 5, y1=45.0, x2=100.0 + i * 90.0 + 5, y2=55.0),
+            conf=0.9,
+            frame_index=i,
+            t=i * 0.1,
+        )
+        for i in range(10)
+    ]
+    polygon = [(0.85, 0.0), (1.0, 0.0), (1.0, 1.0), (0.85, 1.0)]
+    goal_region_cfg = {"regions": {"testslug": [polygon]}}
+
+    take_tracks = [_track(1, team=0), _track(2, team=0)]
+    # Identity 1 (team 0) makes a same-colour PASS to identity 2, who then holds the LAST
+    # possession run right up to the goal -- exactly the data `attribute_goal_team_and_scorer` /
+    # `find_assist_event` need to credit a real scorer + assist.
+    possession_events = [
+        _possession_event(identity=1, raw_track_id=1, t_start=0.3, t_end=0.6, eid="poss-1"),
+        _possession_event(identity=2, raw_track_id=2, t_start=0.65, t_end=0.9, eid="poss-2"),
+    ]
+    pass_events = [_pass_event(passer=1, receiver=2, t_start=0.55, t_end=0.62, eid="pass-1")]
+    monkeypatch.setattr(goals_mod, "possession_runs_for_take", lambda *a, **k: [])
+    monkeypatch.setattr(goals_mod, "detect_possession", lambda *a, **k: possession_events)
+    monkeypatch.setattr(goals_mod, "detect_passes", lambda *a, **k: pass_events)
+
+    events, debug = goals_mod.detect_goals_for_take(
+        reader=_EmptyReader(),
+        video_path="fake.mp4",
+        take=take,
+        take_tracks=take_tracks,
+        take_balls=balls,
+        events_cfg=events_cfg,
+        identity_of=None,
+        use_nvdec=False,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        goal_region_cfg=goal_region_cfg,
+        slug="testslug",
+    )
+
+    goal_events = [e for e in events if e.type == EventType.GOAL]
+    assert len(goal_events) == 1
+    goal = goal_events[0]
+    assert goal.source == "goal_region"
+    assert goal.player_track_id == 2  # attributed scorer, not left None
+    region_cfg = events_cfg["goal_region"]
+    goal_cfg = events_cfg["goal"]
+    expected_goal_conf = region_cfg["confidence"] * goal_cfg["scorer_confidence_multiplier"]
+    assert goal.confidence == expected_goal_conf
+    # Confidence stacks down HONESTLY LOWER than the equivalent scoreboard-sourced case would --
+    # same attribution multiplier, but starting from goal_region's own lower occurrence confidence.
+    scoreboard_equivalent_conf = goal_cfg["occurrence_confidence"] * goal_cfg["scorer_confidence_multiplier"]
+    assert goal.confidence < scoreboard_equivalent_conf
+
+    assist_events = [e for e in events if e.type == EventType.ASSIST]
+    assert len(assist_events) == 1
+    assert assist_events[0].player_track_id == 1  # the passer credited with the assist
+
+
+def test_detect_goals_for_take_skips_possession_computation_when_no_goals_of_either_kind(
+    monkeypatch,
+):
+    """Cost-discipline check (the function's own docstring claim): when neither the scoreboard
+    scan nor a configured goal region produces ANY goal for this take, the expensive lazy
+    possession/pass computation must never run at all."""
+    monkeypatch.setattr(goals_mod, "decode_frames", _no_scoreboard_decode)
+
+    def _boom(*a, **k):
+        raise AssertionError("possession_runs_for_take must not be called with zero goals")
+
+    monkeypatch.setattr(goals_mod, "possession_runs_for_take", _boom)
+
+    events_cfg = _events_config()
+    take = Take(id=0, t_start=0.0, t_end=1.0, frame_start=0, frame_end=10, kind="main")
+
+    events, debug = goals_mod.detect_goals_for_take(
+        reader=_EmptyReader(),
+        video_path="fake.mp4",
+        take=take,
+        take_tracks=[],
+        take_balls=[],
+        events_cfg=events_cfg,
+        identity_of=None,
+        use_nvdec=False,
+        frame_width=None,
+        frame_height=None,
+        goal_region_cfg=None,
+        slug=None,
+    )
+    assert events == []  # no exception raised -- the lazy step was correctly never invoked
+
+
+# ---------------------------------------------------------------------------
 # check_goal_availability -- the final Golden-Rule-5 decision table
 # ---------------------------------------------------------------------------
 
