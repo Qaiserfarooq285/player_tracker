@@ -23,4 +23,13 @@
 #   clip2_77:
 #     - [[0.82, 0.35], [0.95, 0.35], [0.95, 0.55], [0.82, 0.55]]
 
-regions: {}
+regions:
+  # clip1_43: owner watched the footage and confirmed the sequence directly (2026-08-31) --
+  # player #43 passes at ~6.0s, the ball is in the net by ~7.0s, on-screen celebration follows
+  # from ~7s through at least 10.5s. Polygon located by grid-referenced inspection of the goal
+  # frame's on-screen position (static/near-static camera for this clip, CLAUDE.md §3.2): the
+  # soccer goal net's white frame spans roughly x=[0.44,0.56] y=[0.35,0.46] as a fraction of the
+  # 1600x900 reference frame used for inspection; given a small margin here since the ball's
+  # actual crossing point may sit slightly outside the net's own visible frame.
+  clip1_43:
+    - [[0.42, 0.33], [0.58, 0.33], [0.58, 0.47], [0.42, 0.47]]
