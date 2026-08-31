@@ -413,6 +413,97 @@ def test_find_assist_event_picks_the_nearest_preceding_pass():
 
 
 # ---------------------------------------------------------------------------
+# find_assist_event -- teammate check (Stage D bug fix, "streamed-gathering-treehouse" plan).
+# The docstring always claimed "a teammate pass" but the code never verified it; these tests
+# exercise the NEW `tracks_by_id`-gated re-check via the same `teammates_gate` tri-state test
+# `pass`/`tackle`/`dribble` already use.
+# ---------------------------------------------------------------------------
+
+
+def _pass_event_with_raw(
+    passer: int,
+    receiver: int,
+    passer_raw: int,
+    t_start: float,
+    t_end: float,
+    eid: str = "pass-1",
+) -> Event:
+    return Event(
+        id=eid,
+        type=EventType.PASS,
+        t_start=t_start,
+        t_end=t_end,
+        player_track_id=passer,
+        take_id=0,
+        confidence=0.3,
+        source="possession_change_teammate_heuristic",
+        evidence={
+            "passer_identity": passer,
+            "receiver_identity": receiver,
+            "passer_raw_track_id": passer_raw,
+        },
+    )
+
+
+def test_find_assist_event_credits_when_passer_confirmed_teammate_of_scorer():
+    # scorer's own track id doubles as its "raw" id here (matches the real Phase-1 flow, where
+    # identity_of is None and run.identity IS the raw Track.id -- see detect_goals_for_take's own
+    # docstring). Both on team 0 -- confirmed teammates.
+    tracks_by_id = {7: _track(7, team=0), 11: _track(11, team=0)}
+    goal_event = _scored_goal_event(t_after=100.0, scorer=11)
+    pass_events = [
+        _pass_event_with_raw(passer=7, receiver=11, passer_raw=7, t_start=97.0, t_end=98.0)
+    ]
+    cfg = _assist_cfg(assist_window_seconds=15.0)
+
+    assist = find_assist_event(goal_event, pass_events, cfg, tracks_by_id)
+    assert assist is not None
+    assert assist.player_track_id == 7
+
+
+def test_find_assist_event_rejects_when_passer_confirmed_opposing_team():
+    # Real gap this fix closes: receiver_identity == scorer matches, but passer (team 1) and
+    # scorer (team 0) are on CONFIRMED OPPOSING teams -- never a real assist.
+    tracks_by_id = {7: _track(7, team=1), 11: _track(11, team=0)}
+    goal_event = _scored_goal_event(t_after=100.0, scorer=11)
+    pass_events = [
+        _pass_event_with_raw(passer=7, receiver=11, passer_raw=7, t_start=97.0, t_end=98.0)
+    ]
+    cfg = _assist_cfg(assist_window_seconds=15.0)
+
+    assert find_assist_event(goal_event, pass_events, cfg, tracks_by_id) is None
+
+
+def test_find_assist_event_rejects_when_team_signal_not_trustworthy():
+    # `teammates_gate` returns None (untrustworthy) when either side's team_confidence is below
+    # the threshold -- same "can't tell, don't guess" convention as pass/tackle/dribble: excluded,
+    # never assumed to be a teammate just because no evidence says otherwise.
+    tracks_by_id = {
+        7: Track(id=7, take_id=0, boxes=[], team=0, team_confidence=0.1),
+        11: _track(11, team=0),
+    }
+    goal_event = _scored_goal_event(t_after=100.0, scorer=11)
+    pass_events = [
+        _pass_event_with_raw(passer=7, receiver=11, passer_raw=7, t_start=97.0, t_end=98.0)
+    ]
+    cfg = _assist_cfg(assist_window_seconds=15.0)
+
+    assert find_assist_event(goal_event, pass_events, cfg, tracks_by_id) is None
+
+
+def test_find_assist_event_skips_teammate_check_when_tracks_by_id_not_given():
+    # Backward compatibility: tracks_by_id=None (the default) preserves the exact pre-fix
+    # behaviour -- no re-check performed at all.
+    goal_event = _scored_goal_event(t_after=100.0, scorer=11)
+    pass_events = [_pass_event(passer=7, receiver=11, t_start=97.0, t_end=98.0)]
+    cfg = _assist_cfg(assist_window_seconds=15.0)
+
+    assist = find_assist_event(goal_event, pass_events, cfg)
+    assert assist is not None
+    assert assist.player_track_id == 7
+
+
+# ---------------------------------------------------------------------------
 # detect_goals_goal_region (ADR-20) -- acceptance #4
 # ---------------------------------------------------------------------------
 
@@ -470,7 +561,9 @@ def test_detect_goals_goal_region_crossing_without_preceding_fast_window_does_no
 def test_detect_goals_goal_region_crossing_outside_shot_window_does_not_fire():
     cfg = _goal_region_cfg(regions={"someslug": [SQUARE_POLYGON]})
     balls = [_region_ball(t=10.0, cx=0.95)]
-    fast_ball_windows = [(0.5, 1.0)]  # ended 9s before the crossing -- far outside shot_window_s=3.0
+    fast_ball_windows = [
+        (0.5, 1.0)
+    ]  # ended 9s before the crossing -- far outside shot_window_s=3.0
     events = detect_goals_goal_region(balls, fast_ball_windows, "someslug", cfg, take_id=0)
     assert events == []
 
@@ -497,7 +590,9 @@ def test_detect_goals_goal_region_debounces_one_continuous_crossing():
 # ---------------------------------------------------------------------------
 
 
-def _no_scoreboard_decode(video_path, fps=None, start=None, end=None, scale_width=None, use_nvdec=True):
+def _no_scoreboard_decode(
+    video_path, fps=None, start=None, end=None, scale_width=None, use_nvdec=True
+):
     for i in range(2):
         yield i, float(i), np.zeros((10, 10, 3), dtype=np.uint8)
 
@@ -575,7 +670,9 @@ def test_detect_goals_for_take_region_sourced_goal_gets_full_attribution_when_su
     assert goal.confidence == expected_goal_conf
     # Confidence stacks down HONESTLY LOWER than the equivalent scoreboard-sourced case would --
     # same attribution multiplier, but starting from goal_region's own lower occurrence confidence.
-    scoreboard_equivalent_conf = goal_cfg["occurrence_confidence"] * goal_cfg["scorer_confidence_multiplier"]
+    scoreboard_equivalent_conf = (
+        goal_cfg["occurrence_confidence"] * goal_cfg["scorer_confidence_multiplier"]
+    )
     assert goal.confidence < scoreboard_equivalent_conf
 
     assist_events = [e for e in events if e.type == EventType.ASSIST]

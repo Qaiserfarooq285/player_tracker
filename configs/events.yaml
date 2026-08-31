@@ -152,6 +152,13 @@ assist:
   max_confidence: 0.35 # HARD CEILING -- matches `pass.max_confidence` (Golden Rule 5: an assist
   # can never read more certain than the pass heuristic it is built on).
   min_confidence: 0.1
+  team_confidence_threshold: 0.5 # "streamed-gathering-treehouse" plan, Stage D bug fix: see
+  # `pass.team_confidence_threshold` -- identical value/reasoning, reused here (not re-measured)
+  # because `find_assist_event` now re-verifies the passer is a CONFIRMED TEAMMATE of the credited
+  # scorer via the same `teammates_gate` tri-state test `pass`/`tackle`/`dribble` already use,
+  # closing the gap where the function's own docstring claimed "a teammate pass" but never actually
+  # checked it (latent under the default `pass.same_colour_required: true`, but a real gap when
+  # that owner-facing escape hatch is set `false` for footage with unreliable colour clustering).
 
 goal_region:
   # ADR-20 (owner, 2026-08-27) -- a SECOND, independent goal-occurrence source alongside `goal`'s

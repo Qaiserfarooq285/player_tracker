@@ -56,7 +56,12 @@ from pydantic import BaseModel
 from src.common.logging import get_logger
 from src.common.types import BallDetection, Event, EventType, Take, Track
 from src.common.video import decode_frames
-from src.events.possession import detect_passes, detect_possession, possession_runs_for_take
+from src.events.possession import (
+    detect_passes,
+    detect_possession,
+    possession_runs_for_take,
+    teammates_gate,
+)
 from src.events.segments import find_threshold_segments
 from src.events.shots import ball_speed_series
 from src.identity.jersey_ocr import free_easyocr_reader, load_easyocr_reader
@@ -410,15 +415,38 @@ def attribute_goal_team_and_scorer(
 
 
 def find_assist_event(
-    goal_event: Event, pass_events: list[Event], assist_cfg: dict
+    goal_event: Event,
+    pass_events: list[Event],
+    assist_cfg: dict,
+    tracks_by_id: dict[int, Track] | None = None,
 ) -> Event | None:
     """ADR-17 step 4 — the owner's own rule, verbatim: "if the target pass the ball and the other
     score goal should be assist". The nearest PRECEDING `PASS` event
     (`src/events/possession.py::detect_passes`) whose `evidence['receiver_identity']` equals
     `goal_event`'s own credited scorer, ending within `assist_cfg['assist_window_seconds']` of the
-    goal, becomes an `ASSIST` `Event` credited to the PASSER (`player_track_id` = the pass event's
-    own `player_track_id`). Returns `None` — never fabricated — when the scorer itself is unknown
-    (`goal_event.player_track_id is None`) or no qualifying pass exists.
+    goal, from a CONFIRMED TEAMMATE of the scorer, becomes an `ASSIST` `Event` credited to the
+    PASSER (`player_track_id` = the pass event's own `player_track_id`). Returns `None` — never
+    fabricated — when the scorer itself is unknown (`goal_event.player_track_id is None`) or no
+    qualifying teammate pass exists.
+
+    **Bug fix ("streamed-gathering-treehouse" plan, Stage D).** This docstring always claimed "a
+    teammate pass", but the code never actually checked it — it only matched
+    `evidence['receiver_identity'] == scorer`. Under the DEFAULT config
+    (`configs/events.yaml: pass.same_colour_required: true`, ADR-20) every `PASS` event already
+    implies same-colour passer/receiver by construction (`src/events/possession.py::detect_passes`
+    only emits `PASS`, never `TURNOVER`, when `teammates_gate` is `True`), so this was latent.
+    But `pass.same_colour_required: false` is an explicit, documented owner-facing escape hatch
+    for footage where colour clustering is unreliable — under that config a `PASS` can go to an
+    OPPOSING-coloured receiver, and if that receiver later becomes the credited scorer (e.g. via a
+    deflection/own-goal-shaped possession sequence), the old code would have credited an assist to
+    a non-teammate. Fix: when `tracks_by_id` is supplied, re-verify passer-vs-scorer team agreement
+    directly via the SAME `teammates_gate` tri-state test `pass`/`tackle`/`dribble` already use —
+    `True` (confidently same team) is required; `False` (confidently opposing) or `None` (team
+    signal not trustworthy enough to judge) both EXCLUDE that candidate pass, same "can't tell,
+    don't guess" convention as every other team-gated heuristic in this codebase (Golden Rule 5).
+    `tracks_by_id=None` (no track data available to the caller) skips this re-check entirely,
+    preserving the exact pre-fix behaviour — every real caller (`detect_goals_for_take`) always has
+    `tracks_by_id` on hand and passes it.
     """
     scorer = goal_event.player_track_id
     if scorer is None:
@@ -432,6 +460,15 @@ def find_assist_event(
         and ev.evidence.get("receiver_identity") == scorer
         and window_start <= ev.t_end <= goal_event.t_end
     ]
+    if tracks_by_id is not None:
+        threshold = assist_cfg["team_confidence_threshold"]
+        candidates = [
+            ev
+            for ev in candidates
+            if (passer_raw := ev.evidence.get("passer_raw_track_id", ev.player_track_id))
+            is not None
+            and teammates_gate(passer_raw, scorer, tracks_by_id, threshold) is True
+        ]
     if not candidates:
         return None
     supporting_pass = max(candidates, key=lambda ev: ev.t_end)
@@ -696,7 +733,7 @@ def detect_goals_for_take(
     for occ in occurrence_events + region_events:
         attributed = attribute_goal_team_and_scorer(occ, possession_events, tracks_by_id, goal_cfg)
         events.append(attributed)
-        assist_event = find_assist_event(attributed, pass_events, assist_cfg)
+        assist_event = find_assist_event(attributed, pass_events, assist_cfg, tracks_by_id)
         if assist_event is not None:
             events.append(assist_event)
     return events, debug
