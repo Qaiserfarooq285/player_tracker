@@ -28,14 +28,17 @@ def _event(
     )
 
 
-def test_timeline_excludes_save_and_possession():
+def test_timeline_includes_save_but_excludes_possession():
+    # Stage 6 (2026-08-31): SAVE gained a timeline row (owner's explicit "every save (for
+    # goalkeepers)" ask, CLAUDE.md §13.2/§13.3) -- POSSESSION still has none, it only feeds the
+    # "Possession Time" summary stat.
     events = [
         _event(EventType.SAVE, 1.0),
         _event(EventType.POSSESSION, 2.0),
         _event(EventType.TOUCH, 3.0),
     ]
     rows = build_event_timeline_rows(events)
-    assert [r["label"] for r in rows] == ["Touch"]
+    assert [r["label"] for r in rows] == ["Save", "Touch"]
 
 
 def test_timeline_is_chronological():

@@ -20,9 +20,9 @@ from src.highlights.reel import build_reel
 
 logger = get_logger(__name__)
 
-# CLAUDE.md §13.2's Event Timeline table lists exactly these row types (Save/Possession are
-# deliberately NOT among them — Possession feeds the "Possession Time" summary stat instead, and
-# the owner's template simply has no "Save" row; followed literally, not padded out).
+# CLAUDE.md §13.2's Event Timeline table lists exactly these row types. POSSESSION is
+# deliberately NOT among them -- it feeds the "Possession Time" summary stat instead, and the
+# owner's template has no per-possession timeline row; followed literally, not padded out.
 _TIMELINE_EVENT_TYPES = {
     EventType.TOUCH: "Touch",
     EventType.PASS: "Pass",
@@ -32,6 +32,12 @@ _TIMELINE_EVENT_TYPES = {
     EventType.DRIBBLE: "Dribble",
     EventType.SHOT: "Shot",
     EventType.TACKLE: "Tackle",
+    EventType.SAVE: "Save",  # owner (2026-08-31): "every save (for goalkeepers)" is an explicit
+    # timeline row in their category list (CLAUDE.md §13.2/§13.3) -- the detector
+    # (src/events/saves.py, ADR-13) already existed and was already counted in the summary line
+    # ("Saves: N"), it just had no path into the timeline table below it. This was the one real
+    # gap Stage 6 found; every other listed category already had both a summary line and a
+    # timeline row.
     EventType.GOAL: "Goal",
     EventType.ASSIST: "Assist",  # ADR-17: real detector now exists (src/events/goals.py) --
     # previously omitted since EventType.ASSIST didn't exist at all.
@@ -92,7 +98,7 @@ def build_event_timeline_rows(events: list[Event]) -> list[dict]:
         elif ev.type in _TIMELINE_EVENT_TYPES:
             label = _TIMELINE_EVENT_TYPES[ev.type]
         else:
-            continue  # SAVE/POSSESSION: not a template timeline row, see module docstring
+            continue  # POSSESSION: not a template timeline row, see module docstring above
         rows.append(
             {
                 "t_start": ev.t_start,
