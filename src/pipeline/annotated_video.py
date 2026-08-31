@@ -307,6 +307,21 @@ def _draw_box_with_label(
     )
 
 
+def _target_panel_header(identity: TakeIdentityResult) -> str:
+    """The panel's own headline for a verified take -- owner-reported bug fix, 2026-08-31:
+    "VERIFIED" used to be shown unconditionally, even when the drawn BOX itself was only a
+    kit-colour pick among many identically-dressed teammates (no real digit read backing it) --
+    confirmed on real footage to have silently boxed the WRONG player while still claiming
+    "VERIFIED" (Golden Rule 5: never display more certainty than the evidence supports). Split out
+    as its own pure function so this exact text decision is directly unit-testable without a real
+    frame/cv2 draw call -- see `TakeIdentityResult.association_confirmed_by_jersey`'s own docstring
+    for the full story.
+    """
+    if identity.association_confirmed_by_jersey:
+        return f"TARGET #{identity.jersey_number} -- VERIFIED"
+    return f"TARGET #{identity.jersey_number} -- COLOUR MATCH (jersey unconfirmed)"
+
+
 def _draw_live_panel(
     frame: np.ndarray,
     take_id: int | None,
@@ -315,7 +330,7 @@ def _draw_live_panel(
 ) -> None:
     lines: list[tuple[str, tuple[int, int, int]]] = []
     if identity is not None and identity.status == "verified":
-        lines.append((f"TARGET #{identity.jersey_number} -- VERIFIED", _PANEL_HEADER_COLOR))
+        lines.append((_target_panel_header(identity), _PANEL_HEADER_COLOR))
         for etype in _PANEL_EVENT_TYPES:
             lines.append(
                 (f"{_PANEL_LABELS[etype]}: {(counts or {}).get(etype, 0)}", _PANEL_TEXT_COLOR)

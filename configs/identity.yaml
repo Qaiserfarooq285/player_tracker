@@ -40,6 +40,15 @@ crop:
   torso_crop_expand: 0.08 # expand the candidate track's own bbox by this fraction on each side
   # before cropping, so a jersey number sitting near the box edge (loose bbox, motion blur) isn't
   # clipped off.
+  crop_upscale_factor: 3.0 # owner-reported bug fix, 2026-08-31: standard OCR practice, upscale the
+  # crop (`src.identity.jersey_ocr.upscale_crop`, `cv2.INTER_CUBIC`) before handing it to EasyOCR/
+  # Gemini. Reasoned from the SAME numbers `min_crop_height_frac` above already cites: a real 720p
+  # box (mean 71.9px, median 70.7px) carries a digit glyph roughly 12-18% of that height, i.e.
+  # ~8.6-17.5px -- at or below EasyOCR's own practical minimum reliable text height (~15-20px,
+  # identity.yaml's own long-standing estimate). 3x brings that to ~25.8-52.5px, comfortably above
+  # that floor. Does not fabricate detail that was never there (the crop is still whatever the
+  # camera actually captured) -- it only presents the SAME pixels at a scale both the classical OCR
+  # engine and the VLM are documented to read more reliably at.
 
 ocr:
   engine: easyocr # Apache-2.0 (CLAUDE.md §7), `ocr` extra

@@ -213,10 +213,28 @@ jersey_reid:
   enabled: true # global off-switch: when false, manual-mode identity association falls back to
   # the pre-Stage-B colour(+arrow)-only behaviour unconditionally (e.g. no GEMINI_API_KEY
   # available at all makes VLM escalation moot, but OCR alone still runs when enabled).
-  max_vlm_escalations_per_call: 2 # cost bound for ONE `read_jersey_number_for_candidates` call
-  # (one lock attempt, or one reacquisition attempt for one annotation): at most this many
-  # OCR-ambiguous candidate crops are ever escalated to Gemini before giving up on that call.
-  # Deliberately much smaller than identity.yaml's per-TAKE cap of 6 -- this call already only
-  # fires at lock-establishment and at a reacquisition gap (bounded to at most a handful of times
-  # per take), so even a small per-call budget keeps the whole-video VLM cost low; measured real
-  # cost per test video is reported in the plan's own verification stage, not assumed here.
+  # ⚠️ REVISED 2026-08-31 -- owner-reported real misidentification on `chelsea_burnley_target10`
+  # (annotation_report.json, t=57.0s): a colour-only lock silently picked the WRONG one of ~10+
+  # identically-dressed teammates; the ORIGINAL one-crop-per-candidate design gave jersey
+  # confirmation only a single snapshot's worth of odds to rescue it, and that one snapshot's own
+  # box height (70-97px across the whole track's lifespan, measured directly) sat at/below
+  # EasyOCR's reliable floor. Two changes below close this gap: sample multiple frames across each
+  # CANDIDATE's own lifespan (not one instant) and require temporal agreement
+  # (`identity.yaml: aggregation`, reused directly) before trusting a digit, and raise the VLM
+  # budget to match (a single call almost never wins now that the pattern is "vote across several
+  # tries", not "one shot").
+  max_vlm_escalations_per_call: 6 # was 2 -- raised to match identity.yaml's OWN per-take budget
+  # (same reasoning: this call now samples MULTIPLE frames per candidate, mirroring a scaled-down
+  # version of ADR-15's own per-take verification loop, so it needs a comparable budget to actually
+  # accumulate >= aggregation.min_agreeing_frames real reads rather than exhausting itself on the
+  # very first ambiguous crop). Still a hard ceiling shared across EVERY candidate in this one
+  # call, not per-candidate -- a take with many same-kit candidates still cannot turn this into an
+  # unbounded VLM scan; real measured cost per test video is reported in the plan's own
+  # verification stage, not assumed here.
+  max_frames_per_candidate: 3 # owner-reported fix: sample up to this many frames spread across
+  # EACH candidate's own box lifespan (`src.annotations.associate._candidate_target_timestamps`),
+  # not just one crop near the annotation's own instant -- a player side-on at that exact moment
+  # may be facing the camera elsewhere in the same track. Reasoned (not separately measured): the
+  # SAME order of magnitude as `identity.yaml: aggregation.min_agreeing_frames` (2) plus one spare
+  # try, since >= 2 independent AGREEING reads are required before a candidate counts as confirmed
+  # -- 3 attempts gives a real chance at 2 agreeing even if one of the three is ambiguous/wrong.

@@ -52,6 +52,7 @@ from src.identity.jersey_ocr import (
     free_easyocr_reader,
     load_easyocr_reader,
     read_jersey_digits,
+    upscale_crop,
 )
 from src.identity.jersey_vlm import classify_jersey_number
 from src.track.tracker import assign_take_id
@@ -93,6 +94,23 @@ class TakeIdentityResult(BaseModel):
     # other verification path, including the case where it CONTRADICTS an OCR/VLM majority
     # (Golden Rule 5: never hide contradicting evidence, even though Golden Rule 4 has the human's
     # own authority win).
+    association_confirmed_by_jersey: bool = True  # owner-reported bug fix, 2026-08-31: this
+    # take's `status == "verified"` conflates TWO different claims -- "the jersey NUMBER is
+    # trustworthy" (true for both the ADR-15 OCR/VLM path AND ADR-19's human-authored sidecar) and
+    # "the drawn BOX is confidently the right physical player" (only true when a real digit read,
+    # not just kit-colour proximity among many identically-dressed teammates, backs the
+    # association). Confirmed on real broadcast footage (`chelsea_burnley_target10`,
+    # `output/.../annotation_report.json`, t=57.0s): a colour-only lock silently picked the WRONG
+    # teammate (visually confirmed #8, not the claimed #10) among ~10+ same-kit candidates, yet the
+    # rendered video said "TARGET #10 -- VERIFIED" -- displaying more certainty than the evidence
+    # supported (Golden Rule 5). Default `True` preserves the ADR-15 path's own existing, honest
+    # meaning (its own `status="verified"` already IS a real digit-read confirmation via
+    # `aggregate_take_identity`); ADR-19's manual-mode path (`src/pipeline/manual_events.py`) sets
+    # this explicitly per take, `True` only when at least one of that take's own annotations
+    # resolved via a `jersey_*` `association_signal` (`src/annotations/associate.py`), `False` when
+    # every resolution was colour(+arrow)-only -- the renderer
+    # (`src/pipeline/annotated_video.py::_draw_live_panel`) reads this to show "JERSEY CONFIRMED"
+    # vs. "COLOUR MATCH (jersey unconfirmed)" instead of a blanket "VERIFIED".
 
 
 class IdentityReport(BaseModel):
@@ -322,7 +340,7 @@ def _collect_reads_for_take(
             counters["n_too_small"] += 1
             continue
         counters["n_crops_considered"] += 1
-        crop = frame[y1:y2, x1:x2]
+        crop = upscale_crop(frame[y1:y2, x1:x2], crop_cfg["crop_upscale_factor"])
 
         ocr_read = read_jersey_digits(reader, crop, ocr_cfg)
         if ocr_read.is_confident:

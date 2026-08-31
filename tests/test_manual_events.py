@@ -512,6 +512,9 @@ def test_initial_lock_prefers_confident_jersey_read_over_colour_pick(monkeypatch
     assert entry["association_signal"] == "jersey_ocr"
     assert entry["jersey_colour_disagreement"] == {"colour_track_id": 5, "jersey_track_id": 9}
     assert identity_by_take[0].location_track_ids == [9]
+    # owner-reported bug fix, 2026-08-31: a real jersey-number confirmation means the renderer's
+    # panel may honestly say "VERIFIED", not just "COLOUR MATCH (jersey unconfirmed)".
+    assert identity_by_take[0].association_confirmed_by_jersey is True
 
 
 def test_initial_lock_falls_back_to_colour_when_jersey_read_finds_nothing(monkeypatch):
@@ -547,6 +550,9 @@ def test_initial_lock_falls_back_to_colour_when_jersey_read_finds_nothing(monkey
     assert entry["track_id"] == 5
     assert entry["association_signal"] == "colour"
     assert "jersey_colour_disagreement" not in entry
+    # owner-reported bug fix, 2026-08-31: colour-only resolution must NOT claim "VERIFIED" --
+    # the renderer needs this False to show "COLOUR MATCH (jersey unconfirmed)" instead.
+    assert identity_by_take[0].association_confirmed_by_jersey is False
 
 
 def test_reacquisition_accepts_jersey_confirmed_candidate_outside_locked_chain(monkeypatch):

@@ -14,12 +14,35 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+import cv2
 import numpy as np
 from pydantic import BaseModel
 
 from src.common.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def upscale_crop(crop_bgr: np.ndarray, factor: float) -> np.ndarray:
+    """Upscale a jersey-number crop before handing it to EasyOCR/Gemini -- owner-reported bug fix,
+    2026-08-31: standard, well-established OCR practice for small/blurry text (the pixels are
+    genuinely low-detail either way; upscaling does not fabricate information, it just gives both
+    the classical OCR engine and the VLM a larger, smoother version of the same evidence to work
+    from, matching how EasyOCR/most OCR pipelines are documented to be used on small source text).
+    `factor <= 1.0` or a degenerate (zero-area) crop is a no-op, never a crash. `cv2.INTER_CUBIC`
+    is used deliberately (not the default `INTER_LINEAR`) -- it produces smoother, less blocky
+    edges on small upscaled text, which is what actually helps a downstream digit read.
+    Reused identically by `src/annotations/associate.py` (Stage B re-identification) and
+    `src/identity/verify.py` (ADR-15's own per-take verification) -- the same crop-legibility
+    limitation applies to both, confirmed on real 720p broadcast footage where a locked track's
+    own box height measured only ~70-97px across its whole lifespan (CLAUDE.md §3.2's own
+    "resolution ceiling" territory, not something either caller should solve independently).
+    """
+    if factor <= 1.0 or crop_bgr.size == 0:
+        return crop_bgr
+    height, width = crop_bgr.shape[:2]
+    new_size = (max(1, round(width * factor)), max(1, round(height * factor)))
+    return cv2.resize(crop_bgr, new_size, interpolation=cv2.INTER_CUBIC)
 
 
 class OcrRead(BaseModel):

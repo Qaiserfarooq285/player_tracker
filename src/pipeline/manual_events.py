@@ -201,6 +201,11 @@ def build_manual_identity_by_take(
                 )
 
             associated_ids: set[int] = set()
+            any_jersey_confirmed = False  # owner-reported bug fix 2026-08-31: True only when AT
+            # LEAST ONE of this take's own annotations actually resolved via a real digit read
+            # (association_signal starting "jersey_"), never just because SOME track got a
+            # colour-only box -- feeds TakeIdentityResult.association_confirmed_by_jersey so the
+            # renderer never claims more certainty ("VERIFIED") than the evidence supports.
             locked_chain_id_by_jersey: dict[int, int] = {}
             for ann in sorted(anns, key=lambda a: a.t):
                 locked_chain_id = (
@@ -308,6 +313,11 @@ def build_manual_identity_by_take(
                                 reader,
                                 gemini_api_key,
                                 use_nvdec,
+                                # bug fix 2026-08-31: give colour's OWN pick first claim on the
+                                # shared VLM budget -- real broadcast data showed a crowded field
+                                # of near-time candidates could exhaust the budget on unrelated
+                                # players before ever reaching the one colour already selected.
+                                priority_track_id=track_id,
                             )
                         )
                         arrow_evidence = {
@@ -346,6 +356,8 @@ def build_manual_identity_by_take(
                 }
                 if track_id is not None:
                     associated_ids.add(track_id)
+                if association_signal.startswith("jersey_"):
+                    any_jersey_confirmed = True
 
             if not associated_ids:
                 logger.info(
@@ -372,6 +384,7 @@ def build_manual_identity_by_take(
                 evidence_frames=[],
                 location_method="manual_annotation_colour_match",
                 location_track_ids=sorted(associated_ids),
+                association_confirmed_by_jersey=any_jersey_confirmed,
             )
     finally:
         if reader is not None:

@@ -16,6 +16,7 @@ from src.pipeline.annotated_video import (
     _nearest_tracked_bbox,
     _NumberProgress,
     _SortedTimeIndex,
+    _target_panel_header,
     _tracked_goal_bboxes_for_take,
     red_box_track_ids,
 )
@@ -77,7 +78,10 @@ def test_nearest_by_time_empty_list_returns_none():
 
 
 def _identity(
-    status: str, jersey_number: int | None, location_track_ids: list[int]
+    status: str,
+    jersey_number: int | None,
+    location_track_ids: list[int],
+    association_confirmed_by_jersey: bool = True,
 ) -> TakeIdentityResult:
     return TakeIdentityResult(
         take_id=0,
@@ -87,6 +91,7 @@ def _identity(
         evidence_frames=[1, 2],
         location_method="arrow_vote",
         location_track_ids=location_track_ids,
+        association_confirmed_by_jersey=association_confirmed_by_jersey,
     )
 
 
@@ -102,6 +107,22 @@ def test_red_box_track_ids_unverified_take_returns_empty_never_a_fallback():
 
 def test_red_box_track_ids_none_identity_returns_empty():
     assert red_box_track_ids(None) == set()
+
+
+# ---------------------------------------------------------------------------
+# _target_panel_header -- owner-reported bug fix, 2026-08-31: never display "VERIFIED" when the
+# drawn box was only a colour pick with no real digit confirmation behind it (Golden Rule 5).
+# ---------------------------------------------------------------------------
+
+
+def test_target_panel_header_says_verified_when_jersey_confirmed():
+    identity = _identity("verified", 10, [208], association_confirmed_by_jersey=True)
+    assert _target_panel_header(identity) == "TARGET #10 -- VERIFIED"
+
+
+def test_target_panel_header_says_colour_match_when_jersey_unconfirmed():
+    identity = _identity("verified", 10, [208], association_confirmed_by_jersey=False)
+    assert _target_panel_header(identity) == "TARGET #10 -- COLOUR MATCH (jersey unconfirmed)"
 
 
 # ---------------------------------------------------------------------------
