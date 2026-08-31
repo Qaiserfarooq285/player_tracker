@@ -23,13 +23,23 @@
 #   clip2_77:
 #     - [[0.82, 0.35], [0.95, 0.35], [0.95, 0.55], [0.82, 0.55]]
 
-regions:
-  # clip1_43: owner watched the footage and confirmed the sequence directly (2026-08-31) --
-  # player #43 passes at ~6.0s, the ball is in the net by ~7.0s, on-screen celebration follows
-  # from ~7s through at least 10.5s. Polygon located by grid-referenced inspection of the goal
-  # frame's on-screen position (static/near-static camera for this clip, CLAUDE.md §3.2): the
-  # soccer goal net's white frame spans roughly x=[0.44,0.56] y=[0.35,0.46] as a fraction of the
-  # 1600x900 reference frame used for inspection; given a small margin here since the ball's
-  # actual crossing point may sit slightly outside the net's own visible frame.
-  clip1_43:
-    - [[0.42, 0.33], [0.58, 0.33], [0.58, 0.47], [0.42, 0.47]]
+regions: {}
+# clip1_43's own hand-typed polygon (owner-confirmed 2026-08-31, goal ~7.0s) lived here through
+# the "streamed-gathering-treehouse" plan's Stage C -- REMOVED 2026-08-31 (Stage G) after
+# confirming, with two real extracted frames (t=6.5s and t=7.0s of
+# output/clip1_43/original_annotated_video.mp4), that Stage C's own auto-tracked goal structure
+# (src/goal/detect.py) sits directly on the real goal frame at both timestamps -- the same anti-
+# pattern (a hand-typed polygon for one specific clip) this whole plan exists to make unnecessary,
+# now genuinely covered automatically. This is the exact scenario this file's own header
+# documents as the intended lifecycle: a manual polygon stays alive ONLY as a fallback for a take
+# Stage C can't confidently localize; clip1_43 is not (any more) such a take.
+#
+# Honest caveat, not swept under the rug: removing this polygon does not change clip1_43's own
+# `Goals: not available` outcome either way. Direct comparison (manual-only vs Stage-C-detected
+# geometry, same cached track/ball data) showed BOTH report "not available" -- the real blocker is
+# a SEPARATE, pre-existing precondition in `detect_goals_goal_region` (the ball's own measured
+# speed on this footage stays elevated for nearly the whole take, so `find_threshold_segments`
+# never reports a "fast window" ENDING shortly before the ball's actual polygon crossing, which
+# `detect_goals_goal_region` requires) -- unrelated to which geometry source supplies the polygon,
+# and out of this plan's stated scope ("the polygon TEST itself stays, only where the polygon
+# comes from changes"). Not fixed here; flagged as a genuine limitation in the plan's own report.
