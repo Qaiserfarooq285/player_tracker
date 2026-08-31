@@ -17,6 +17,7 @@ fast path already does — see `_stream_encode`.
 
 from __future__ import annotations
 
+import math
 import subprocess
 from bisect import bisect_left, bisect_right
 from pathlib import Path
@@ -25,9 +26,10 @@ import cv2
 import numpy as np
 
 from src.common.logging import get_logger
-from src.common.types import BallDetection, Event, EventType, Take, Track
+from src.common.types import BallDetection, BBox, Event, EventType, Take, Track
 from src.common.video import decode_frames, probe
 from src.common.viz import draw_ball
+from src.goal.detect import GoalStructure, goal_bbox_at, take_motion_score
 from src.identity.verify import TakeIdentityResult
 from src.pipeline.player_output import _TIMELINE_EVENT_TYPES, _key_moment_label
 from src.track.tracker import assign_take_id
@@ -401,7 +403,9 @@ def _draw_goal_regions(frame: np.ndarray, polygons: list[np.ndarray]) -> None:
     (the default, no region configured for this slug), never a placeholder/"not configured" note
     (Golden Rule 5 spirit: don't manufacture visual noise for an absent feature)."""
     for pts in polygons:
-        cv2.polylines(frame, [pts], isClosed=True, color=_GOAL_REGION_COLOR, thickness=_GOAL_REGION_THICKNESS)
+        cv2.polylines(
+            frame, [pts], isClosed=True, color=_GOAL_REGION_COLOR, thickness=_GOAL_REGION_THICKNESS
+        )
         label_x, label_y = int(pts[0][0][0]), int(pts[0][0][1])
         cv2.putText(
             frame,
@@ -413,6 +417,81 @@ def _draw_goal_regions(frame: np.ndarray, polygons: list[np.ndarray]) -> None:
             _GOAL_REGION_LABEL_FONT_THICKNESS,
             cv2.LINE_AA,
         )
+
+
+# ---------------------------------------------------------------------------
+# Stage E ("streamed-gathering-treehouse" plan) -- draw Stage C's own AUTO-TRACKED goal structure,
+# not just the static manual configs/goal_region.yaml polygon (still drawn as a fallback, see
+# render_full_annotated_video's own priority rule below).
+# ---------------------------------------------------------------------------
+
+
+def _tracked_goal_bboxes_for_take(
+    goal_structure: GoalStructure,
+    video_path: str | Path,
+    take: Take,
+    hardware_cfg: dict,
+    profile_cfg: dict,
+    goal_structure_cfg: dict,
+    use_nvdec: bool = True,
+) -> list[tuple[float, BBox]]:
+    """`[(anchor_t, native_bbox), ...]` across `take` -- the SAME anchor-timestamp-generation +
+    `src.goal.detect.goal_bbox_at` query pattern as `src.events.goals._tracked_polygons_for_take`,
+    independently duplicated here per CLAUDE.md §10's own "stages independently runnable/
+    debuggable" convention (same precedent as `_effective_frame_size`'s own verbatim copy between
+    `src/pipeline/run.py` and `extended_output.py`). Returns NATIVE pixel boxes directly -- unlike
+    `goals.py`'s own detect-pixel-fraction conversion, this renderer already decodes at native
+    resolution (`scale_width=None` below), so no scaling is needed at all.
+    """
+    tracking_cfg = goal_structure_cfg["tracking"]
+    motion_cfg = profile_cfg["motion"]
+    motion_score = take_motion_score(video_path, take, hardware_cfg, profile_cfg, use_nvdec)
+    interval = (
+        tracking_cfg["min_reestimate_interval_s"]
+        if motion_score > tracking_cfg["reestimate_motion_score_threshold"]
+        else tracking_cfg["max_reestimate_interval_s"]
+    )
+    duration = max(take.t_end - take.t_start, 1e-3)
+    n_anchors = max(1, min(10, math.ceil(duration / interval)))
+    anchor_ts = [take.t_start + duration * (i + 0.5) / n_anchors for i in range(n_anchors)]
+    return [
+        (
+            t,
+            goal_bbox_at(
+                goal_structure,
+                video_path,
+                t,
+                take,
+                motion_score,
+                tracking_cfg,
+                motion_cfg,
+                use_nvdec,
+            ),
+        )
+        for t in anchor_ts
+    ]
+
+
+def _nearest_tracked_bbox(anchors: list[tuple[float, BBox]], t: float) -> BBox | None:
+    """Whichever precomputed anchor sits closest in time to `t` -- a cheap in-memory lookup (no
+    I/O), never a fresh `goal_bbox_at` call per rendered frame (that would mean a fresh decode +
+    affine fit for every one of a multi-minute render's thousands of frames)."""
+    if not anchors:
+        return None
+    return min(anchors, key=lambda item: abs(item[0] - t))[1]
+
+
+def _bbox_to_polygon(bbox: BBox) -> np.ndarray:
+    """A `BBox` as a `cv2.polylines`-ready 4-corner `int32` array -- the same shape
+    `_prepare_goal_region_polygons` already produces for the manual polygon path, so
+    `_draw_goal_regions` draws either source identically."""
+    pts = [
+        (int(round(bbox.x1)), int(round(bbox.y1))),
+        (int(round(bbox.x2)), int(round(bbox.y1))),
+        (int(round(bbox.x2)), int(round(bbox.y2))),
+        (int(round(bbox.x1)), int(round(bbox.y2))),
+    ]
+    return np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
 
 
 def _draw_cut_banner(frame: np.ndarray, take_id: int, verified: bool) -> None:
@@ -533,6 +612,10 @@ def render_full_annotated_video(
     detect_frame_height: float,
     use_nvdec: bool = True,
     goal_region_cfg: dict | None = None,
+    goal_structures_by_take: dict[int, GoalStructure] | None = None,
+    goal_structure_cfg: dict | None = None,
+    hardware_cfg: dict | None = None,
+    profile_cfg: dict | None = None,
 ) -> Path:
     """Render CLAUDE.md §13.1's primary output for one video: the WHOLE input, at native
     resolution/fps, red-boxed only during known-identity takes, green everywhere else, with a
@@ -543,6 +626,15 @@ def render_full_annotated_video(
     cyan outline on every frame; absent for every one of this project's clips until the owner
     marks one (`_prepare_goal_region_polygons` returns `[]` and nothing is drawn -- Golden Rule 5:
     no placeholder for an unconfigured feature).
+
+    `goal_structures_by_take`/`goal_structure_cfg`/`hardware_cfg`/`profile_cfg` (Stage C/D,
+    "streamed-gathering-treehouse" plan) draw Stage C's own AUTO-TRACKED goal box instead, per
+    take: a take with a confident `GoalStructure` gets ITS tracked box drawn (never the manual
+    polygon at the same time -- one box on screen, matching whichever source
+    `src/events/goals.py::detect_goals_for_take` actually used for that take's own goal/assist
+    reasoning); a take with none falls back to the manual `goal_region_cfg` polygon exactly as
+    before. All four default to `None` -- omitting any of them draws only the manual polygon (or
+    nothing), the exact pre-Stage-C/D behaviour, never a crash.
     """
     video_path = Path(video_path)
     native_meta = probe(video_path)
@@ -578,6 +670,27 @@ def render_full_annotated_video(
     goal_region_polygons = _prepare_goal_region_polygons(
         goal_region_cfg, work_dir.name, detect_frame_width, detect_frame_height, scale_x, scale_y
     )
+
+    # Stage E: precompute each take's own tracked-goal anchors ONCE, up front -- never a fresh
+    # goal_bbox_at call per rendered frame (see _tracked_goal_bboxes_for_take's own docstring for
+    # the cost this avoids). A take absent from `goal_structures_by_take` (or missing any of the
+    # four new params) simply has no entry here and falls back to the manual polygon at render
+    # time below.
+    tracked_anchors_by_take: dict[int, list[tuple[float, BBox]]] = {}
+    if goal_structures_by_take and goal_structure_cfg and hardware_cfg and profile_cfg:
+        for take in takes:
+            structure = goal_structures_by_take.get(take.id)
+            if structure is None:
+                continue
+            tracked_anchors_by_take[take.id] = _tracked_goal_bboxes_for_take(
+                structure,
+                video_path,
+                take,
+                hardware_cfg,
+                profile_cfg,
+                goal_structure_cfg,
+                use_nvdec,
+            )
 
     video_only_path = work_dir / "debug" / "original_annotated_video_only.mp4"
 
@@ -665,7 +778,17 @@ def render_full_annotated_video(
             # dropped just because there's nothing to box.
             _draw_event_caption(frame, active_event_index.active_at(t))
 
-            _draw_goal_regions(frame, goal_region_polygons)
+            # Stage E: this take's own AUTO-TRACKED box (Stage C/D) wins over the static manual
+            # polygon when one exists for it -- one box on screen, matching whichever source
+            # actually fed this take's own goal/assist reasoning. No entry for this take ->
+            # fall back to the manual polygon exactly as before Stage C/D existed.
+            take_anchors = tracked_anchors_by_take.get(take_id) if take_id is not None else None
+            if take_anchors:
+                nearest_bbox = _nearest_tracked_bbox(take_anchors, t)
+                frame_goal_polygons = [_bbox_to_polygon(nearest_bbox)] if nearest_bbox else []
+            else:
+                frame_goal_polygons = goal_region_polygons
+            _draw_goal_regions(frame, frame_goal_polygons)
 
             yield frame
 

@@ -3,15 +3,20 @@ GPU/video I/O."""
 
 from __future__ import annotations
 
-from src.common.types import BBox, Event, EventType, Track, TrackBox
+import src.pipeline.annotated_video as annotated_video_mod
+from src.common.types import BBox, Event, EventType, Take, Track, TrackBox
+from src.goal.detect import GoalStructure
 from src.identity.verify import TakeIdentityResult
 from src.pipeline.annotated_video import (
     _ActiveEventIndex,
+    _bbox_to_polygon,
     _event_caption_label,
     _format_caption_timestamp,
     _nearest_by_time,
+    _nearest_tracked_bbox,
     _NumberProgress,
     _SortedTimeIndex,
+    _tracked_goal_bboxes_for_take,
     red_box_track_ids,
 )
 
@@ -195,3 +200,95 @@ def test_active_event_index_multiple_simultaneous_events_across_numbers():
 def test_active_event_index_empty_when_no_events():
     index = _ActiveEventIndex({}, caption_duration_s=2.0)
     assert index.active_at(0.0) == []
+
+
+# ---------------------------------------------------------------------------
+# Stage E ("streamed-gathering-treehouse" plan) -- _tracked_goal_bboxes_for_take /
+# _nearest_tracked_bbox / _bbox_to_polygon. take_motion_score/goal_bbox_at are mocked (no real
+# decode/CV); these tests verify the anchor-generation + nearest-lookup + polygon-conversion
+# logic itself.
+# ---------------------------------------------------------------------------
+
+
+def _goal_structure() -> GoalStructure:
+    return GoalStructure(
+        take_id=0,
+        t_anchor=5.0,
+        bbox=BBox(x1=100.0, y1=100.0, x2=200.0, y2=150.0),
+        crossbar=(100.0, 100.0, 200.0, 100.0),
+        posts=[(100.0, 100.0, 100.0, 150.0), (200.0, 100.0, 200.0, 150.0)],
+        confidence=1.0,
+        n_corroborating_frames=2,
+        n_frames_sampled=2,
+    )
+
+
+def _goal_structure_cfg() -> dict:
+    return {
+        "tracking": {
+            "reestimate_motion_score_threshold": 3.75,
+            "min_reestimate_interval_s": 5.0,
+            "max_reestimate_interval_s": 30.0,
+            "frame_grab_window_s": 1.0,
+        }
+    }
+
+
+def test_tracked_goal_bboxes_for_take_one_anchor_when_static(monkeypatch):
+    monkeypatch.setattr(annotated_video_mod, "take_motion_score", lambda *a, **k: 0.0)
+    fixed_bbox = BBox(x1=100.0, y1=100.0, x2=200.0, y2=150.0)
+    monkeypatch.setattr(annotated_video_mod, "goal_bbox_at", lambda *a, **k: fixed_bbox)
+
+    take = Take(id=0, t_start=0.0, t_end=10.0, frame_start=0, frame_end=100, kind="main")
+    anchors = _tracked_goal_bboxes_for_take(
+        _goal_structure(),
+        "fake.mp4",
+        take,
+        hardware_cfg={"stages": {"profile": {"fps_sample": 2}}},
+        profile_cfg={"motion": {}},
+        goal_structure_cfg=_goal_structure_cfg(),
+        use_nvdec=False,
+    )
+    assert len(anchors) == 1
+    assert anchors[0][1] == fixed_bbox
+
+
+def test_tracked_goal_bboxes_for_take_more_anchors_under_high_motion(monkeypatch):
+    tracking_cfg = _goal_structure_cfg()["tracking"]
+    above = tracking_cfg["reestimate_motion_score_threshold"] + 1.0
+    monkeypatch.setattr(annotated_video_mod, "take_motion_score", lambda *a, **k: above)
+    monkeypatch.setattr(annotated_video_mod, "goal_bbox_at", lambda *a, **k: _goal_structure().bbox)
+
+    take = Take(id=0, t_start=0.0, t_end=10.0, frame_start=0, frame_end=100, kind="main")
+    anchors = _tracked_goal_bboxes_for_take(
+        _goal_structure(),
+        "fake.mp4",
+        take,
+        hardware_cfg={"stages": {"profile": {"fps_sample": 2}}},
+        profile_cfg={"motion": {}},
+        goal_structure_cfg=_goal_structure_cfg(),
+        use_nvdec=False,
+    )
+    assert len(anchors) == 2  # duration=10, min_reestimate_interval_s=5 -> ceil(10/5)=2
+
+
+def test_nearest_tracked_bbox_picks_closest_in_time():
+    box_a = BBox(x1=0, y1=0, x2=10, y2=10)
+    box_b = BBox(x1=100, y1=100, x2=110, y2=110)
+    anchors = [(1.0, box_a), (9.0, box_b)]
+    assert _nearest_tracked_bbox(anchors, 2.0) == box_a
+    assert _nearest_tracked_bbox(anchors, 8.5) == box_b
+
+
+def test_nearest_tracked_bbox_empty_list_is_none():
+    assert _nearest_tracked_bbox([], 5.0) is None
+
+
+def test_bbox_to_polygon_is_a_four_corner_rectangle():
+    bbox = BBox(x1=10.4, y1=20.6, x2=100.2, y2=200.9)
+    poly = _bbox_to_polygon(bbox)
+    assert poly.shape == (4, 1, 2)
+    xs = sorted({int(poly[i][0][0]) for i in range(4)})
+    ys = sorted({int(poly[i][0][1]) for i in range(4)})
+    assert xs == [10, 100]
+    assert ys == [21, 201]
