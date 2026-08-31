@@ -72,6 +72,39 @@ sahi:
   # CLAUDE.md §3.2(5) also floats SAHI for players on this footage ("plan to... and measure") —
   # not yet adopted; enabled_for stays [ball] until that's evaluated.
 
+ball_plausibility:
+  # Runs BEFORE ball_interpolation below (src/detect/run.py, between building `observed` and
+  # calling interpolate_ball_gaps): src/detect/ball.py::filter_implausible_ball_jumps rejects a
+  # raw SAHI ball observation that implies a physically impossible jump from the last ACCEPTED
+  # one -- detect_ball_sahi keeps only argmax(confidence) per frame with no cross-frame context at
+  # all, so nothing upstream can otherwise tell a real detection from a swap onto an unrelated
+  # object. A rejected sample becomes a gap that ball_interpolation already bridges correctly.
+  max_plausible_speed_fw_per_s: 10.0 # unit = frame-widths/second, same convention as
+  # configs/events.yaml: shot.ball_speed_threshold / src/events/shots.py::ball_speed_series.
+  # MEASURED 2026-08-31 on input/clip1 43.mp4's cached raw ball_detections.parquet (334
+  # observations, pre-interpolation): frame-to-frame speed is a CONTINUOUS tail from 0.002 to
+  # 24.21 fw/s with no clean bimodal gap (unlike e.g. arrow_min_area_px below) -- the detector
+  # alternates between the real ball and a separate, itself-smoothly-drifting false positive
+  # (almost certainly clip1's painted American-football yard-line numbers sliding with this
+  # clip's own camera pan, CLAUDE.md §3.2(4), highest motion of all 5 clips at 12.70 px/frame).
+  # 10.0 is chosen as a margin between two independently measured reference points, not a
+  # bimodal cliff: comfortably ABOVE the highest real ball motion this project has ever measured
+  # as plausible (configs/events.yaml: shot -- real accepted shot candidates on clip2 peaked at
+  # 4.46-8.30 fw/s), comfortably BELOW clip1's detector-swap jump band (the smallest of clip1's
+  # top-40 frame-to-frame jumps is 11.55 fw/s, the largest 24.21). See
+  # src/detect/ball.py::filter_implausible_ball_jumps docstring for the full measurement.
+  reseed_run_length: 5 # self-correcting re-seed (Golden Rule 5): if a run of this many
+  # CONSECUTIVE rejected observations are each plausible relative to the previous rejected one
+  # (not the stale anchor), that is treated as evidence the ANCHOR was wrong -- not these points
+  # -- and the whole run is promoted to accepted. Guards the failure mode named in the Stage 1
+  # plan: a single early false-positive anchor must not permanently reject every real observation
+  # that follows it. At stages.ball.fps_sample=30 (configs/hardware.yaml) this is ~0.17s of
+  # sustained mutual agreement -- long enough to rule out a 1-2 frame detector swap, short enough
+  # to recover quickly from a genuinely wrong anchor. Real clip1/clip2 data never needed this path
+  # at these thresholds (0 reseeds either clip -- the true ball reasserts itself well inside this
+  # many samples every time); exercised directly by
+  # tests/test_ball.py::test_filter_implausible_ball_jumps_reseeds_after_bad_anchor instead.
+
 ball_interpolation:
   max_gap_frames: 15 # fill a ball-detection gap up to this many *sampled* frames by linear
   # interpolation between the nearest observed detections either side; longer gaps are left

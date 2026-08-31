@@ -25,7 +25,7 @@ import supervision as sv
 import torch
 from sahi.slicing import get_slice_bboxes
 
-from src.common.logging import get_logger
+from src.common.logging import DropCounter, get_logger
 from src.common.types import BallDetection, BBox, DetectionClass
 from src.detect.detector import DetectorHandle, _snap_to_block
 
@@ -121,6 +121,127 @@ def detect_ball_sahi(
         t=t,
         interpolated=False,
     )
+
+
+def filter_implausible_ball_jumps(
+    observed: list[BallDetection],
+    frame_width: float,
+    plausibility_cfg: dict,
+    drops: DropCounter | None = None,
+) -> list[BallDetection]:
+    """Reject an observed `BallDetection` that implies a physically impossible jump from the last
+    *accepted* observation (Stage 1 plausibility filter, CLAUDE.md §5/§10).
+
+    `detect_ball_sahi` keeps only the single highest-confidence candidate per frame and has no
+    access to neighbouring frames at all (see its own docstring/module docstring above) — so
+    nothing upstream of this function can consider continuity. This is the first point in the
+    pipeline that does. A rejected observation simply becomes a gap; `interpolate_ball_gaps`
+    (the very next step in `src/detect/run.py`) already bridges a gap correctly — it just cannot
+    currently tell a real miss from a garbage detection, because nothing feeds it that distinction.
+
+    Speed is measured in the SAME "frame-widths per second" unit `src/events/shots.py::
+    ball_speed_series` already uses (centroid displacement / dt / `frame_width` — self-scaling
+    across clips decoded at different widths, still never a metric unit, ADR-6).
+
+    MEASURED 2026-08-31 on `input/clip1 43.mp4`'s cached raw `ball_detections.parquet` (334 SAHI
+    observations pre-interpolation, at the pipeline's 1920px decode width): frame-to-frame speed
+    has NO clean bimodal gap the way e.g. `configs/detect.yaml: arrow_min_area_px` does — it is a
+    continuous tail from 0.002 up to 24.21 fw/s. Inspecting the raw `(t, cx, cy)` series explains
+    why: the detector alternates — sometimes every single sampled frame — between the real ball
+    (drifting smoothly around cx~850-900px, cy~580px early in the clip) and a SEPARATE, ALSO
+    smoothly-drifting false positive ~235px higher in frame (cy~343-347px), almost certainly
+    clip1's painted American-football yard-line numbers (CLAUDE.md §3.2(4)) sliding with this
+    clip's own camera pan (§3.2's highest-motion clip, 12.70 px/frame). E.g. index 0->1 jumps
+    cx 893.0->1751.7 in one 33ms sample (24.2 fw/s — clearly a detector swap, not ball motion),
+    then 1->2 continues smoothly WITHIN that false cluster (1751.7->1740.2, 0.18 fw/s — internally
+    plausible, just the wrong object), before index 3 jumps straight back to the real cluster
+    (883.8, only 0.15 fw/s from the true anchor two samples back). `configs/events.yaml: shot.`
+    already documents its own real accepted shot candidates peaking at 4.46-8.30 fw/s (measured on
+    clip2). `max_plausible_speed_fw_per_s` is set to 10.0: comfortably above every real ball motion
+    this project has ever measured as plausible, comfortably below the 11.55-24.21 fw/s band
+    clip1's detector-swap jumps occupy (the smallest of clip1's top-40 frame-to-frame jumps is
+    11.55 fw/s) — there is no single clean threshold that perfectly separates the two on this
+    clip's continuous distribution, so 10.0 is a margin-based choice between two independently
+    measured reference points, not a bimodal cliff; documented as such rather than overclaimed.
+
+    Self-correcting re-seed (Golden Rule 5 — never let one bad early sample permanently blind the
+    filter): a run of `reseed_run_length` consecutive REJECTED candidates that are each plausible
+    relative to the PREVIOUS rejected candidate (not the stale anchor) is treated as evidence that
+    the anchor — not these points — was the error, and the whole run is promoted to `accepted`,
+    with tracking continuing from its last point. A run that never reaches that length, followed
+    by a candidate that resumes plausibly from the ORIGINAL anchor, is simply dropped as noise (the
+    anchor was right all along). This specific failure mode — a bad first anchor that would
+    otherwise reject every real subsequent observation forever — is exercised directly in
+    `tests/test_ball.py::test_filter_implausible_ball_jumps_reseeds_after_bad_anchor`. On real
+    clip1/clip2 data at these thresholds this path never actually triggers (0 reseeds either
+    clip — the true ball reasserts itself well inside `reseed_run_length` samples every time); it
+    exists as a safety net for inputs where the true trajectory takes longer to reassert itself.
+
+    Honest limitation: with no appearance model, this cannot always tell WHICH of two
+    simultaneously-plausible, internally-smooth tracks is the real ball (see clip1's yard-number
+    false cluster above, which is itself locally smooth) — it only guarantees a genuinely sustained
+    trajectory is not permanently rejected just because it disagrees with one earlier anchor point.
+    """
+    if frame_width <= 0 or len(observed) < 2:
+        return list(observed)
+
+    max_speed = plausibility_cfg["max_plausible_speed_fw_per_s"]
+    reseed_run_length = plausibility_cfg["reseed_run_length"]
+
+    ordered = sorted(observed, key=lambda d: d.t)
+
+    def _speed(a: BallDetection, b: BallDetection) -> float:
+        dt = b.t - a.t
+        if dt <= 0:
+            return 0.0 if (a.bbox.cx, a.bbox.cy) == (b.bbox.cx, b.bbox.cy) else float("inf")
+        dx = b.bbox.cx - a.bbox.cx
+        dy = b.bbox.cy - a.bbox.cy
+        return ((dx * dx + dy * dy) ** 0.5) / dt / frame_width
+
+    accepted: list[BallDetection] = [ordered[0]]
+    seed_confirmed = False  # True once `accepted[0]` has been directly corroborated by at least
+    # one later plausible sample -- see the bad-anchor case below.
+    pending: list[BallDetection] = []  # a run of consecutive rejections, checked for mutual
+    # self-consistency below — see "Self-correcting re-seed" in the docstring above.
+
+    for det in ordered[1:]:
+        if _speed(accepted[-1], det) <= max_speed:
+            if pending:
+                if drops is not None:
+                    drops.drop("ball_implausible_jump", len(pending))
+                pending = []
+            accepted.append(det)
+            seed_confirmed = True
+            continue
+
+        if pending and _speed(pending[-1], det) <= max_speed:
+            pending.append(det)
+        else:
+            if pending:
+                if drops is not None:
+                    drops.drop("ball_implausible_jump", len(pending))
+            pending = [det]
+
+        if len(pending) >= reseed_run_length:
+            if not seed_confirmed and len(accepted) == 1:
+                # The very first observation was NEVER corroborated by anything before this
+                # sustained, mutually-consistent run showed up -- that is evidence the seed
+                # itself was the error (e.g. the video opens on a stray false positive), not
+                # these `reseed_run_length` points. Discard the seed rather than keeping a
+                # one-sample "trajectory" the rest of the clip never agreed with.
+                if drops is not None:
+                    drops.drop("ball_implausible_jump", 1)
+                accepted = list(pending)
+            else:
+                accepted.extend(pending)
+            seed_confirmed = True
+            pending = []
+
+    if pending:
+        if drops is not None:
+            drops.drop("ball_implausible_jump", len(pending))
+
+    return accepted
 
 
 def interpolate_ball_gaps(

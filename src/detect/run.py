@@ -9,6 +9,12 @@ Both share one loaded detector instance (freed once, at the end) rather than loa
 checkpoint twice. Ball detections from the *main* pass are deliberately dropped (not persisted) —
 the ball is routed exclusively through the dedicated SAHI pass — and counted via `DropCounter` so
 the drop is visible, not silent (CLAUDE.md §10).
+
+Between the raw SAHI pass and gap-interpolation, every observation runs through
+`src.detect.ball.filter_implausible_ball_jumps` — a physically-impossible frame-to-frame jump
+(argmax(confidence) swapping onto an unrelated object; `detect_ball_sahi` has no cross-frame
+context to prevent this on its own) is rejected and counted as `ball_implausible_jump` rather than
+silently interpolated into a fake smooth trajectory.
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ from src.common.io import (
 from src.common.logging import DropCounter, get_logger
 from src.common.types import BallDetection, Detection, DetectionClass
 from src.common.video import decode_frames, probe
-from src.detect.ball import detect_ball_sahi, interpolate_ball_gaps
+from src.detect.ball import detect_ball_sahi, filter_implausible_ball_jumps, interpolate_ball_gaps
 from src.detect.detector import detect_batch, free_detector, load_detector
 from src.detect.overlay_mask import ArrowHint, filter_arrow_overlap, filter_watermark, find_arrow
 
@@ -182,6 +188,7 @@ def run_detect_stage(
     if not ball_hit:
         sampled_frames: list[tuple[int, float]] = []
         observed: list[BallDetection] = []
+        frame_width = 0.0
         for frame_index, t, frame in decode_frames(
             video_path,
             fps=ball_stage_cfg["fps_sample"],
@@ -189,12 +196,27 @@ def run_detect_stage(
             use_nvdec=use_nvdec,
         ):
             sampled_frames.append((frame_index, t))
+            frame_width = frame.shape[1]  # the actual decoded width these bboxes live in --
+            # same value `_effective_frame_size` computes independently in src/pipeline/run.py,
+            # read here straight off the frame so it can never drift out of sync with it.
             bd = detect_ball_sahi(handle, frame, frame_index, detect_config, hardware_config, t=t)
             if bd is not None:
                 observed.append(bd)
 
         if not observed:
             drops.drop("ball_never_detected", 1)
+        n_observed = len(observed)
+        observed = filter_implausible_ball_jumps(
+            observed, frame_width, detect_config["ball_plausibility"], drops
+        )
+        if n_observed:
+            logger.info(
+                "Stage 2 ball plausibility filter: %d/%d raw observation(s) rejected as "
+                "implausible jumps (%.1f%%)",
+                n_observed - len(observed),
+                n_observed,
+                100.0 * (n_observed - len(observed)) / n_observed,
+            )
         all_ball_detections = interpolate_ball_gaps(
             observed, sampled_frames, detect_config["ball_interpolation"]
         )
