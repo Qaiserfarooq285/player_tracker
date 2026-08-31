@@ -14,7 +14,8 @@ Pipeline, per take:
 2. **Evidence collection** (`_collect_reads_for_take`) — ONE native-resolution decode pass over
    the whole video (never re-seeking per candidate frame, which would risk landing on the wrong
    take at a keyframe boundary — see module note below), cropping the location candidate's own box
-   wherever it clears `identity.yaml: crop.min_crop_height_px`, running EasyOCR first (cheap,
+   wherever it clears `identity.yaml: crop.min_crop_height_frac` (resolution-aware, Stage A of the
+   "streamed-gathering-treehouse" plan), running EasyOCR first (cheap,
    local) and escalating only OCR-ambiguous-or-silent crops to Gemini, bounded by
    `identity.yaml: vlm.max_escalations_per_take` (cost control, mirrors ADR-14's own "cheap
    pre-filter, VLM only on survivors" pattern).
@@ -290,7 +291,11 @@ def _collect_reads_for_take(
     crop_cfg = identity_cfg["crop"]
     ocr_cfg = identity_cfg["ocr"]
     vlm_cfg = identity_cfg["vlm"]
-    min_height = crop_cfg["min_crop_height_px"]
+    # Stage A (resolution-aware crop gate): the gate is a FRACTION of native decode-frame height,
+    # not a fixed pixel count, so it scales correctly on any input resolution (see
+    # configs/identity.yaml: crop.min_crop_height_frac's own comment for the 4K/720p measurements
+    # behind this fraction).
+    min_height = crop_cfg["min_crop_height_frac"] * native_h
     expand = crop_cfg["torso_crop_expand"]
     tolerance_s = 1.0 / identity_fps_sample
     max_escalations = vlm_cfg["max_escalations_per_take"]

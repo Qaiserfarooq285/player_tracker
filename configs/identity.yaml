@@ -7,16 +7,32 @@
 # independent frames (Golden Rule 5).
 
 crop:
-  # A box shorter than this (in NATIVE decode-resolution pixels — this stage decodes at native
-  # 4K, not Stage 2's downscaled 1920px-wide detect resolution, since legibility needs the
-  # sharpest pixels available, CLAUDE.md task spec) cannot possibly carry a legible 1-2 digit
-  # jersey number. MEASURED 2026-08-27 on this project's own footage (§3.2's "jerseys legible at
-  # 4K for mid/near players... even at 1280px" finding, extrapolated to native 4K): a jersey
-  # number glyph is roughly 12-18% of a player's own bbox height, and EasyOCR's own practical
-  # minimum reliable text height is ~15-20px — so a box needs to be tall enough that ~15% of it
-  # clears ~20px, i.e. at least ~135px tall at native 4K. Set with a small margin below that
-  # (120px) since digits sometimes sit larger within the torso silhouette than the 15% estimate.
-  min_crop_height_px: 120
+  # A box shorter than this cannot possibly carry a legible 1-2 digit jersey number. Originally
+  # (through 2026-08-27) this was a hardcoded ABSOLUTE pixel count, `min_crop_height_px: 120`,
+  # calibrated only against this project's own native-4K (3840x2160) footage (§3.2's "jerseys
+  # legible at 4K for mid/near players... even at 1280px" finding, extrapolated to native 4K: a
+  # jersey number glyph is roughly 12-18% of a player's own bbox height, EasyOCR's own practical
+  # minimum reliable text height is ~15-20px, so a box needs to be tall enough that ~15% of it
+  # clears ~20px, i.e. at least ~135px tall at native 4K -- 120px set with a small margin below
+  # that). That absolute constant does NOT generalize: measured 2026-08-31 on real 720p broadcast
+  # footage (`input/video2`/`video3`, `chelsea_burnley_target10`/`target2`, same underlying match)
+  # mean player bbox height is 71.9px, median 70.7px -- only 0.63% of boxes ever cleared a fixed
+  # 120px gate, silently starving Stage 5.5/ADR-19's re-identification signal on any non-4K input.
+  # FIX (this stage, ADR-plan "streamed-gathering-treehouse" Stage A): express the gate as a
+  # FRACTION of the DECODE-FRAME height instead, so it scales with whatever resolution a video is
+  # actually decoded at. The fraction is the original 4K calibration re-derived: 120px / 2160px
+  # native height = 0.05556 (~5.56% of frame height). Cross-checked against the 720p measurement:
+  # 0.05556 * 720px = 40.0px -- comfortably below the measured 71.9px mean/70.7px median box
+  # height (so the large majority of real 720p player boxes now clear the gate, unlike the old
+  # 0.63%), while still meaningfully above zero (not a no-op permissive gate) and unchanged in
+  # absolute terms for the native-4K case that originally justified it (0.05556 * 2160 = 120.0px,
+  # exact). Honest caveat, documented rather than hidden: the underlying "12-18% of bbox is the
+  # glyph" ratio was measured on THIS project's own Veo footage, not on broadcast video generally
+  # -- reusing the same relative fraction across resolutions is the safest available
+  # generalization (scales correctly, changes nothing for the already-verified 4K case) but has
+  # not itself been re-derived from a fresh ratio measurement on 720p broadcast footage; revisit
+  # if 720p verification/re-acquisition rates suggest the fraction is still mis-calibrated.
+  min_crop_height_frac: 0.05556
   identity_fps_sample: 2 # native-res decode cadence for THIS stage only (a separate budget from
   # configs/hardware.yaml stages.team.fps_sample=2, which decodes at Stage 2's DOWNSCALED
   # resolution) — CLAUDE.md §11 "team/jersey: 1-2 fps per tracklet" budget, at the higher end

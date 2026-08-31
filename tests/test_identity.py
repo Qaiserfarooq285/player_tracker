@@ -8,7 +8,10 @@ network call).
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import yaml
 
 from src.identity.jersey_ocr import read_jersey_digits
 from src.identity.jersey_vlm import _parse_response, classify_jersey_number
@@ -19,6 +22,39 @@ AGG_CFG = {"min_agreeing_frames": 2, "min_verified_confidence": 0.3}
 
 def _read(t: float, idx: int, source: str, digits: str | None, conf: float) -> FrameRead:
     return FrameRead(t=t, frame_index=idx, source=source, digits=digits, confidence=conf)
+
+
+# ---------------------------------------------------------------------------
+# Stage A -- resolution-aware jersey-crop size gate (configs/identity.yaml: crop.
+# min_crop_height_frac). Pure arithmetic + the one real config value, no GPU/network.
+# ---------------------------------------------------------------------------
+
+
+def _load_min_crop_height_frac() -> float:
+    cfg_path = Path(__file__).resolve().parents[1] / "configs" / "identity.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text())
+    return cfg["crop"]["min_crop_height_frac"]
+
+
+def test_min_crop_height_frac_reproduces_original_4k_calibration():
+    # The original absolute gate (through 2026-08-27) was 120px on native 3840x2160 decode.
+    # The fraction must reproduce that exact pixel threshold at the resolution it was calibrated
+    # on, so the already-verified 4K behaviour is unchanged by expressing it as a fraction.
+    frac = _load_min_crop_height_frac()
+    native_h_4k = 2160
+    assert round(frac * native_h_4k) == 120
+
+
+def test_min_crop_height_frac_is_permissive_enough_for_measured_720p_boxes():
+    # Measured 2026-08-31 on real 720p broadcast footage (input/video2, video3): mean player
+    # bbox height 71.9px, median 70.7px. The old fixed 120px gate let through only 0.63% of
+    # boxes; the resolution-aware fraction must clear comfortably below that measured mean/median
+    # so the OCR/VLM re-identification signal (Stage B) is not silently starved on 720p input.
+    frac = _load_min_crop_height_frac()
+    native_h_720p = 720
+    threshold_px = frac * native_h_720p
+    assert threshold_px < 70.7  # below the measured median box height
+    assert threshold_px > 0  # still a real, non-trivial gate -- not a no-op
 
 
 # ---------------------------------------------------------------------------
