@@ -27,6 +27,8 @@ def compute_motion_score(
     hardware_config: dict,
     profile_config: dict,
     use_nvdec: bool = True,
+    start: float | None = None,
+    end: float | None = None,
 ) -> float:
     """Estimate global camera motion for `video_path`, in px/**native video frame** at native
     resolution (matching CLAUDE.md §3.2's own `vidstabdetect`-measured "~1 px/frame" figure and
@@ -70,12 +72,22 @@ def compute_motion_score(
     characteristic in its own right, not something being smoothed away to force a "static" answer
     — see the run report for the actual per-clip numbers, including where this still pushes a
     clip's classification to `single-panning`.
+
+    `start`/`end` (seconds, optional): when given, scopes the WHOLE estimate to that window of
+    `video_path` instead of the entire video — same anchor-based algorithm, same
+    `decode_frames`-level `start`/`end` windowing every other windowed-decode caller in this
+    codebase already uses (e.g. `src/events/goals.py::detect_goals_for_take`), just restricting
+    the OUTPUT to one take instead of the whole video. Added for `src/goal/detect.py` (Stage C,
+    "streamed-gathering-treehouse" plan), which needs a PER-TAKE motion score (ADR-11: consume the
+    take's own measured signal, never the whole-video aggregate, when a take-specific decision —
+    how often to re-localize the tracked goal structure — is being made). `None`/`None` (the
+    default) is the original whole-video behaviour, byte-for-byte unchanged.
     """
     video_path = Path(video_path)
     meta = probe(video_path)
     native_width = meta["width"]
     native_fps = meta["fps"]
-    duration = meta["duration"]
+    duration = (end - start) if (start is not None and end is not None) else meta["duration"]
 
     fps_sample = hardware_config["stages"]["profile"]["fps_sample"]
     motion_cfg = profile_config["motion"]
@@ -95,7 +107,7 @@ def compute_motion_score(
     prev: np.ndarray | None = None
     native_scale = 1.0
     for index, _t, frame in decode_frames(
-        video_path, fps=None, scale_width=flow_width, use_nvdec=use_nvdec
+        video_path, fps=None, start=start, end=end, scale_width=flow_width, use_nvdec=use_nvdec
     ):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if prev is not None and index in anchor_frames:

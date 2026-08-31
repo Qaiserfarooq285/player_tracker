@@ -87,6 +87,21 @@ cv_refine:
   # margin either side for perspective distortion at a shallow broadcast angle; not independently
   # frame-measured beyond the single clip1 sample, which measured ratio 347.1/108.8 = 3.19 --
   # comfortably inside this band.
+  # --- below: added by the EXECUTION session (not part of the planning session's own measured
+  # set above) while implementing Stage C -- mechanical/reasoned, not independently measured;
+  # flagged distinctly per this file's own "every threshold documents its own epistemic status"
+  # convention rather than silently blending them in with the measured values above.
+  roi_pad_frac: 0.5 # the VLM's own box (`vlm.prompt`) is a ROUGH localization, not a tight crop --
+  # pad the refine-stage ROI by this fraction of the VLM box's own width/height on each side so a
+  # crossbar/post whose real extent sits slightly outside the VLM's box isn't clipped before the
+  # classical-CV step ever sees it. Reasoned (generous margin, symmetric with the VLM's own
+  # imprecision), not frame-measured.
+  player_box_match_tolerance_s: 1.0 # how close (seconds) a Track's own sampled box must be to a
+  # localization frame's timestamp to count as "this player is here, exclude them" -- reasoned
+  # from the tracking stage's own ~0.1s sample spacing (`configs/hardware.yaml:
+  # stages.track.fps_sample`) with generous slack, since exclusion only needs to be approximately
+  # right (a slightly stale player silhouette merely risks NOT being excluded, not a wrong
+  # crossbar/post pick -- structural exclusion is a defense in depth, not the only gate).
 
 aggregation:
   min_corroborating_frames: 2 # require at least this many of the sampled frames (out of
@@ -110,3 +125,8 @@ tracking:
   # motion, to bound VLM cost -- reasoned cap, not separately measured.
   max_reestimate_interval_s: 30.0 # for a near-static take, don't bother re-checking more often
   # than this -- reasoned cap.
+  # --- below: added by the EXECUTION session implementing Stage C, same "flagged distinctly"
+  # convention as cv_refine's own two added keys above.
+  frame_grab_window_s: 1.0 # half-width (seconds) of the decode window used to grab a single frame
+  # near a requested timestamp (e.g. the take's own anchor frame, or a later query instant) for
+  # affine-propagation tracking -- mechanical decode-window sizing, not a detection threshold.
