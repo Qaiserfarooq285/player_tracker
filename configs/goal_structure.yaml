@@ -1,0 +1,112 @@
+# Stage C (goal-structure detection, CLAUDE.md plan "General-purpose player identity, goal
+# detection, and goal/assist reasoning"). Every threshold below was MEASURED directly by the
+# planning session, not guessed — see the per-key comments for the exact experiment. No training,
+# no new dependency: OpenCV (already a dependency) + the existing Gemini VLM client.
+#
+# Two-stage design, both measured necessary (neither alone is reliable):
+#   1. VLM localizes roughly WHERE the goal is (generalizes across venue/angle/lighting).
+#   2. Classical CV refines EXACTLY WHAT, at native resolution, inside that VLM-proposed region.
+# Cross-validated once, directly: on `input/clip1 43.mp4` at t=7.0s (the owner-confirmed goal
+# moment), the VLM's box and the independently-CV-detected crossbar+post agreed (the CV lines sat
+# inside the VLM box) -- see `vlm:` and `cv_refine:` below for the exact numbers from that run.
+
+vlm:
+  # MEASURED 2026-08-31: full-frame classical CV (no VLM) FAILS outright on this project's own
+  # footage -- a white/low-saturation mask + line-segment detection at 1920px locks onto painted
+  # American-football yard lines and background buildings, zero real goalpost candidates found
+  # near the actual goal on `clip1 43.mp4`. A temporal-median-background variant also failed on
+  # BOTH `clip1 43.mp4` and `clip2 77.mp4` (0 goal-topology candidates each) because clip1's real
+  # camera motion (motion_score 12.70 px/frame, the highest of all 5 owner clips) smears thin
+  # posts under a temporal median. The VLM step exists specifically to supply the rough location
+  # classical CV cannot find on its own on this footage.
+  model: "gemini-flash-lite-latest" # MEASURED 2026-08-31: this model successfully localized the
+  # goal on both `clip1 43.mp4` (t=3.0s/7.0s/10.0s tried; 7.0/10.0 succeeded, 3.0s returned NONE
+  # -- a genuinely different camera angle at that timestamp, not a model failure) and, on a
+  # different venue/lighting entirely, `input/video2/chelsea_burnley_target10.mp4` (t=5.0s/10.0s,
+  # both succeeded). Reuse the SAME model-fallback-list pattern already in
+  # `src/identity/jersey_vlm.py`/`configs/identity.yaml: vlm` for quota resilience -- do not
+  # hardcode a single model with no fallback.
+  prompt: >
+    This is a frame from a soccer match. Locate the SOCCER GOAL structure (the white goalposts,
+    crossbar and net forming the goal mouth). Do NOT return the goalkeeper or any player.
+    Respond with ONLY one line, no other text:
+    GOAL=x1,y1,x2,y2 (each an integer 0-1000, the bounding box of the goal frame, in a 0-1000
+    coordinate system where 0,0 is the top-left corner and 1000,1000 is the bottom-right corner)
+    If no soccer goal structure is clearly visible, respond exactly: GOAL=NONE
+  coordinate_convention: "0-1000" # ⚠️ MEASURED 2026-08-31: despite prompting for a 0-1 fraction in
+  # an earlier attempt, Gemini consistently returned box coordinates as integers on a 0-1000
+  # scale regardless of prompt wording (e.g. "GOAL=580,317,659,372" on a 1600x900-equivalent
+  # frame) -- the prompt above now asks for 0-1000 directly to match observed behaviour rather
+  # than fighting it. Parsing MUST divide by 1000.0, never trust a raw 0-1 assumption.
+  none_response: "NONE" # exact literal Gemini returns when no goal is visible in the sampled
+  # frame (observed once, on `clip1 43.mp4` at t=3.0s, a wide shot with no goal in frame) --
+  # treated as an honest absence for that sample, never retried into a guess.
+  frames_per_take: 3 # sample this many frames per take for localization, spread across the
+  # take's duration (not just one) -- MEASURED: a single frame can genuinely have no goal visible
+  # (see none_response above) even when the take as a whole does show it at other timestamps.
+  max_escalations_per_take: 3 # cost cap, matching the existing `identity.yaml: vlm` /
+  # `annotations.yaml: jersey_reid` pattern of bounding VLM calls per take -- this stage must not
+  # turn into a per-frame scan.
+
+cv_refine:
+  # MEASURED 2026-08-31 on `clip1 43.mp4` at t=7.0s, native 4K (3840x2160), inside a manually
+  # centred +/-10% ROI around the owner-confirmed goal location (later replaced by the VLM's own
+  # proposed region, not a fixed offset): a "loose" white/low-saturation HSV mask
+  # (S < s_max, V > v_min) cleanly separated the goal's white paint from the pitch/crowd
+  # background. Two thresholds were tried side by side on the SAME frame:
+  #   loose (s_max=70, v_min=150): white_px=6.62% of ROI, found the real crossbar+post cleanly.
+  #   tight (s_max=45, v_min=190): white_px=1.42% of ROI, ALSO found them (fewer stray segments)
+  #     but at higher risk of missing the goal paint under harsher lighting/shadow.
+  # `loose` is the adopted default -- it is measurably sufficient and more forgiving of lighting
+  # variation; `tight` is kept as an explicit fallback for a take with excessive glare/noise.
+  hsv_s_max: 70 # saturation must be BELOW this to count as "white/near-white paint"
+  hsv_v_min: 150 # value/brightness must be ABOVE this
+  hsv_s_max_tight: 45 # fallback pass if the loose mask yields too many candidates to disambiguate
+  hsv_v_min_tight: 190
+  min_segment_length_frac_of_roi_height: 0.10 # MEASURED: the real crossbar (347.1px) and post
+  # (108.8px) in a 768x432-pixel ROI both comfortably clear 10% of the ROI's own height (43.2px)
+  # -- segments below this are pitch-line/crowd-banner noise, not goal structure, in the same
+  # measured sample.
+  horizontal_max_angle_deg: 25 # a line within this many degrees of horizontal qualifies as a
+  # CROSSBAR candidate -- MEASURED: the real crossbar's two longest segments measured 0.0-0.9deg
+  # from horizontal in the same sample.
+  vertical_min_angle_deg: 65 # a line at least this steep qualifies as a POST candidate --
+  # MEASURED: the real post's longest segments measured 76-80deg from horizontal in the same
+  # sample.
+  post_endpoint_x_tolerance_frac_of_crossbar_len: 0.20 # a candidate post's x-position must sit
+  # within this fraction of the crossbar's own length from one of the crossbar's two endpoints to
+  # count as "descending from this crossbar" (topology match, not just "any steep line
+  # anywhere") -- reasoned from the measured crossbar/post geometry above, not independently
+  # re-measured; revisit if a real false-positive/false-negative topology match is found.
+  post_top_y_tolerance_frac_of_crossbar_len: 0.15 # a candidate post's TOP endpoint must sit
+  # within this fraction of the crossbar's length, vertically, of the crossbar's own y-position --
+  # same reasoning as above.
+  aspect_ratio_min: 0.8 # crossbar-length / post-height must fall in this range to look like a
+  aspect_ratio_max: 6.0 # real goal (a real goal is wider than it is tall, but not absurdly so) --
+  # reasoned from standard goal proportions (7.32m wide x 2.44m tall = ratio ~3.0), given generous
+  # margin either side for perspective distortion at a shallow broadcast angle; not independently
+  # frame-measured beyond the single clip1 sample, which measured ratio 347.1/108.8 = 3.19 --
+  # comfortably inside this band.
+
+aggregation:
+  min_corroborating_frames: 2 # require at least this many of the sampled frames (out of
+  # `vlm.frames_per_take`) to agree (VLM localizes AND CV refines to a plausible topology) before
+  # emitting a goal-structure estimate for the take at all -- Golden Rule 5: a single-frame
+  # coincidence is not enough to track a goal for a whole take.
+  outlier_reject_iou_threshold: 0.3 # a per-frame candidate whose box IoU against the running
+  # median estimate falls below this is treated as an outlier and excluded from the aggregate,
+  # not averaged in -- reasoned (not separately measured) to be generous enough to tolerate real
+  # camera motion between samples while rejecting a genuinely wrong detection.
+
+tracking:
+  reestimate_motion_score_threshold: 3.75 # = midpoint of `configs/profile.yaml`'s own
+  # `static_motion_threshold: 1.5` / `panning_motion_threshold: 6.0` band (verified against that
+  # file directly, not assumed) -- CLAUDE.md ADR-11's own ambiguous-band midpoint, reused here as
+  # the point above which the goal structure should be re-localized more often
+  # (shorter interval between VLM+CV re-checks) rather than assumed to hold from one static
+  # estimate, since real camera motion measurably moves the goal's on-screen position (clip1's
+  # 12.70 px/frame motion score is well above this threshold).
+  min_reestimate_interval_s: 5.0 # never re-localize more often than this even under high measured
+  # motion, to bound VLM cost -- reasoned cap, not separately measured.
+  max_reestimate_interval_s: 30.0 # for a near-static take, don't bother re-checking more often
+  # than this -- reasoned cap.
