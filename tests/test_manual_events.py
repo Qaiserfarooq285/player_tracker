@@ -64,6 +64,20 @@ def _track(tid: int, t: float) -> Track:
     return Track(id=tid, take_id=0, boxes=[box], dominant_class=DetectionClass.PLAYER)
 
 
+def _box_at(t: float, cx: float, cy: float, height: float = 100.0) -> TrackBox:
+    half_h = height / 2.0
+    return TrackBox(
+        frame_index=int(round(t * 10)),
+        t=t,
+        bbox=BBox(x1=cx - 20.0, y1=cy - half_h, x2=cx + 20.0, y2=cy + half_h),
+        conf=0.9,
+    )
+
+
+def _selection_cfg() -> dict:
+    return load_yaml("configs/highlights.yaml")["selection"]
+
+
 def test_build_manual_identity_by_take_verified_when_association_succeeds(monkeypatch):
     take = _take(0, 0.0, 10.0)
     track = _track(1, 1.0)
@@ -149,6 +163,174 @@ def test_build_manual_identity_by_take_arrow_fallback_recorded_in_debug(monkeypa
     assert identity_by_take[0].status == "verified"
     assert debug["0:1.00"]["agreement"] == "arrow_fallback"
     assert debug["0:1.00"]["arrow_track_id"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Bug fix 2026-08-31: identity LOCK across a take -- once a jersey number resolves confidently to
+# a track's stitched identity chain (src.track.continuity.build_take_identities), every LATER
+# annotation of the SAME jersey number in the SAME take must be restricted to that chain, never
+# re-opened to an independent whole-field search. Confirmed on real data
+# (output/chelsea_burnley_target10/annotation_report.json): jersey #10 resolved to raw track 208
+# at t=57.0s and a DIFFERENT real track 210 at t=60.0s -- a genuine cross-player identity swap.
+# ---------------------------------------------------------------------------
+
+
+def test_build_manual_identity_by_take_locks_onto_same_track_despite_closer_distractor(
+    monkeypatch,
+):
+    """Two candidate tracks exist near the SECOND annotation: track 100 (the same physical player
+    as the first annotation) and track 200 (a distractor, spatially far from 100 so it never
+    stitches into 100's identity chain). An UNRESTRICTED per-instant search (the pre-fix
+    behaviour) would pick 200 at the second instant -- proven directly below. The FIX must instead
+    lock onto 100's identity chain at the first annotation and restrict the second annotation's
+    search to that chain only, so it resolves to 100 again, never 200."""
+    take = _take(0, 0.0, 10.0)
+    # track_a: one continuous physical player, visible near BOTH annotation instants.
+    track_a = Track(id=100, take_id=0, boxes=[_box_at(1.0, 50, 50), _box_at(5.0, 52, 50)])
+    # track_b: a distractor only near the second instant, far enough away (450 units, height 100)
+    # that build_take_identities' own stitch_max_dist (3.0 bbox-heights) rejects joining it to A.
+    track_b = Track(id=200, take_id=0, boxes=[_box_at(5.0, 500, 500)])
+    anns = [_annotation(1.0, jersey=10), _annotation(5.0, jersey=10)]
+
+    def fake_associate(video_path, take, candidates, ann, *args, **kwargs):
+        ids = {tr.id for tr in candidates}
+        if ids == {100, 200}:
+            # UNRESTRICTED search (what the pre-fix code always did): simulate an independent
+            # colour match landing on the DIFFERENT track at the later instant.
+            if ann.t < 3.0:
+                return (
+                    100,
+                    5.0,
+                    {"arrow_track_id": None, "arrow_distance_px": None, "agreement": "colour_only"},
+                )
+            return (
+                200,
+                2.0,
+                {"arrow_track_id": None, "arrow_distance_px": None, "agreement": "colour_only"},
+            )
+        if ids == {100}:
+            return (
+                100,
+                5.0,
+                {"arrow_track_id": None, "arrow_distance_px": None, "agreement": "colour_only"},
+            )
+        raise AssertionError(f"unexpected candidate id set {ids} for ann.t={ann.t}")
+
+    monkeypatch.setattr(me_mod, "associate_annotation_to_track", fake_associate)
+
+    # Sanity-check the premise: an unrestricted search at the later instant really does pick the
+    # distractor (200) -- exactly what the old, memory-less per-annotation code did.
+    assert fake_associate("fake.mp4", take, [track_a, track_b], anns[1])[0] == 200
+
+    configs = {
+        "annotations": {"track_association": {}},
+        "hardware": {"decode": {}},
+        "highlights": {"selection": _selection_cfg()},
+    }
+    identity_by_take, debug = me_mod.build_manual_identity_by_take(
+        [take], {0: [track_a, track_b]}, {0: anns}, "fake.mp4", configs
+    )
+
+    # NEW code: jersey #10 locks onto track 100's identity chain at t=1.0; the t=5.0 annotation is
+    # RESTRICTED to that same chain and must resolve to 100 again, never the distractor.
+    assert debug["0:1.00"]["track_id"] == 100
+    assert debug["0:5.00"]["track_id"] == 100
+    assert debug["0:5.00"]["locked_chain_id"] == 100
+    assert identity_by_take[0].location_track_ids == [100]
+
+
+def test_build_manual_identity_by_take_honest_caption_only_when_locked_identity_absent(
+    monkeypatch,
+):
+    """Once jersey #10 locks onto track 100's chain at the first annotation, if NO member of that
+    chain has a confident candidate near a LATER annotation's own instant, the honest result is
+    caption-only (`track_id=None`) -- never a fallback to an unrestricted whole-field search (that
+    would silently reopen the exact cross-player swap the lock exists to prevent)."""
+    take = _take(0, 0.0, 10.0)
+    # track_a only appears near the FIRST annotation; track_b only near the second, far enough
+    # away in time (gap 4.0s > stitch_max_gap_s 1.5s) that they never stitch into one chain.
+    track_a = Track(id=100, take_id=0, boxes=[_box_at(1.0, 50, 50)])
+    track_b = Track(id=200, take_id=0, boxes=[_box_at(5.0, 500, 500)])
+    anns = [_annotation(1.0, jersey=10), _annotation(5.0, jersey=10)]
+
+    def fake_associate(video_path, take, candidates, ann, *args, **kwargs):
+        ids = {tr.id for tr in candidates}
+        if ids == {100, 200} and ann.t < 3.0:
+            return (
+                100,
+                5.0,
+                {"arrow_track_id": None, "arrow_distance_px": None, "agreement": "colour_only"},
+            )
+        if ids == {100} and ann.t >= 3.0:
+            # locked chain (100) has no confident candidate near this later instant.
+            return (
+                None,
+                None,
+                {
+                    "arrow_track_id": None,
+                    "arrow_distance_px": None,
+                    "agreement": "no_confident_signal",
+                },
+            )
+        raise AssertionError(f"unexpected candidate id set {ids} for ann.t={ann.t}")
+
+    monkeypatch.setattr(me_mod, "associate_annotation_to_track", fake_associate)
+
+    configs = {
+        "annotations": {"track_association": {}},
+        "hardware": {"decode": {}},
+        "highlights": {"selection": _selection_cfg()},
+    }
+    identity_by_take, debug = me_mod.build_manual_identity_by_take(
+        [take], {0: [track_a, track_b]}, {0: anns}, "fake.mp4", configs
+    )
+
+    assert debug["0:1.00"]["track_id"] == 100
+    assert debug["0:5.00"]["track_id"] is None
+    assert debug["0:5.00"]["agreement"] == "locked_identity_absent_at_instant"
+    assert debug["0:5.00"]["locked_chain_id"] == 100
+    # Track 200 (the distractor) never enters the union of confidently-associated ids.
+    assert identity_by_take[0].location_track_ids == [100]
+
+
+def test_build_manual_identity_by_take_two_distinct_jerseys_lock_independently(monkeypatch):
+    """Requirement (CLAUDE.md task): a take with MULTIPLE distinct jersey numbers must lock each
+    one independently -- one jersey's lock must never influence another jersey's own search."""
+    take = _take(0, 0.0, 10.0)
+    track_a = Track(id=100, take_id=0, boxes=[_box_at(1.0, 50, 50), _box_at(5.0, 52, 50)])
+    track_c = Track(id=300, take_id=0, boxes=[_box_at(1.0, 500, 500), _box_at(5.0, 502, 500)])
+    anns = [
+        _annotation(1.0, jersey=10, colour="white"),
+        _annotation(1.5, jersey=7, colour="red"),
+        _annotation(5.0, jersey=10, colour="white"),
+        _annotation(5.5, jersey=7, colour="red"),
+    ]
+
+    def fake_associate(video_path, take, candidates, ann, *args, **kwargs):
+        ids = {tr.id for tr in candidates}
+        agreement = {"arrow_track_id": None, "arrow_distance_px": None, "agreement": "colour_only"}
+        if ann.jersey_number == 10 and 100 in ids:
+            return 100, 5.0, agreement
+        if ann.jersey_number == 7 and 300 in ids:
+            return 300, 5.0, agreement
+        raise AssertionError(f"unexpected call: jersey={ann.jersey_number} ids={ids}")
+
+    monkeypatch.setattr(me_mod, "associate_annotation_to_track", fake_associate)
+
+    configs = {
+        "annotations": {"track_association": {}},
+        "hardware": {"decode": {}},
+        "highlights": {"selection": _selection_cfg()},
+    }
+    identity_by_take, debug = me_mod.build_manual_identity_by_take(
+        [take], {0: [track_a, track_c]}, {0: anns}, "fake.mp4", configs
+    )
+
+    assert debug["0:1.00"]["track_id"] == 100
+    assert debug["0:5.00"]["track_id"] == 100
+    assert debug["0:1.50"]["track_id"] == 300
+    assert debug["0:5.50"]["track_id"] == 300
+    assert set(identity_by_take[0].location_track_ids) == {100, 300}
 
 
 # ---------------------------------------------------------------------------

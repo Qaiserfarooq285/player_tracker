@@ -33,6 +33,7 @@ from src.identity.verify import TakeIdentityResult
 from src.pipeline.annotated_video import render_full_annotated_video
 from src.pipeline.player_output import write_player_output
 from src.pipeline.profiler import build_run_profile
+from src.track.continuity import build_take_identities
 from src.track.run import run_track_stage
 from src.track.tracker import assign_take_id
 
@@ -102,6 +103,30 @@ def build_manual_identity_by_take(
     "arrow_distance_px", "agreement"}}`) written verbatim into `annotation_report.json` (Golden
     Rule 5: every association attempt, and whether the arrow corroborated/disagreed/filled in for
     colour, is traceable -- not just the ones that succeeded).
+
+    **Identity lock, bug fix 2026-08-31.** Each annotation used to be associated INDEPENDENTLY --
+    a fresh colour(+arrow) search across every candidate track near that instant, with no memory
+    of which physical player a PRIOR annotation of the SAME jersey number had already resolved to.
+    On real footage many teammates share the exact same kit colour, so two independent searches at
+    two different timestamps can (and, confirmed on real data --
+    `output/chelsea_burnley_target10/annotation_report.json`, jersey #10 resolved to raw track 208
+    at t=57.0s and a DIFFERENT real track 210 at t=60.0s -- did) land on two different physical
+    players. Fix: partition this take's own tracks into stitched "same physical player" identity
+    chains ONCE (`src.track.continuity.build_take_identities`, already tested, no new stitching
+    logic invented here). Per jersey number, the FIRST annotation in the take that resolves
+    confidently LOCKS that jersey number to the resolved track's own stitched chain for the rest of
+    the take; every LATER annotation of the SAME jersey number is restricted to candidates that are
+    members of that SAME chain -- never re-opened to an independent whole-field search, even when a
+    closer-by-colour distractor sits nearby. If no locked-chain member has a visible box near a
+    later instant, the honest result is caption-only (`track_id=None`,
+    `agreement="locked_identity_absent_at_instant"`), never a fallback to an unrestricted search
+    (that would silently reopen the exact swap this fix closes). A jersey number whose first
+    annotation itself has no confident match establishes no lock yet -- the next annotation of that
+    jersey number still gets a fresh independent search. Generic to any number of distinct jersey
+    numbers per take, each locking independently. When `selection_cfg` is absent (no
+    `configs["highlights"]["selection"]`, e.g. a minimal test config), `build_take_identities` has
+    no thresholds to stitch with, so this take falls back to the pre-fix independent-search
+    behaviour for every annotation -- exactly as before this fix, never a crash.
     """
     colour_cfg = configs["annotations"]
     sampling_cfg = configs["annotations"]["track_association"]
@@ -118,20 +143,68 @@ def build_manual_identity_by_take(
         if take is None or not anns:
             continue
 
+        # Stitched "same physical player" chains for this take, computed once (pure, no I/O).
+        # `identity_of` is `{}` whenever `selection_cfg` is unavailable -- see docstring -- and the
+        # lock logic below is a no-op in that case (falls through to independent search always).
+        identity_of: dict[int, int] = {}
+        if selection_cfg:
+            identity_of, _identity_confidence = build_take_identities(take_tracks, selection_cfg)
+
         associated_ids: set[int] = set()
-        for ann in anns:
-            track_id, distance, arrow_evidence = associate_annotation_to_track(
-                video_path,
-                take,
-                take_tracks,
-                ann,
-                colour_cfg,
-                decode_cfg,
-                sampling_cfg,
-                use_nvdec,
-                arrow_hints=arrow_hints,
-                selection_cfg=selection_cfg,
-            )
+        locked_chain_id_by_jersey: dict[int, int] = {}
+        for ann in sorted(anns, key=lambda a: a.t):
+            locked_chain_id = locked_chain_id_by_jersey.get(ann.jersey_number) if identity_of else None
+
+            if locked_chain_id is not None:
+                # Restricted search: only candidates that are members of the SAME stitched chain
+                # the jersey number already locked onto earlier in this take.
+                locked_tracks = [
+                    tr for tr in take_tracks if identity_of.get(tr.id) == locked_chain_id
+                ]
+                track_id, distance, arrow_evidence = associate_annotation_to_track(
+                    video_path,
+                    take,
+                    locked_tracks,
+                    ann,
+                    colour_cfg,
+                    decode_cfg,
+                    sampling_cfg,
+                    use_nvdec,
+                    arrow_hints=arrow_hints,
+                    selection_cfg=selection_cfg,
+                )
+                if track_id is None:
+                    # Honest caption-only: the locked identity has no visible candidate near this
+                    # instant -- never fall back to an unrestricted search (that would silently
+                    # reopen the exact cross-player swap this fix closes).
+                    arrow_evidence = {
+                        **arrow_evidence,
+                        "agreement": "locked_identity_absent_at_instant",
+                    }
+                arrow_evidence = {**arrow_evidence, "locked_chain_id": locked_chain_id}
+            else:
+                # No lock yet for this jersey number in this take -- fresh independent search
+                # across every candidate near this instant (the pre-fix behaviour).
+                track_id, distance, arrow_evidence = associate_annotation_to_track(
+                    video_path,
+                    take,
+                    take_tracks,
+                    ann,
+                    colour_cfg,
+                    decode_cfg,
+                    sampling_cfg,
+                    use_nvdec,
+                    arrow_hints=arrow_hints,
+                    selection_cfg=selection_cfg,
+                )
+                if track_id is not None and identity_of:
+                    # First confident resolution for this jersey number in this take -- lock its
+                    # STITCHED chain id (not the bare raw track id) for every later annotation of
+                    # the same jersey number in this take.
+                    chain_id = identity_of.get(track_id, track_id)
+                    locked_chain_id_by_jersey[ann.jersey_number] = chain_id
+                    arrow_evidence = {**arrow_evidence, "locked_chain_id": chain_id}
+
             debug[f"{take_id}:{ann.t:.2f}"] = {
                 "track_id": track_id,
                 "distance": distance,
