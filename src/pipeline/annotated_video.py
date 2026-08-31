@@ -67,7 +67,17 @@ _BANNER_SECONDS = 2.0  # how long the CUT banner stays on screen after a take st
 
 # Live-panel categories, matching statcard.md's own summary lines (CLAUDE.md §13.2) so the
 # overlay never presents a number the stat card itself doesn't also report (Golden Rule 5).
-_PANEL_EVENT_TYPES = ("touch", "pass", "sprint", "shot", "tackle", "save", "dribble")
+_PANEL_EVENT_TYPES = (
+    "touch",
+    "pass",
+    "sprint",
+    "shot",
+    "tackle",
+    "save",
+    "dribble",
+    "goal",
+    "assist",
+)
 _PANEL_LABELS = {
     "touch": "Touches",
     "pass": "Passes",
@@ -76,6 +86,8 @@ _PANEL_LABELS = {
     "tackle": "Tackles",
     "save": "Saves",
     "dribble": "Dribbles",
+    "goal": "Goals",
+    "assist": "Assists",
 }
 
 # Event captions (ADR-19/20, CLAUDE.md §13.1): "a brief on-screen caption naming the event, the
@@ -306,8 +318,6 @@ def _draw_live_panel(
             lines.append(
                 (f"{_PANEL_LABELS[etype]}: {(counts or {}).get(etype, 0)}", _PANEL_TEXT_COLOR)
             )
-        lines.append(("Goals: not available", _PANEL_TEXT_COLOR))
-        lines.append(("Assists: not available", _PANEL_TEXT_COLOR))
     else:
         lines.append(("IDENTITY: unverified in this segment", _PANEL_HEADER_COLOR))
         lines.append(("No target player statistics for this segment", _PANEL_TEXT_COLOR))
