@@ -28,6 +28,7 @@ from src.common.io import load_models_parquet, save_json, work_dir_for
 from src.common.logging import get_logger
 from src.common.types import Annotation, BallDetection, Event, Take, Track
 from src.common.video import probe
+from src.detect.overlay_mask import ArrowHint
 from src.identity.verify import TakeIdentityResult
 from src.pipeline.annotated_video import render_full_annotated_video
 from src.pipeline.player_output import write_player_output
@@ -77,24 +78,35 @@ def build_manual_identity_by_take(
     video_path: str | Path,
     configs: dict,
     use_nvdec: bool = True,
+    arrow_hints: list[ArrowHint] | None = None,
 ) -> tuple[dict[int, TakeIdentityResult], dict[str, dict]]:
     """Best-effort per-take track association (ADR-19): try to associate EACH of a take's own
-    annotations to a real track by colour+timing (`src.annotations.associate`). A take with at
-    least one confidently-associated annotation gets a `TakeIdentityResult` (red box on the UNION
-    of associated track ids across that take's own annotated instants -- best-effort continuity,
-    same spirit as CLAUDE.md §13.1's "ID must not visibly reset" rule); a take where NONE of its
-    own annotations associate confidently gets no identity at all (green boxes only in the
-    renderer) -- the event CAPTIONS (Stage 5) still fire regardless, per ADR-19's own
+    annotations to a real track by colour+timing (`src.annotations.associate`), CORROBORATED by
+    the burned-in-arrow hint when one exists near that instant (owner request, 2026-08-31 --
+    generic to every manual-mode video, not gated on a filename; see
+    `src.annotations.associate`'s own module docstring for the combination rule: colour stays
+    primary, the arrow is a corroborating/fallback signal, never a silent override). A take with
+    at least one confidently-associated annotation gets a `TakeIdentityResult` (red box on the
+    UNION of associated track ids across that take's own annotated instants -- best-effort
+    continuity, same spirit as CLAUDE.md §13.1's "ID must not visibly reset" rule); a take where
+    NONE of its own annotations associate confidently gets no identity at all (green boxes only in
+    the renderer) -- the event CAPTIONS (Stage 5) still fire regardless, per ADR-19's own
     "caption-only, no red box" rule.
 
+    `arrow_hints` defaults to `None`/empty -- every existing caller that doesn't pass it gets
+    exactly the prior colour-only behaviour (`associate_annotation_to_track` treats an empty/`None`
+    `arrow_hints` as "no arrow signal available", not an error).
+
     Returns `(identity_by_take, association_debug)` -- `association_debug` is a flat
-    per-annotation audit trail (`{"<take_id>:<t>": {"track_id", "distance"}}`) written verbatim
-    into `annotation_report.json` (Golden Rule 5: every association attempt is traceable, not just
-    the ones that succeeded).
+    per-annotation audit trail (`{"<take_id>:<t>": {"track_id", "distance", "arrow_track_id",
+    "arrow_distance_px", "agreement"}}`) written verbatim into `annotation_report.json` (Golden
+    Rule 5: every association attempt, and whether the arrow corroborated/disagreed/filled in for
+    colour, is traceable -- not just the ones that succeeded).
     """
     colour_cfg = configs["annotations"]
     sampling_cfg = configs["annotations"]["track_association"]
     decode_cfg = configs["hardware"]["decode"]
+    selection_cfg = configs.get("highlights", {}).get("selection")
 
     identity_by_take: dict[int, TakeIdentityResult] = {}
     debug: dict[str, dict] = {}
@@ -108,10 +120,23 @@ def build_manual_identity_by_take(
 
         associated_ids: set[int] = set()
         for ann in anns:
-            track_id, distance = associate_annotation_to_track(
-                video_path, take, take_tracks, ann, colour_cfg, decode_cfg, sampling_cfg, use_nvdec
+            track_id, distance, arrow_evidence = associate_annotation_to_track(
+                video_path,
+                take,
+                take_tracks,
+                ann,
+                colour_cfg,
+                decode_cfg,
+                sampling_cfg,
+                use_nvdec,
+                arrow_hints=arrow_hints,
+                selection_cfg=selection_cfg,
             )
-            debug[f"{take_id}:{ann.t:.2f}"] = {"track_id": track_id, "distance": distance}
+            debug[f"{take_id}:{ann.t:.2f}"] = {
+                "track_id": track_id,
+                "distance": distance,
+                **arrow_evidence,
+            }
             if track_id is not None:
                 associated_ids.add(track_id)
 
@@ -210,6 +235,8 @@ def run_manual_events_pipeline_for_video(
     takes = load_models_parquet(work_dir / "shots" / "takes.parquet", Take)
     tracks = load_models_parquet(work_dir / "track" / "tracks.parquet", Track)
     balls = load_models_parquet(work_dir / "detect" / "ball_detections.parquet", BallDetection)
+    arrow_path = work_dir / "detect" / "arrow_hints.parquet"
+    arrow_hints = load_models_parquet(arrow_path, ArrowHint) if arrow_path.exists() else []
 
     tracks_by_take: dict[int, list[Track]] = defaultdict(list)
     for tr in tracks:
@@ -224,7 +251,13 @@ def run_manual_events_pipeline_for_video(
         )
 
     identity_by_take, association_debug = build_manual_identity_by_take(
-        takes, dict(tracks_by_take), annotations_by_take, video_path, configs, use_nvdec
+        takes,
+        dict(tracks_by_take),
+        annotations_by_take,
+        video_path,
+        configs,
+        use_nvdec,
+        arrow_hints=arrow_hints,
     )
 
     annotation_report = {

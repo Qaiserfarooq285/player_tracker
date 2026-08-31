@@ -69,7 +69,15 @@ def test_build_manual_identity_by_take_verified_when_association_succeeds(monkey
     track = _track(1, 1.0)
     anns = [_annotation(1.0)]
 
-    monkeypatch.setattr(me_mod, "associate_annotation_to_track", lambda *a, **k: (1, 5.0))
+    monkeypatch.setattr(
+        me_mod,
+        "associate_annotation_to_track",
+        lambda *a, **k: (
+            1,
+            5.0,
+            {"arrow_track_id": None, "arrow_distance_px": None, "agreement": "colour_only"},
+        ),
+    )
 
     identity_by_take, debug = me_mod.build_manual_identity_by_take(
         [take],
@@ -83,6 +91,7 @@ def test_build_manual_identity_by_take_verified_when_association_succeeds(monkey
     assert identity_by_take[0].location_track_ids == [1]
     assert identity_by_take[0].location_method == "manual_annotation_colour_match"
     assert "0:1.00" in debug
+    assert debug["0:1.00"]["agreement"] == "colour_only"
 
 
 def test_build_manual_identity_by_take_no_identity_when_association_fails(monkeypatch):
@@ -90,7 +99,15 @@ def test_build_manual_identity_by_take_no_identity_when_association_fails(monkey
     track = _track(1, 1.0)
     anns = [_annotation(1.0)]
 
-    monkeypatch.setattr(me_mod, "associate_annotation_to_track", lambda *a, **k: (None, 55.0))
+    monkeypatch.setattr(
+        me_mod,
+        "associate_annotation_to_track",
+        lambda *a, **k: (
+            None,
+            55.0,
+            {"arrow_track_id": None, "arrow_distance_px": None, "agreement": "no_confident_signal"},
+        ),
+    )
 
     identity_by_take, _debug = me_mod.build_manual_identity_by_take(
         [take],
@@ -100,6 +117,38 @@ def test_build_manual_identity_by_take_no_identity_when_association_fails(monkey
         {"annotations": {"track_association": {}}, "hardware": {"decode": {}}},
     )
     assert identity_by_take == {}
+
+
+def test_build_manual_identity_by_take_arrow_fallback_recorded_in_debug(monkeypatch):
+    """When colour found nothing but the arrow signal did, `build_manual_identity_by_take` must
+    still end up with a verified identity (via the arrow's own fallback pick) AND the debug trail
+    must say so (`agreement == "arrow_fallback"`) -- Golden Rule 5 traceability, not just a bare
+    track id with no explanation of which signal actually produced it."""
+    take = _take(0, 0.0, 10.0)
+    track = _track(1, 1.0)
+    anns = [_annotation(1.0)]
+
+    monkeypatch.setattr(
+        me_mod,
+        "associate_annotation_to_track",
+        lambda *a, **k: (
+            1,
+            42.0,
+            {"arrow_track_id": 1, "arrow_distance_px": 42.0, "agreement": "arrow_fallback"},
+        ),
+    )
+
+    identity_by_take, debug = me_mod.build_manual_identity_by_take(
+        [take],
+        {0: [track]},
+        {0: anns},
+        "fake.mp4",
+        {"annotations": {"track_association": {}}, "hardware": {"decode": {}}},
+        arrow_hints=["not empty -- just needs to be truthy for this monkeypatched test"],
+    )
+    assert identity_by_take[0].status == "verified"
+    assert debug["0:1.00"]["agreement"] == "arrow_fallback"
+    assert debug["0:1.00"]["arrow_track_id"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +207,15 @@ def test_run_manual_events_pipeline_smoke(tmp_path, monkeypatch):
         lambda path, model: {"takes.parquet": [take], "tracks.parquet": [track]}.get(path.name, []),
     )
     monkeypatch.setattr(me_mod, "probe", lambda path: {"width": 100, "height": 100, "fps": 30.0})
-    monkeypatch.setattr(me_mod, "associate_annotation_to_track", lambda *a, **k: (1, 5.0))
+    monkeypatch.setattr(
+        me_mod,
+        "associate_annotation_to_track",
+        lambda *a, **k: (
+            1,
+            5.0,
+            {"arrow_track_id": None, "arrow_distance_px": None, "agreement": "colour_only"},
+        ),
+    )
     monkeypatch.setattr(me_mod, "render_full_annotated_video", lambda *a, **k: None)
     monkeypatch.setattr(me_mod, "write_player_output", fake_write_player_output)
 
