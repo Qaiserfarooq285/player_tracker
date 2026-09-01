@@ -157,7 +157,14 @@ def aggregate_take_identity(
     among all digit strings seen (a tie for the top count is `"unverified"`, never broken
     arbitrarily — owner's explicit rule). `confidence` blends how much of the total evidence
     agrees with the mean confidence of the agreeing reads themselves; a verified result
-    additionally must clear `agg_cfg['min_verified_confidence']`.
+    additionally must clear BOTH `agg_cfg['min_agreement_fraction']` (a structural share-of-reads
+    floor, ADR-21 follow-up) and `agg_cfg['min_verified_confidence']`.
+
+    The two floors are deliberately separate: `min_agreeing_frames` is an ABSOLUTE count, trivially
+    met once a track accumulates 40+ reads, and `min_verified_confidence` is diluted by the source's
+    own self-reported confidence — which PARSeq mis-calibrates badly on small crops (measured: 0.85+
+    even on wrong reads). `min_agreement_fraction` is the one check that asks only "did this digit
+    actually win a real share of this track's own reads", independent of model self-confidence.
 
     ADR-18 (1) — human-in-the-loop override (CLAUDE.md Golden Rule 4): when
     `human_confirmed_jersey` is given AND at least one read in `reads` actually matches it, a
@@ -245,6 +252,20 @@ def aggregate_take_identity(
     agreement_fraction = len(supporting) / len(reads)
     mean_source_conf = sum(r.confidence for r in supporting) / len(supporting)
     confidence = min(1.0, 0.5 * agreement_fraction + 0.5 * mean_source_conf)
+
+    # ADR-21 follow-up: a purely STRUCTURAL share-of-reads floor, checked before the blended
+    # confidence below. `min_agreeing_frames` is an absolute count (trivially met at 40+ reads)
+    # and the blend is diluted by PARSeq's uncalibrated per-read confidence, so without this a
+    # 15%-agreement plurality still "verified". See this key's own comment in
+    # configs/identity.yaml for the measured calibration and its honestly-thin margin.
+    if agreement_fraction < agg_cfg["min_agreement_fraction"]:
+        return {
+            "jersey_number": None,
+            "status": "unverified",
+            "confidence": confidence,
+            "evidence_frames": [],
+            "human_override_note": human_note,
+        }
 
     if confidence < agg_cfg["min_verified_confidence"]:
         return {

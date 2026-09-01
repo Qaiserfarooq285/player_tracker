@@ -17,7 +17,13 @@ from src.identity.jersey_ocr import read_jersey_digits
 from src.identity.jersey_vlm import _parse_response, classify_jersey_number
 from src.identity.verify import FrameRead, aggregate_take_identity
 
-AGG_CFG = {"min_agreeing_frames": 2, "min_verified_confidence": 0.3}
+# `min_agreement_fraction` 0.0 here so these cases keep testing the count/tie/confidence rules
+# they were written for; the ADR-21 share-of-reads floor has its own dedicated tests below.
+AGG_CFG = {
+    "min_agreeing_frames": 2,
+    "min_verified_confidence": 0.3,
+    "min_agreement_fraction": 0.0,
+}
 
 
 def _read(t: float, idx: int, source: str, digits: str | None, conf: float) -> FrameRead:
@@ -114,7 +120,11 @@ def test_aggregate_no_digit_reads_at_all_is_unverified():
 
 
 def test_aggregate_low_confidence_agreement_still_gated_by_min_verified_confidence():
-    cfg = {"min_agreeing_frames": 2, "min_verified_confidence": 0.9}  # unreachably high floor
+    cfg = {
+        "min_agreeing_frames": 2,
+        "min_verified_confidence": 0.9,  # unreachably high floor
+        "min_agreement_fraction": 0.0,
+    }
     reads = [_read(0.0, 0, "ocr", "7", 0.5), _read(0.5, 1, "ocr", "7", 0.5)]
     result = aggregate_take_identity(reads, cfg)
     assert result["status"] == "unverified"
@@ -366,3 +376,78 @@ def test_classify_jersey_number_all_models_quota_exhausted_is_call_failed_never_
     assert conf == 0.0
     assert raw.startswith("CALL_FAILED")
     assert mock_post.call_count == len(VLM_CFG["models"])  # one attempt per model, no retries
+
+
+# ---------------------------------------------------------------------------
+# ADR-21 follow-up -- `min_agreement_fraction`, the structural share-of-reads floor.
+#
+# Why it exists (all measured on video2 take 0, 720p broadcast): `min_agreeing_frames` is an
+# ABSOLUTE count, trivially satisfied once a track accumulates 40-140 reads, and
+# `min_verified_confidence` blends agreement 50/50 with the source's own confidence -- which
+# PARSeq mis-calibrates badly on small crops (~0.85-0.94 even when wrong). The blend therefore
+# floated essentially any plurality over the 0.3 bar: 13 of 13 scanned tracks "verified",
+# including every wrong one. This floor asks only "did this digit win a real share of THIS
+# track's own reads", independent of model self-confidence.
+# ---------------------------------------------------------------------------
+
+_FRACTION_CFG = {
+    "min_agreeing_frames": 2,
+    "min_verified_confidence": 0.3,
+    "min_agreement_fraction": 0.40,
+}
+
+
+def _reads(digit_counts: dict[str, int], conf: float = 0.9) -> list[FrameRead]:
+    """One FrameRead per read, `digit_counts` mapping digit-string -> how many reads said it."""
+    out: list[FrameRead] = []
+    i = 0
+    for digits, n in digit_counts.items():
+        for _ in range(n):
+            out.append(_read(float(i), i, "parseq_soccernet", digits, conf))
+            i += 1
+    return out
+
+
+def test_weak_plurality_is_unverified_even_with_high_source_confidence():
+    """The real failure this closes: a 36%-agreement plurality with high model confidence was
+    being verified. Mirrors real track 189 (truly #19, read "10" at 36%)."""
+    reads = _reads({"10": 15, "19": 12, "13": 9, "18": 6})  # top = 15/42 = 36%
+    result = aggregate_take_identity(reads, _FRACTION_CFG)
+    assert result["jersey_number"] is None
+    assert result["status"] == "unverified"
+
+
+def test_strong_agreement_still_verifies():
+    """Mirrors real track 208 (truly #8, read at 95%) -- the floor must not cost a good read."""
+    reads = _reads({"8": 19, "3": 1})  # 95%
+    result = aggregate_take_identity(reads, _FRACTION_CFG)
+    assert result["jersey_number"] == 8
+    assert result["status"] == "verified"
+
+
+def test_agreement_fraction_boundary_is_inclusive():
+    """Exactly at the floor verifies; just below it does not -- the threshold is `<`, not `<=`."""
+    at_floor = aggregate_take_identity(_reads({"7": 4, "1": 3, "2": 3}), _FRACTION_CFG)  # 40%
+    assert at_floor["jersey_number"] == 7
+    below = aggregate_take_identity(_reads({"7": 4, "1": 3, "2": 3, "5": 1}), _FRACTION_CFG)  # 36%
+    assert below["jersey_number"] is None
+
+
+def test_agreement_floor_does_not_apply_to_human_confirmed_jersey():
+    """ADR-18 / Golden Rule 4: a human who watched the footage outranks a vote, so a single
+    supporting read still verifies regardless of how small a share of the reads it is."""
+    reads = _reads({"10": 15, "2": 1})  # "2" is only 1/16 = 6%
+    result = aggregate_take_identity(reads, _FRACTION_CFG, human_confirmed_jersey=2)
+    assert result["jersey_number"] == 2
+    assert result["status"] == "verified"
+    assert "ACCEPTED" in (result["human_override_note"] or "")
+
+
+def test_unverified_by_fraction_still_reports_its_computed_confidence():
+    """Golden Rule 5: the rejection keeps the number it computed, so a run report can say HOW
+    close the evidence came rather than just dropping it silently."""
+    # a clear (non-tie) winner that still falls short of the floor: 4/12 = 33%
+    result = aggregate_take_identity(_reads({"10": 4, "19": 3, "4": 3, "5": 2}), _FRACTION_CFG)
+    assert result["jersey_number"] is None
+    assert result["status"] == "unverified"
+    assert result["confidence"] > 0.0

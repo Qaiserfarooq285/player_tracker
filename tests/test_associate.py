@@ -426,7 +426,13 @@ def _jersey_reid_identity_cfg() -> dict:
                 "bottom_frac": 0.45,
             }
         },
-        "aggregation": {"min_agreeing_frames": 2, "min_verified_confidence": 0.0},
+        "aggregation": {
+            "min_agreeing_frames": 2,
+            "min_verified_confidence": 0.0,
+            # 0.0 keeps this fixture exercising the CHAIN logic it is about; the
+            # share-of-reads floor itself has dedicated tests in test_identity.py.
+            "min_agreement_fraction": 0.0,
+        },
     }
 
 

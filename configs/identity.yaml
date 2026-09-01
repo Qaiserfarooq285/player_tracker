@@ -150,3 +150,22 @@ aggregation:
   # mean source confidence, see src/identity/verify.py::aggregate_take_identity) must still clear
   # this floor — a bare 2-agreeing-frames-out-of-40-read-attempts result is technically "temporal
   # agreement" but not something to present as reliable identification.
+  min_agreement_fraction: 0.40 # ADR-21 follow-up. `min_agreeing_frames` is an ABSOLUTE count, so
+  # it is trivially satisfied once a track has 40-140 reads, and `min_verified_confidence` above
+  # turned out to be effectively INERT: it blends agreement 50/50 with the source's own
+  # confidence, and PARSeq's per-read confidence is uncalibrated on this footage (~0.85-0.94 even
+  # when wrong -- measured, it returned 1.000 on a garbage decode), which floats almost any
+  # plurality over the 0.3 bar. Measured effect: 13 of 13 scanned tracks "verified", including
+  # every wrong one. This is a SEPARATE, purely structural requirement -- the winning digit must
+  # command a real share of that track's own reads, independent of how confident the model claims
+  # to be.
+  # Calibrated on video2 take 0 against five visually-confirmed tracks (ADR-21):
+  #     confirmed CORRECT reads: 95%, 86%, 58%, 44% agreement
+  #     confirmed WRONG read:    36% agreement
+  # 0.40 drops the known-wrong read while keeping all four known-correct ones. ⚠️ The margin is
+  # genuinely THIN (44% correct vs 36% wrong is only 8 points) and rests on one confirmed error,
+  # so treat this as a conservative guard, NOT a well-separated threshold -- the per-take
+  # uniqueness check (one number, one player) is the structurally stronger guarantee. Revisit if a
+  # larger labeled slice becomes available (§9.1's own "our Veo slice" is still unlabeled).
+  # Deliberately does NOT apply to the ADR-18 human-confirmed-jersey path, which by design needs
+  # only one supporting read (Golden Rule 4: a human who watched the footage outranks a vote).
