@@ -26,6 +26,8 @@ from src.common.io import load_yaml
 from src.common.types import Annotation, BBox, EventType, Take, Track, TrackBox
 from src.detect.overlay_mask import ArrowHint
 from src.identity.jersey_ocr import OcrRead
+from src.identity.jersey_parseq import ParseqRead
+from src.identity.legibility import LegibilityRead
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -763,3 +765,189 @@ def test_read_jersey_number_for_candidates_priority_track_id_gets_first_claim_on
     assert (track_id, source) == (2, "vlm")
     assert evidence["outcome"] == "matched"
     assert evidence["n_vlm_calls"] == 2  # both spent on the prioritized track 2, which matched
+
+
+# ---------------------------------------------------------------------------
+# Chain-priority logic (owner-authorized 2026-08-31, CLAUDE.md §7): legibility gate ->
+# PARSeq-SoccerNet -> EasyOCR -> VLM, mirroring src/identity/verify.py's own
+# `_collect_reads_for_take` chain, now reused by manual-mode reacquisition too. All three model
+# stages are mocked -- no real checkpoint/GPU/network involved.
+# ---------------------------------------------------------------------------
+
+
+def _fake_legible_by_marker(legible_markers: set[int]):
+    def _fake(crop, model, legibility_cfg):
+        marker = int(crop[0, 0, 0])
+        is_legible_ = marker in legible_markers
+        return LegibilityRead(confidence=0.9 if is_legible_ else 0.1, is_legible=is_legible_)
+
+    return _fake
+
+
+def _fake_parseq_by_marker(marker_to_digits: dict[int, str | None], confident_markers: set[int]):
+    def _fake(crop, model, transform, parseq_cfg):
+        marker = int(crop[0, 0, 0])
+        digits = marker_to_digits.get(marker)
+        is_confident = marker in confident_markers and digits is not None
+        return ParseqRead(
+            digits=digits,
+            confidence=0.9 if is_confident else 0.2,
+            is_confident=is_confident,
+            raw_text=digits,
+        )
+
+    return _fake
+
+
+def test_read_jersey_number_for_candidates_confident_legible_parseq_wins_outright(monkeypatch):
+    """A legible crop that PARSeq reads confidently and correctly must win WITHOUT ever falling
+    through to OCR -- the chain's own cost/priority ordering, not just its correctness."""
+    box_a = BBox(x1=10, y1=10, x2=40, y2=70)
+    frame = _marker_frame()
+    _stamp_box(frame, box_a, marker=1)
+    monkeypatch.setattr(associate_mod, "decode_frames", _fake_decode_over_range(frame))
+    monkeypatch.setattr(associate_mod, "is_legible", _fake_legible_by_marker({1}))
+    monkeypatch.setattr(
+        associate_mod, "read_jersey_number_parseq", _fake_parseq_by_marker({1: "7"}, {1})
+    )
+
+    def _boom_ocr(*a, **k):
+        raise AssertionError("OCR must not run once PARSeq already confidently read the digit")
+
+    monkeypatch.setattr(associate_mod, "read_jersey_digits", _boom_ocr)
+
+    track_a = _candidate(1, [4.0, 6.0], box_a)
+    track_id, source, evidence = read_jersey_number_for_candidates(
+        "fake.mp4",
+        _take_for_reid(),
+        [track_a],
+        t=5.0,
+        claimed_jersey_number=7,
+        identity_cfg=_jersey_reid_identity_cfg(),
+        jersey_reid_cfg=_jersey_reid_cfg(),
+        decode_cfg=_DECODE_CFG,
+        sampling_cfg=_SAMPLING_CFG,
+        reader=object(),
+        gemini_api_key=None,
+        legibility_model=object(),
+        parseq_model=object(),
+        parseq_transform=object(),
+    )
+    assert (track_id, source) == (1, "parseq_soccernet")
+    assert evidence["outcome"] == "matched"
+    assert evidence["n_legible"] == 2
+    assert evidence["n_parseq_confident"] == 2
+    assert evidence["n_ocr_confident"] == 0
+
+
+def test_read_jersey_number_for_candidates_illegible_crop_falls_back_to_ocr(monkeypatch):
+    """A crop the legibility gate rejects must never reach PARSeq at all -- OCR is the honest
+    fallback, exactly the prior (pre-PARSeq) behaviour."""
+    box_a = BBox(x1=10, y1=10, x2=40, y2=70)
+    frame = _marker_frame()
+    _stamp_box(frame, box_a, marker=1)
+    monkeypatch.setattr(associate_mod, "decode_frames", _fake_decode_over_range(frame))
+    monkeypatch.setattr(associate_mod, "is_legible", _fake_legible_by_marker(set()))  # illegible
+
+    def _boom_parseq(*a, **k):
+        raise AssertionError("PARSeq must not run on a crop the legibility gate rejected")
+
+    monkeypatch.setattr(associate_mod, "read_jersey_number_parseq", _boom_parseq)
+    monkeypatch.setattr(associate_mod, "read_jersey_digits", _fake_ocr_by_marker({1: "7"}))
+
+    track_a = _candidate(1, [4.0, 6.0], box_a)
+    track_id, source, evidence = read_jersey_number_for_candidates(
+        "fake.mp4",
+        _take_for_reid(),
+        [track_a],
+        t=5.0,
+        claimed_jersey_number=7,
+        identity_cfg=_jersey_reid_identity_cfg(),
+        jersey_reid_cfg=_jersey_reid_cfg(),
+        decode_cfg=_DECODE_CFG,
+        sampling_cfg=_SAMPLING_CFG,
+        reader=object(),
+        gemini_api_key=None,
+        legibility_model=object(),
+        parseq_model=object(),
+        parseq_transform=object(),
+    )
+    assert (track_id, source) == (1, "ocr")
+    assert evidence["n_legible"] == 0
+    assert evidence["n_parseq_confident"] == 0
+    assert evidence["n_ocr_confident"] == 2
+
+
+def test_read_jersey_number_for_candidates_legible_but_unconfident_parseq_falls_back_to_ocr(
+    monkeypatch,
+):
+    """A legible crop where PARSeq's OWN read is unconfident must still fall through to OCR --
+    legibility alone does not short-circuit the chain, only a CONFIDENT PARSeq read does."""
+    box_a = BBox(x1=10, y1=10, x2=40, y2=70)
+    frame = _marker_frame()
+    _stamp_box(frame, box_a, marker=1)
+    monkeypatch.setattr(associate_mod, "decode_frames", _fake_decode_over_range(frame))
+    monkeypatch.setattr(associate_mod, "is_legible", _fake_legible_by_marker({1}))
+    # PARSeq "reads" a wrong/low-confidence digit -- confident_markers is empty, so it never wins.
+    monkeypatch.setattr(
+        associate_mod, "read_jersey_number_parseq", _fake_parseq_by_marker({1: "3"}, set())
+    )
+    monkeypatch.setattr(associate_mod, "read_jersey_digits", _fake_ocr_by_marker({1: "7"}))
+
+    track_a = _candidate(1, [4.0, 6.0], box_a)
+    track_id, source, evidence = read_jersey_number_for_candidates(
+        "fake.mp4",
+        _take_for_reid(),
+        [track_a],
+        t=5.0,
+        claimed_jersey_number=7,
+        identity_cfg=_jersey_reid_identity_cfg(),
+        jersey_reid_cfg=_jersey_reid_cfg(),
+        decode_cfg=_DECODE_CFG,
+        sampling_cfg=_SAMPLING_CFG,
+        reader=object(),
+        gemini_api_key=None,
+        legibility_model=object(),
+        parseq_model=object(),
+        parseq_transform=object(),
+    )
+    assert (track_id, source) == (1, "ocr")
+    assert evidence["n_legible"] == 2
+    assert evidence["n_parseq_confident"] == 0
+    assert evidence["n_ocr_confident"] == 2
+
+
+def test_read_jersey_number_for_candidates_none_models_preserve_prior_ocr_only_behaviour(
+    monkeypatch,
+):
+    """Default `legibility_model=None, parseq_model=None` (every pre-existing caller/test) must
+    behave EXACTLY as before this chain existed: legibility/PARSeq never even get referenced."""
+    box_a = BBox(x1=10, y1=10, x2=40, y2=70)
+    frame = _marker_frame()
+    _stamp_box(frame, box_a, marker=1)
+    monkeypatch.setattr(associate_mod, "decode_frames", _fake_decode_over_range(frame))
+
+    def _boom(*a, **k):
+        raise AssertionError("legibility/PARSeq must not be referenced when both models are None")
+
+    monkeypatch.setattr(associate_mod, "is_legible", _boom)
+    monkeypatch.setattr(associate_mod, "read_jersey_number_parseq", _boom)
+    monkeypatch.setattr(associate_mod, "read_jersey_digits", _fake_ocr_by_marker({1: "7"}))
+
+    track_a = _candidate(1, [4.0, 6.0], box_a)
+    track_id, source, evidence = read_jersey_number_for_candidates(
+        "fake.mp4",
+        _take_for_reid(),
+        [track_a],
+        t=5.0,
+        claimed_jersey_number=7,
+        identity_cfg=_jersey_reid_identity_cfg(),
+        jersey_reid_cfg=_jersey_reid_cfg(),
+        decode_cfg=_DECODE_CFG,
+        sampling_cfg=_SAMPLING_CFG,
+        reader=object(),
+        gemini_api_key=None,
+    )
+    assert (track_id, source) == (1, "ocr")
+    assert evidence["n_legible"] == 0
+    assert evidence["n_parseq_confident"] == 0
