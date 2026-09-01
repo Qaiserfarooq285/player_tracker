@@ -194,7 +194,13 @@ def expanded_bbox_region(bbox: BBox, expand_frac: float) -> BBox:
     )
 
 
-def _candidate_lifespan(tr: Track, take: Take, t: float, window_s: float) -> tuple[float, float]:
+def _candidate_lifespan(
+    tr: Track,
+    take: Take,
+    t: float,
+    window_s: float,
+    max_span_s: float | None = None,
+) -> tuple[float, float]:
     """`(start, end)` -- candidate `tr`'s own box lifespan, widened by `window_s` either side of
     `t` (so a track whose lifespan is very short around `t` still gets a real span to sample from),
     clamped into `take`. Split out from `_candidate_target_timestamps` so the DECODE window
@@ -213,13 +219,22 @@ def _candidate_lifespan(tr: Track, take: Take, t: float, window_s: float) -> tup
     end = max(end, t + window_s)
     start = max(take.t_start, start)
     end = min(take.t_end, end)
+    if max_span_s is not None and max_span_s > 0:
+        half_span = max_span_s / 2.0
+        start = max(start, t - half_span)
+        end = min(end, t + half_span)
     if end <= start:
         end = start
     return start, end
 
 
 def _candidate_target_timestamps(
-    tr: Track, take: Take, t: float, window_s: float, max_frames: int
+    tr: Track,
+    take: Take,
+    t: float,
+    window_s: float,
+    max_frames: int,
+    max_span_s: float | None = None,
 ) -> list[float]:
     """Up to `max_frames` timestamps spread across candidate `tr`'s OWN box lifespan
     (`_candidate_lifespan`) -- owner-reported bug fix, 2026-08-31: a single crop near the
@@ -233,7 +248,7 @@ def _candidate_target_timestamps(
     single instant. Deliberately bounded to `max_frames` (never "scan the whole track") -- this is
     the cost-bounding knob `jersey_reid_cfg['max_frames_per_candidate']` controls.
     """
-    lifespan_start, lifespan_end = _candidate_lifespan(tr, take, t, window_s)
+    lifespan_start, lifespan_end = _candidate_lifespan(tr, take, t, window_s, max_span_s)
     if lifespan_end <= lifespan_start or max_frames <= 1:
         return [t]
     span = lifespan_end - lifespan_start
@@ -341,13 +356,17 @@ def read_jersey_number_for_candidates(
     parseq_cfg = identity_cfg.get("parseq_soccernet", {})
     max_vlm = jersey_reid_cfg["max_vlm_escalations_per_call"]
     max_frames_per_candidate = jersey_reid_cfg["max_frames_per_candidate"]
+    max_candidate_span_s = jersey_reid_cfg.get("max_candidate_span_s")
     min_disambiguation_margin = jersey_reid_cfg["min_disambiguation_margin"]
 
     lifespans_by_track: dict[int, tuple[float, float]] = {
-        tr.id: _candidate_lifespan(tr, take, t, window_s) for tr in candidates
+        tr.id: _candidate_lifespan(tr, take, t, window_s, max_candidate_span_s)
+        for tr in candidates
     }
     target_ts_by_track: dict[int, list[float]] = {
-        tr.id: _candidate_target_timestamps(tr, take, t, window_s, max_frames_per_candidate)
+        tr.id: _candidate_target_timestamps(
+            tr, take, t, window_s, max_frames_per_candidate, max_candidate_span_s
+        )
         for tr in candidates
     }
     # Decode window sized from the TRUE lifespan bounds (not the scattered sample points' own

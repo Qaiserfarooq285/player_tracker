@@ -811,7 +811,10 @@ def render_full_annotated_video(
                         y1,
                         x2,
                         y2,
-                        f"#{identity.jersey_number} | TARGET | ID: {tr.id}",
+                        # per-track number where the take names more than one target player
+                        # (assist/goal pair) -- falls back to the take-level number otherwise.
+                        f"#{identity.jersey_by_track_id.get(tr.id, identity.jersey_number)}"
+                        f" | TARGET | ID: {tr.id}",
                         _RED,
                         _px(_RED_THICKNESS, overlay_scale),
                         _LABEL_FONT_SCALE_TARGET * overlay_scale,

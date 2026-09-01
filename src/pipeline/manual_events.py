@@ -168,6 +168,7 @@ def build_manual_identity_by_take(
     identity_cfg = configs.get("identity")
     jersey_reid_cfg = configs["annotations"].get("jersey_reid", {})
     jersey_reid_enabled = bool(identity_cfg) and jersey_reid_cfg.get("enabled", False)
+    require_confirmed_jersey = bool(jersey_reid_cfg.get("require_confirmed_jersey", False))
 
     identity_by_take: dict[int, TakeIdentityResult] = {}
     debug: dict[str, dict] = {}
@@ -211,6 +212,10 @@ def build_manual_identity_by_take(
                 )
 
             associated_ids: set[int] = set()
+            # owner-reported bug fix 2026-09-01: remember WHICH jersey number each associated
+            # track belongs to, so a take naming two different target players (an assist/goal
+            # pair) labels each box with its own number instead of one take-level number.
+            jersey_by_track_id: dict[int, int] = {}
             any_jersey_confirmed = False  # owner-reported bug fix 2026-08-31: True only when AT
             # LEAST ONE of this take's own annotations actually resolved via a real digit read
             # (association_signal starting "jersey_"), never just because SOME track got a
@@ -355,6 +360,21 @@ def build_manual_identity_by_take(
                                 }
                             track_id = jersey_id
                             association_signal = f"jersey_{jersey_source}"
+                        elif require_confirmed_jersey:
+                            # A kit colour only narrows the field to several teammates; it cannot
+                            # establish the claimed printed number.  Keeping the colour-selected
+                            # id here used to render a confident-looking TARGET box on whichever
+                            # teammate happened to be closest in Lab space. Preserve that useful
+                            # candidate evidence, but render this event caption-only until a
+                            # temporally-agreeing jersey read actually identifies the player.
+                            if track_id is not None:
+                                arrow_evidence = {
+                                    **arrow_evidence,
+                                    "unverified_colour_candidate_track_id": track_id,
+                                }
+                            track_id = None
+                            distance = None
+                            association_signal = "jersey_unverified"
 
                     if track_id is not None and identity_of:
                         # First confident resolution for this jersey number in this take -- lock
@@ -372,13 +392,14 @@ def build_manual_identity_by_take(
                 }
                 if track_id is not None:
                     associated_ids.add(track_id)
+                    jersey_by_track_id[track_id] = ann.jersey_number
                 if association_signal.startswith("jersey_"):
                     any_jersey_confirmed = True
 
             if not associated_ids:
                 logger.info(
                     "manual mode take=%d: none of its %d annotation(s) could be confidently "
-                    "associated to a track by colour -- events for this take will render as "
+                    "associated to the claimed jersey -- events for this take will render as "
                     "captions only, no red box (Golden Rule 5)",
                     take_id,
                     len(anns),
@@ -400,6 +421,7 @@ def build_manual_identity_by_take(
                 evidence_frames=[],
                 location_method="manual_annotation_colour_match",
                 location_track_ids=sorted(associated_ids),
+                jersey_by_track_id=jersey_by_track_id,
                 association_confirmed_by_jersey=any_jersey_confirmed,
             )
     finally:
@@ -414,6 +436,7 @@ def run_manual_events_pipeline_for_video(
     video_path: str | Path,
     configs: dict[str, dict],
     annotations_path: str | Path,
+    target_jersey: int | None = None,
     work_root: str | Path = "work",
     output_root: str | Path = "output",
     use_nvdec: bool = True,
@@ -422,9 +445,11 @@ def run_manual_events_pipeline_for_video(
 
     Detection/tracking (Stage 0.5-3) run via the same cached `run_track_stage` every other flow
     uses. Everything after that is replaced: the parsed sidecar becomes every player's own event
-    list directly (`annotation_to_event`), grouped by the jersey number each line itself names --
-    never by an inferred/stitched identity. Deletes any stale prior output first, same contract as
-    `run_extended_pipeline_for_video`.
+    list directly (`annotation_to_event`). When `target_jersey` is supplied (the web UI's jersey
+    field), it is the ONE primary player: only annotations for that number are allowed to establish
+    a red target track or receive a player stat card. Annotations naming other players remain in
+    the video as event captions, but can never replace the requested player as the target.
+    Deletes any stale prior output first, same contract as `run_extended_pipeline_for_video`.
     """
     video_path = Path(video_path)
     work_dir = work_dir_for(video_path, root=work_root)
@@ -502,10 +527,23 @@ def run_manual_events_pipeline_for_video(
             "EasyOCR alone (no VLM escalation for OCR-ambiguous crops)"
         )
 
+    # The user-selected jersey is the primary identity.  For example, "#10 assists #2" must
+    # never cause #2's goal annotation to become the red TARGET player merely because it is the
+    # last or lowest-numbered annotation in the take.
+    identity_annotations_by_take = annotations_by_take
+    if target_jersey is not None:
+        identity_annotations_by_take = {
+            take_id: [ann for ann in anns if ann.jersey_number == target_jersey]
+            for take_id, anns in annotations_by_take.items()
+        }
+        identity_annotations_by_take = {
+            take_id: anns for take_id, anns in identity_annotations_by_take.items() if anns
+        }
+
     identity_by_take, association_debug = build_manual_identity_by_take(
         takes,
         dict(tracks_by_take),
-        annotations_by_take,
+        identity_annotations_by_take,
         video_path,
         configs,
         use_nvdec,
@@ -516,6 +554,7 @@ def run_manual_events_pipeline_for_video(
     annotation_report = {
         "video": str(video_path),
         "annotations_path": str(annotations_path),
+        "target_jersey": target_jersey,
         "parsed": [a.model_dump(mode="json") for a in annotations],
         "problems": problems,
         "unassigned_annotations": n_unassigned,
@@ -560,9 +599,9 @@ def run_manual_events_pipeline_for_video(
     logger.info("manual-mode annotated video render -> %s", final_video_path)
 
     takes_by_id = {t.id: t for t in takes}
-    jersey_numbers = sorted(events_by_number.keys())
+    jersey_numbers = [target_jersey] if target_jersey is not None else sorted(events_by_number.keys())
     for number in jersey_numbers:
-        events = events_by_number[number]
+        events = events_by_number.get(number, [])
         player_dir = output_dir / "players" / f"player_{number}"
         write_player_output(
             player_dir,

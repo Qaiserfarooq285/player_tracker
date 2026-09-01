@@ -96,6 +96,13 @@ class TakeIdentityResult(BaseModel):
     evidence_frames: list[int]
     location_method: str  # SelectionMethod from src/highlights/selection.py, as a plain str
     location_track_ids: list[int]
+    jersey_by_track_id: dict[int, int] = {}  # owner-reported bug fix, 2026-09-01: which jersey
+    # number each individual target track belongs to. `jersey_number` above is a SINGLE take-level
+    # value, which is wrong whenever one take legitimately names more than one target player --
+    # exactly what a manual sidecar does for an assist->goal pair ("#10 provides the assist",
+    # "#2 scores a goal"). Before this, every target track in the take was drawn with the take's
+    # own single (min) number, so #10's box was labelled "#2" on real footage. Empty dict = the
+    # single-target case, where `jersey_number` is already correct for every track.
     n_crops_considered: int = 0
     n_too_small: int = 0
     n_legible: int = 0  # owner-authorized 2026-08-31 (CLAUDE.md §7): crops the legibility gate
