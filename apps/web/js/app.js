@@ -321,6 +321,10 @@ async function startPipelineProcessing() {
       manual_annotations: manualAnnotations,
     };
 
+    // Note: a frame-players picker selection doesn't need handling here -- its click handler
+    // (`renderFramePlayers`) writes `take_id:raw_track_id` directly into `#track-id-input`, which
+    // `trackId` above already reads fresh at submit time. Re-reading `selectedFramePlayer` here
+    // too would risk overriding a manual edit to that field with a stale remembered value.
     if (selectedClickPoint) {
       payload.click_x = selectedClickPoint.x;
       payload.click_y = selectedClickPoint.y;

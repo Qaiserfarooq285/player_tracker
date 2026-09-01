@@ -517,23 +517,44 @@ def _run_pipeline_job(
                     f"Processing interactive click at ({click_x:.3f}, {click_y:.3f}) "
                     f"@ t={click_t or 0.0:.1f}s..."
                 )
+                # Real bug fixed here (2026-09-01): a click that failed to match ANY track used
+                # to fall through silently with `overrides` left empty, and the pipeline below
+                # still ran -- but with NO manual override, `select_targets` auto-picks its own
+                # arrow/heuristic target for whatever `target_jersey` happened to be sitting in
+                # the form (a stale default from a PREVIOUS video, in the confirmed real case:
+                # the user opened `video3` -- whose own annotated target is #2 -- clicked at
+                # t=0.0s before play started, missed every player, and silently got results for
+                # "#10" instead, with no indication their click had done nothing). CLAUDE.md
+                # Golden Rule 5 ("no fabricated numbers... an honest not-available is correct, a
+                # fabricated one is a bug") applies here just as much to IDENTITY as to a stat:
+                # an explicit human selection that failed must fail loudly, never be silently
+                # replaced by an unrelated auto-pick that LOOKS like it honored the request.
                 try:
                     chosen_take_id, chosen_track_id = _match_click_to_track(
                         video_path, configs, click_x, click_y, click_t or 0.0
                     )
-                    if chosen_track_id is not None:
-                        overrides[chosen_take_id] = chosen_track_id
-                        job["logs"].append(
-                            f"Interactive click matched take={chosen_take_id} "
-                            f"track_id={chosen_track_id}."
-                        )
-                    else:
-                        job["logs"].append(
-                            "Interactive click did not hit a specific track closely enough; "
-                            "no override applied."
-                        )
                 except Exception as cx_err:
-                    job["logs"].append(f"Click matching warning: {cx_err}")
+                    job["status"] = "failed"
+                    job["error"] = f"Click matching failed: {cx_err}"
+                    job["logs"].append(f"ERROR: {job['error']}")
+                    return
+                if chosen_track_id is not None:
+                    overrides[chosen_take_id] = chosen_track_id
+                    job["logs"].append(
+                        f"Interactive click matched take={chosen_take_id} "
+                        f"track_id={chosen_track_id}."
+                    )
+                else:
+                    job["status"] = "failed"
+                    job["error"] = (
+                        "Your click did not land on a detected player near that moment (or the "
+                        "video was paused before any player was visible). Refusing to silently "
+                        "fall back to an unrelated auto-selected target. Use \"Load Players\" to "
+                        "see real detected boxes and click one directly, or pick a moment where "
+                        "the target player is clearly on screen."
+                    )
+                    job["logs"].append(f"ERROR: {job['error']}")
+                    return
 
             run_pipeline_for_video(
                 video_path,
