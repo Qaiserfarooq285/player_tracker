@@ -90,6 +90,33 @@ vlm:
   # sent to Gemini. A take needing more than 6 VLM calls to resolve is ambiguous enough that a 7th
   # call is unlikely to change the outcome — stays unverified rather than escalating indefinitely.
 
+# ---------------------------------------------------------------------------------------------
+# mkoshkina/jersey-number-pipeline CHECKPOINTS (CLAUDE.md §7, owner-authorized 2026-08-31, CC
+# BY-NC 3.0 -- see MODEL_CARD.md in models/jersey-parseq-soccernet/ for the full license scoping).
+# NEW chain order (src/identity/verify.py, src/annotations/associate.py): legibility gate -> if
+# legible, PARSeq-SoccerNet (purpose-built for exactly this problem) -> if PARSeq is unconfident
+# OR the crop was flagged illegible, fall back to the EXISTING EasyOCR path -> escalate to Gemini
+# VLM only if NEITHER succeeds. This keeps VLM cost minimal (now the last resort, not the primary
+# escalation) and never removes the existing OCR/VLM stack -- only reorders it.
+# ---------------------------------------------------------------------------------------------
+legibility:
+  checkpoint: models/jersey-parseq-soccernet/legibility_resnet34_soccer_20240215.pth
+  min_confidence: 0.5 # the classifier's own sigmoid output is a calibrated P(legible) in [0, 1];
+  # 0.5 is the natural decision boundary for a binary classifier with no other measured
+  # calibration data on THIS project's own footage yet (unlike e.g. `colour_match_max_distance`,
+  # which was re-derived from a real measurement) -- revisit if real verification runs show it
+  # miscalibrated on our crops specifically.
+
+parseq_soccernet:
+  checkpoint: "models/jersey-parseq-soccernet/parseq_epoch=24-step=2575-val_accuracy=95.6044-val_NED=96.3255.ckpt"
+  min_confidence: 0.5 # PARSeq's own decoded-sequence confidence (mean per-token softmax prob,
+  # via its own `tokenizer.decode`); below this a read is treated as unconfident and the chain
+  # falls back to EasyOCR, same "ambiguous -> escalate" spirit as `ocr.min_easyocr_confidence`
+  # above. No project-specific recalibration yet (checkpoint's own reported val_accuracy=95.6% is
+  # on SoccerNet's own held-out set, not our footage -- ADR-10's own "expect a domain gap, measure
+  # don't assume" discipline applies here too).
+  max_digits: 2 # identical reasoning to `ocr.max_digits` -- a soccer jersey number is 1-2 digits.
+
 aggregation:
   min_agreeing_frames: 2 # ADR-15 / owner's explicit rule: never declare a jersey number
   # "verified" off a single frame's read. At least this many INDEPENDENT frames (OCR and/or VLM,

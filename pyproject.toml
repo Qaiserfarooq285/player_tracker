@@ -49,6 +49,24 @@ team = [
 ocr = [
     "easyocr",
 ]
+# Purpose-built jersey-number reading (CLAUDE.md §7 "mkoshkina/jersey-number-pipeline CHECKPOINTS
+# ONLY" row, owner-authorized 2026-08-31): a legibility gate (own resnet34+linear model
+# definition, src/identity/legibility.py) + PARSeq (src/identity/jersey_parseq.py), fine-tuned on
+# SoccerNet, run ahead of the existing EasyOCR/Gemini chain. `strhub` is the REAL upstream
+# `baudm/parseq` package (Apache-2.0) -- not any code from mkoshkina's repo -- installed as a git
+# dependency since it has no PyPI release; it is pinned by commit via `uv.lock`/CI, not by tag,
+# since upstream cuts none. `gdown` (MIT) fetches the two NC-restricted checkpoint FILES into
+# `models/jersey-parseq-soccernet/` (never installed as a code dependency of the checkpoints
+# themselves -- see that directory's own MODEL_CARD.md for the license scoping). `pytorch-lightning`
+# (Apache-2.0) and `nltk` (Apache-2.0) are `strhub`'s own transitive runtime imports
+# (`strhub.models.base` imports `nltk.edit_distance`; `PARSeq.load_from_checkpoint` is a
+# `pytorch_lightning.LightningModule` classmethod) -- both permissive, verified before adding.
+jersey_parseq = [
+    "gdown",
+    "strhub @ git+https://github.com/baudm/parseq.git",
+    "pytorch-lightning",
+    "nltk",
+]
 # scripts/download_soccernet.py: pulls one labeled SoccerNet broadcast clip for eval/testing
 # (CLAUDE.md §9.1/§7). MIT-licensed package; the underlying *video data* is NDA-gated/research-
 # education-only regardless of this package's own license -- see the script's docstring.

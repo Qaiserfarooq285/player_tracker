@@ -15,10 +15,15 @@ Pipeline, per take:
    the whole video (never re-seeking per candidate frame, which would risk landing on the wrong
    take at a keyframe boundary — see module note below), cropping the location candidate's own box
    wherever it clears `identity.yaml: crop.min_crop_height_frac` (resolution-aware, Stage A of the
-   "streamed-gathering-treehouse" plan), running EasyOCR first (cheap,
-   local) and escalating only OCR-ambiguous-or-silent crops to Gemini, bounded by
-   `identity.yaml: vlm.max_escalations_per_take` (cost control, mirrors ADR-14's own "cheap
-   pre-filter, VLM only on survivors" pattern).
+   "streamed-gathering-treehouse" plan). **Reading chain, owner-authorized 2026-08-31 (CLAUDE.md
+   §7):** a legibility gate (`src/identity/legibility.py`) first screens out crops that can't
+   possibly carry a legible number; a legible crop goes to PARSeq-SoccerNet
+   (`src/identity/jersey_parseq.py`, purpose-built for exactly this problem) before falling back
+   to the PRE-EXISTING EasyOCR-first/Gemini-escalation chain (cheap, local OCR first, Gemini only
+   on OCR-ambiguous-or-silent crops, bounded by `identity.yaml: vlm.max_escalations_per_take` —
+   ADR-14's own "cheap pre-filter, VLM only on survivors" pattern). Both new stages are optional
+   and additive: absent/disabled checkpoints (`src/identity/jersey_models.py`) degrade this
+   exactly to the original OCR-first/VLM-escalation chain.
 3. **Aggregation** (`aggregate_take_identity`, pure/testable) — requires temporal agreement across
    >= `identity.yaml: aggregation.min_agreeing_frames` INDEPENDENT frames (OCR and/or VLM, any
    mix) reading the SAME digit string before declaring `status="verified"`; a tie for the top
@@ -48,24 +53,33 @@ from src.common.types import BBox, Take, Track, TrackBox
 from src.common.video import decode_frames, probe
 from src.detect.overlay_mask import ArrowHint
 from src.highlights.selection import select_targets
+from src.identity.jersey_models import free_optional_jersey_stack, load_optional_jersey_stack
 from src.identity.jersey_ocr import (
     free_easyocr_reader,
     load_easyocr_reader,
     read_jersey_digits,
     upscale_crop,
 )
+from src.identity.jersey_parseq import read_jersey_number_parseq
 from src.identity.jersey_vlm import classify_jersey_number
+from src.identity.legibility import is_legible
 from src.track.tracker import assign_take_id
 
 logger = get_logger(__name__)
 
 
 class FrameRead(BaseModel):
-    """One independent digit read at one instant — the atomic unit of evidence."""
+    """One independent digit read at one instant — the atomic unit of evidence.
+
+    `source="parseq_soccernet"` (owner-authorized 2026-08-31, CLAUDE.md §7) is a NEW, stronger
+    signal inserted AHEAD of `"ocr"` in `_collect_reads_for_take`'s own chain — see that
+    function's docstring for the full legibility-gate -> PARSeq -> EasyOCR -> VLM ordering. It
+    does not replace `"ocr"`/`"vlm"`; a take's evidence can freely mix all three sources.
+    """
 
     t: float
     frame_index: int  # index within THIS stage's own single native-res decode pass
-    source: Literal["ocr", "vlm"]
+    source: Literal["ocr", "vlm", "parseq_soccernet"]
     digits: str | None
     confidence: float
     raw: str | None = None
@@ -84,6 +98,10 @@ class TakeIdentityResult(BaseModel):
     location_track_ids: list[int]
     n_crops_considered: int = 0
     n_too_small: int = 0
+    n_legible: int = 0  # owner-authorized 2026-08-31 (CLAUDE.md §7): crops the legibility gate
+    # passed (eligible for a PARSeq-SoccerNet read). 0 whenever the legibility model isn't loaded
+    # (checkpoint absent/disabled) -- an honest "this signal did not run", not a claim of illegibility.
+    n_parseq_confident: int = 0  # crops PARSeq-SoccerNet read with a confident, pure-digit result
     n_ocr_confident: int = 0
     n_vlm_calls: int = 0
     n_vlm_failed: int = 0
@@ -303,9 +321,21 @@ def _collect_reads_for_take(
     reader,
     gemini_api_key: str | None,
     identity_fps_sample: float,
+    legibility_model=None,
+    parseq_model=None,
+    parseq_transform=None,
 ) -> tuple[list[FrameRead], dict]:
     """Evidence for ONE take, given the frames already bucketed for it. Returns
-    `(reads, counters)`; `counters` feeds `TakeIdentityResult`'s own bookkeeping fields."""
+    `(reads, counters)`; `counters` feeds `TakeIdentityResult`'s own bookkeeping fields.
+
+    **Chain order (owner-authorized 2026-08-31, CLAUDE.md §7):** legibility gate -> if legible,
+    PARSeq-SoccerNet (purpose-built for this exact problem) -> if PARSeq is unconfident OR the
+    crop was flagged illegible, fall back to the PRE-EXISTING EasyOCR path -> escalate to Gemini
+    VLM only if neither succeeds. `legibility_model`/`parseq_model` default to `None`, which
+    degrades this EXACTLY to the prior OCR-first/VLM-escalation chain (a missing/disabled
+    checkpoint is not an error here -- see `verify_identities_for_video`'s own loading, which logs
+    a warning and passes `None` rather than crashing the whole run).
+    """
     crop_cfg = identity_cfg["crop"]
     ocr_cfg = identity_cfg["ocr"]
     vlm_cfg = identity_cfg["vlm"]
@@ -322,11 +352,15 @@ def _collect_reads_for_take(
     counters = {
         "n_crops_considered": 0,
         "n_too_small": 0,
+        "n_legible": 0,
+        "n_parseq_confident": 0,
         "n_ocr_confident": 0,
         "n_vlm_calls": 0,
         "n_vlm_failed": 0,
     }
     take_id = take_tracks[0].take_id if take_tracks else None
+    legibility_cfg = identity_cfg.get("legibility", {})
+    parseq_cfg = identity_cfg.get("parseq_soccernet", {})
 
     for frame_index, t, frame in frames_by_take.get(take_id, []):
         found = _nearest_box_among(take_tracks, t, tolerance_s)
@@ -341,6 +375,29 @@ def _collect_reads_for_take(
             continue
         counters["n_crops_considered"] += 1
         crop = upscale_crop(frame[y1:y2, x1:x2], crop_cfg["crop_upscale_factor"])
+
+        # Owner-authorized 2026-08-31 (CLAUDE.md §7): legibility gate -> PARSeq-SoccerNet, ahead
+        # of the pre-existing EasyOCR path. `legibility_model`/`parseq_model` are `None` whenever
+        # the NC-restricted checkpoints weren't loaded (missing/disabled) -- this block is then a
+        # no-op and control falls straight through to the unchanged OCR/VLM chain below.
+        if legibility_model is not None and parseq_model is not None:
+            leg = is_legible(crop, legibility_model, legibility_cfg)
+            if leg.is_legible:
+                counters["n_legible"] += 1
+                parseq_read = read_jersey_number_parseq(crop, parseq_model, parseq_transform, parseq_cfg)
+                if parseq_read.is_confident:
+                    counters["n_parseq_confident"] += 1
+                    reads.append(
+                        FrameRead(
+                            t=t,
+                            frame_index=frame_index,
+                            source="parseq_soccernet",
+                            digits=parseq_read.digits,
+                            confidence=parseq_read.confidence,
+                            raw=parseq_read.raw_text,
+                        )
+                    )
+                    continue
 
         ocr_read = read_jersey_digits(reader, crop, ocr_cfg)
         if ocr_read.is_confident:
@@ -469,6 +526,7 @@ def verify_identities_for_video(
             frames_by_take[take_id].append((frame_index, t, frame.copy()))
 
     reader = load_easyocr_reader(identity_cfg["ocr"])
+    legibility_model, parseq_model, parseq_transform = load_optional_jersey_stack(identity_cfg)
     try:
         for take in takes:
             sel = location_by_take.get(take.id)
@@ -500,13 +558,17 @@ def verify_identities_for_video(
                 reader,
                 gemini_api_key,
                 identity_fps_sample,
+                legibility_model,
+                parseq_model,
+                parseq_transform,
             )
             agg = aggregate_take_identity(
                 reads, identity_cfg["aggregation"], human_confirmed_jersey
             )
             logger.info(
                 "take=%d: location=%s(%s) -> identity=%s number=%s conf=%.2f "
-                "(%d crop(s), %d ocr-confident, %d vlm call(s), %d vlm failure(s))",
+                "(%d crop(s), %d legible, %d parseq-confident, %d ocr-confident, "
+                "%d vlm call(s), %d vlm failure(s))",
                 take.id,
                 sel.method,
                 sel.track_ids,
@@ -514,6 +576,8 @@ def verify_identities_for_video(
                 agg["jersey_number"],
                 agg["confidence"],
                 counters["n_crops_considered"],
+                counters["n_legible"],
+                counters["n_parseq_confident"],
                 counters["n_ocr_confident"],
                 counters["n_vlm_calls"],
                 counters["n_vlm_failed"],
@@ -534,5 +598,6 @@ def verify_identities_for_video(
             )
     finally:
         free_easyocr_reader(reader)
+        free_optional_jersey_stack(legibility_model, parseq_model)
 
     return IdentityReport(video=str(video_path), takes=results)

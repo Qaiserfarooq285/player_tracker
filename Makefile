@@ -13,7 +13,7 @@ setup:
 # Adds the heavy, GPU-bound extras (RF-DETR/torch detection stack + SigLIP team stack) on top of
 # `make setup`, pinned to the CUDA 12.1 torch wheel index (RTX A2000, CLAUDE.md §11).
 install-gpu:
-	export PATH="$$HOME/.local/bin:$$PATH" && $(UV) pip install -e ".[detect,team]" \
+	export PATH="$$HOME/.local/bin:$$PATH" && $(UV) pip install -e ".[detect,team,ocr,jersey_parseq]" \
 		--extra-index-url https://download.pytorch.org/whl/cu121
 
 # Process the video(s) in input/ -> reel + stat card + report in output/ (resumable via work/).
