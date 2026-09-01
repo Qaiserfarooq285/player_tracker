@@ -117,6 +117,31 @@ parseq_soccernet:
   # don't assume" discipline applies here too).
   max_digits: 2 # identical reasoning to `ocr.max_digits` -- a soccer jersey number is 1-2 digits.
 
+  # ADR-21 -- the crop PARSeq actually reads. MEASURED root cause (2026-09-01): PARSeq resizes its
+  # input to 128x32 (4:1, text-line shaped, `strhub`'s own img_size). Handing it the FULL-BODY
+  # player crop -- tall and narrow, ~1:2.5 -- squashes the digits vertically into illegibility, and
+  # the model then emits a confident but WRONG read that is CONSISTENT for the same track across
+  # frames (so temporal voting cannot filter it: agreement measures consistency, not correctness).
+  # That is exactly the owner-reported "player 8 detected as player 10" bug.
+  #
+  # Measured on video2 take 0 (720p broadcast, 5 tracks with visually-confirmed ground truth
+  # #8/#4/#30/#19/#37, t=40-61s, legibility gate on the full-body crop in both arms):
+  #     full-body crop (previous behaviour): 0/5 correct -- FOUR of five collapsed onto "10"
+  #     this number-region crop:             5/5 correct
+  # The insets below are the winning geometry of six evaluated; the two runners-up
+  # (0.10/0.10/0.10/0.40 and 0.075/0.08/0.075/0.42) each scored 4/5, differing only on the
+  # smallest/most side-on track, so this is a plateau rather than a knife-edge fit.
+  #
+  # The legibility gate deliberately keeps seeing the FULL-BODY crop: mkoshkina's resnet34 was
+  # trained on whole-player images and rejects tight number crops outright (measured: 0/743 passed
+  # vs 336/743 for full-body). Gate on the body, read on the number.
+  number_crop:
+    left_inset_frac: 0.15 # fraction of box WIDTH trimmed from each side, to drop arms/background
+    right_inset_frac: 0.15 # and adjacent players, keeping the torso column where the number sits
+    top_inset_frac: 0.12 # fraction of box HEIGHT trimmed from the top, to drop the head
+    bottom_frac: 0.45 # bottom edge as a fraction of box height from its top -- shirt numbers sit
+    # in the upper back/chest, so everything below this is shorts/legs and only adds noise.
+
 aggregation:
   min_agreeing_frames: 2 # ADR-15 / owner's explicit rule: never declare a jersey number
   # "verified" off a single frame's read. At least this many INDEPENDENT frames (OCR and/or VLM,

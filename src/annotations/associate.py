@@ -39,7 +39,7 @@ from src.common.video import decode_frames
 from src.detect.overlay_mask import ArrowHint
 from src.highlights.selection import _center_distance, _contains, _nearest_box
 from src.identity.jersey_ocr import read_jersey_digits, upscale_crop
-from src.identity.jersey_parseq import read_jersey_number_parseq
+from src.identity.jersey_parseq import number_region, read_jersey_number_parseq
 from src.identity.jersey_vlm import classify_jersey_number
 from src.identity.legibility import is_legible
 from src.identity.verify import FrameRead, aggregate_take_identity
@@ -416,11 +416,19 @@ def read_jersey_number_for_candidates(
             # are `None` whenever the NC-restricted checkpoints weren't loaded -- this block is
             # then a no-op and control falls straight through to the unchanged OCR/VLM chain.
             if legibility_model is not None and parseq_model is not None:
+                # Gate on the FULL-BODY crop (what mkoshkina's resnet34 was trained on), but read
+                # the tight upper-torso NUMBER REGION -- ADR-21. `crop` IS the full-body box here,
+                # so the region is taken against its own bounds; the insets are fractions, so
+                # applying them after `upscale_crop` is geometrically identical.
                 leg = is_legible(crop, legibility_model, legibility_cfg)
                 if leg.is_legible:
                     evidence["n_legible"] += 1
+                    ch, cw = crop.shape[:2]
+                    nx1, ny1, nx2, ny2 = number_region(
+                        0, 0, cw, ch, parseq_cfg["number_crop"]
+                    )
                     parseq_read = read_jersey_number_parseq(
-                        crop, parseq_model, parseq_transform, parseq_cfg
+                        crop[ny1:ny2, nx1:nx2], parseq_model, parseq_transform, parseq_cfg
                     )
                     if parseq_read.is_confident:
                         evidence["n_parseq_confident"] += 1

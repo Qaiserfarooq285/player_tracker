@@ -60,7 +60,7 @@ from src.identity.jersey_ocr import (
     read_jersey_digits,
     upscale_crop,
 )
-from src.identity.jersey_parseq import read_jersey_number_parseq
+from src.identity.jersey_parseq import number_region, read_jersey_number_parseq
 from src.identity.jersey_vlm import classify_jersey_number
 from src.identity.legibility import is_legible
 from src.track.tracker import assign_take_id
@@ -381,10 +381,19 @@ def _collect_reads_for_take(
         # the NC-restricted checkpoints weren't loaded (missing/disabled) -- this block is then a
         # no-op and control falls straight through to the unchanged OCR/VLM chain below.
         if legibility_model is not None and parseq_model is not None:
+            # Gate on the FULL-BODY crop (what mkoshkina's resnet34 was trained on), but read the
+            # tight upper-torso NUMBER REGION -- ADR-21, see `number_region`'s own docstring for
+            # the measured 0/5 -> 5/5 result behind this split.
             leg = is_legible(crop, legibility_model, legibility_cfg)
             if leg.is_legible:
                 counters["n_legible"] += 1
-                parseq_read = read_jersey_number_parseq(crop, parseq_model, parseq_transform, parseq_cfg)
+                nx1, ny1, nx2, ny2 = number_region(x1, y1, x2, y2, parseq_cfg["number_crop"])
+                number_crop = upscale_crop(
+                    frame[ny1:ny2, nx1:nx2], crop_cfg["crop_upscale_factor"]
+                )
+                parseq_read = read_jersey_number_parseq(
+                    number_crop, parseq_model, parseq_transform, parseq_cfg
+                )
                 if parseq_read.is_confident:
                     counters["n_parseq_confident"] += 1
                     reads.append(

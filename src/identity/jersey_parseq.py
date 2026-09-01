@@ -78,6 +78,42 @@ class ParseqRead(BaseModel):
     source: Literal["parseq_soccernet"] = "parseq_soccernet"
 
 
+def number_region(
+    x1: int, y1: int, x2: int, y2: int, number_crop_cfg: dict
+) -> tuple[int, int, int, int]:
+    """Narrow a full-body player box to the upper-torso NUMBER REGION that PARSeq should read.
+
+    ADR-21, measured 2026-09-01. PARSeq resizes its input to 128x32 (4:1, text-line shaped), so a
+    full-body crop (tall and narrow) squashes the digits vertically into illegibility -- the model
+    then returns a confident but WRONG read which is CONSISTENT across that track's frames, so
+    temporal voting cannot filter it (agreement measures consistency, not correctness). That was
+    the mechanism behind the owner-reported "player 8 detected as player 10". Measured on 5
+    visually-confirmed tracks: full-body 0/5 correct, this region 5/5.
+
+    Insets come from `configs/identity.yaml: parseq_soccernet.number_crop` (no magic numbers,
+    CLAUDE.md §10). The result is clamped to stay inside the input box and to keep a non-degenerate
+    area; a box too small to narrow meaningfully is returned unchanged rather than inverted, so the
+    caller always gets a usable rect.
+
+    NOTE: the legibility gate must keep seeing the FULL-BODY crop -- mkoshkina's resnet34 was
+    trained on whole-player images and rejects tight number crops (measured 0/743 vs 336/743).
+    """
+    w, h = x2 - x1, y2 - y1
+    if w <= 0 or h <= 0:
+        return x1, y1, x2, y2
+
+    nx1 = x1 + int(round(w * number_crop_cfg["left_inset_frac"]))
+    nx2 = x2 - int(round(w * number_crop_cfg["right_inset_frac"]))
+    ny1 = y1 + int(round(h * number_crop_cfg["top_inset_frac"]))
+    ny2 = y1 + int(round(h * number_crop_cfg["bottom_frac"]))
+
+    # degenerate after inset (very small boxes) -> fall back to the original box, never an
+    # inverted/empty rect that would silently become a zero-size crop downstream
+    if nx2 - nx1 < 2 or ny2 - ny1 < 2:
+        return x1, y1, x2, y2
+    return nx1, ny1, nx2, ny2
+
+
 def _remap_and_load(model: Any, checkpoint: dict) -> None:
     """Load a pre-refactor (`self.encoder`/`self.decoder`/...) checkpoint's `state_dict` into the
     CURRENT upstream `PARSeq` architecture (`self.model.encoder`/`self.model.decoder`/...) by

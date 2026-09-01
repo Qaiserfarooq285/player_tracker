@@ -27,7 +27,17 @@ def _identity_cfg() -> dict:
         "ocr": {},
         "vlm": {"max_escalations_per_take": 6},
         "legibility": {},
-        "parseq_soccernet": {},
+        # ADR-21: PARSeq reads the tight upper-torso number region, not the full-body crop.
+        # Insets mirror `configs/identity.yaml`'s own values so the fixture exercises the real
+        # geometry rather than a degenerate one.
+        "parseq_soccernet": {
+            "number_crop": {
+                "left_inset_frac": 0.15,
+                "right_inset_frac": 0.15,
+                "top_inset_frac": 0.12,
+                "bottom_frac": 0.45,
+            }
+        },
     }
 
 

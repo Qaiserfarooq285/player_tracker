@@ -414,6 +414,18 @@ def _jersey_reid_identity_cfg() -> dict:
         },
         "ocr": {},
         "vlm": {},
+        # ADR-21: PARSeq reads the tight upper-torso number region, not the full-body crop.
+        # Insets mirror `configs/identity.yaml`'s own values so the fixture exercises the real
+        # geometry. `_stamp_box` fills the whole box, so the sub-crop still carries the marker
+        # byte the fakes key off.
+        "parseq_soccernet": {
+            "number_crop": {
+                "left_inset_frac": 0.15,
+                "right_inset_frac": 0.15,
+                "top_inset_frac": 0.12,
+                "bottom_frac": 0.45,
+            }
+        },
         "aggregation": {"min_agreeing_frames": 2, "min_verified_confidence": 0.0},
     }
 
