@@ -22,7 +22,14 @@ already has one (e.g. a UI's own advisory read via `src.identity.jersey_parseq`)
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from src.common.types import Track
+from src.common.video import decode_frames
+from src.identity.jersey_ocr import upscale_crop
+from src.identity.jersey_parseq import number_region, read_jersey_number_parseq
+from src.identity.legibility import is_legible
+from src.identity.verify import FrameRead, _scale_bbox_to_native, aggregate_take_identity
 
 
 def _median_height(track: Track) -> float:
@@ -102,6 +109,137 @@ def candidate_score(
 
     evidence["accepted"] = True
     return True, evidence
+
+
+def _sample_track_timestamps(track: Track, max_samples: int) -> list[float]:
+    """Up to `max_samples` timestamps evenly spread across `track`'s OWN box lifespan -- same
+    "don't judge a player from one instant" reasoning as
+    `src.annotations.associate._candidate_target_timestamps` (a player side-on in one frame may be
+    facing the camera elsewhere in the same track), simplified here since there is no take-anchored
+    window to widen: this track's own boxes ARE the full population to sample from."""
+    if not track.boxes:
+        return []
+    if len(track.boxes) <= max_samples:
+        return [b.t for b in track.boxes]
+    step = len(track.boxes) / max_samples
+    return [track.boxes[int(i * step)].t for i in range(max_samples)]
+
+
+def collect_track_jersey_digits(
+    video_path: str | Path,
+    take_tracks: list[Track],
+    scale_x: float,
+    scale_y: float,
+    native_w: int,
+    native_h: int,
+    identity_cfg: dict,
+    legibility_model,
+    parseq_model,
+    parseq_transform,
+    max_samples_per_track: int,
+    aggregation_cfg: dict,
+    use_nvdec: bool = True,
+) -> dict[int, str]:
+    """Best-effort confident jersey-number digit string per raw track in `take_tracks` --
+    corroborating evidence for `candidate_score`'s jersey check, so click-anchored chain extension
+    is not left with colour+height alone (measured 2026-09-01, see `configs/highlights.yaml:
+    click_reid`'s own comment: colour alone let a DIFFERENT physical player join a clicked chain).
+
+    Reuses the exact ADR-21 chain (`src/identity/jersey_parseq.py::number_region` -- gate on the
+    full-body crop, read the tight number region -- the fix for PARSeq's own 128x32 text-line input
+    shape) and the SAME per-item aggregation rule `src.identity.verify.aggregate_take_identity`
+    already applies for ADR-15's own per-take verification (>= `min_agreeing_frames` reads must
+    agree, a strict plurality, clearing `min_agreement_fraction`/`min_verified_confidence`) --
+    applied here PER TRACK instead of per take. A track with no confident majority is simply absent
+    from the returned dict (an honest "no jersey evidence", not a guess) -- `candidate_score`
+    already treats a missing entry as "no evidence either way", never a rejection.
+
+    `legibility_model`/`parseq_model` may be `None` (checkpoint unavailable) -- returns `{}` rather
+    than raising, same "optional stage, never fatal" contract as
+    `src.identity.jersey_models.load_optional_jersey_stack`'s own callers.
+    """
+    if legibility_model is None or parseq_model is None or not take_tracks:
+        return {}
+
+    crop_cfg = identity_cfg["crop"]
+    parseq_cfg = identity_cfg["parseq_soccernet"]
+    legibility_cfg = identity_cfg["legibility"]
+    min_height = crop_cfg["min_crop_height_frac"] * native_h
+    expand = crop_cfg["torso_crop_expand"]
+    upscale_factor = crop_cfg["crop_upscale_factor"]
+
+    target_ts_by_track = {
+        tr.id: _sample_track_timestamps(tr, max_samples_per_track) for tr in take_tracks
+    }
+    all_ts = [t for ts in target_ts_by_track.values() for t in ts]
+    if not all_ts:
+        return {}
+
+    # ONE decode pass over the union of every track's own sample timestamps -- never a per-track
+    # or per-sample re-seek (matches src/identity/verify.py's/src/annotations/associate.py's own
+    # "one decode, bucket into instants" discipline).
+    decoded_frames: list[tuple[float, object]] = []
+    for _idx, frame_t, frame in decode_frames(
+        str(video_path),
+        fps=identity_cfg["crop"]["identity_fps_sample"],
+        start=max(0.0, min(all_ts) - 0.5),
+        end=max(all_ts) + 0.5,
+        scale_width=None,
+        use_nvdec=use_nvdec,
+    ):
+        decoded_frames.append((frame_t, frame))
+    if not decoded_frames:
+        return {}
+
+    tolerance_s = 1.0 / identity_cfg["crop"]["identity_fps_sample"]
+    reads_by_track: dict[int, list[FrameRead]] = {}
+    frame_index = 0
+    for tr in take_tracks:
+        boxes_by_t = {b.t: b for b in tr.boxes}
+        reads: list[FrameRead] = []
+        for target_t in target_ts_by_track[tr.id]:
+            box = boxes_by_t.get(target_t)
+            if box is None:
+                continue
+            frame = min(decoded_frames, key=lambda f: abs(f[0] - target_t), default=None)
+            if frame is None or abs(frame[0] - target_t) > tolerance_s:
+                continue
+            _t, frame_bgr = frame
+            x1, y1, x2, y2 = _scale_bbox_to_native(
+                box.bbox, scale_x, scale_y, expand, native_w, native_h
+            )
+            if (y2 - y1) < min_height or x2 <= x1 or y2 <= y1:
+                continue
+            frame_index += 1
+            body_crop = upscale_crop(frame_bgr[y1:y2, x1:x2], upscale_factor)
+            leg = is_legible(body_crop, legibility_model, legibility_cfg)
+            if body_crop.size == 0 or not leg.is_legible:
+                continue
+            nx1, ny1, nx2, ny2 = number_region(x1, y1, x2, y2, parseq_cfg["number_crop"])
+            number_crop = upscale_crop(frame_bgr[ny1:ny2, nx1:nx2], upscale_factor)
+            read = read_jersey_number_parseq(
+                number_crop, parseq_model, parseq_transform, parseq_cfg
+            )
+            if read.is_confident:
+                reads.append(
+                    FrameRead(
+                        t=target_t,
+                        frame_index=frame_index,
+                        source="parseq_soccernet",
+                        digits=read.digits,
+                        confidence=read.confidence,
+                        raw=read.raw_text,
+                    )
+                )
+        if reads:
+            reads_by_track[tr.id] = reads
+
+    jersey_by_track_id: dict[int, str] = {}
+    for track_id, reads in reads_by_track.items():
+        agg = aggregate_take_identity(reads, aggregation_cfg)
+        if agg["status"] == "verified" and agg["jersey_number"] is not None:
+            jersey_by_track_id[track_id] = str(agg["jersey_number"])
+    return jersey_by_track_id
 
 
 def extend_chain_with_profile(

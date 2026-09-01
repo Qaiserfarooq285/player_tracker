@@ -107,21 +107,38 @@ click_reid:
   # player's own measured colour (team cluster) + height as corroborating evidence (owner request,
   # 2026-09-01: "keep in mind the colour and jersy number and height").
   #
-  # ⛔ DISABLED BY DEFAULT, 2026-09-01 -- real failure measured on real footage, not a hypothetical.
-  # A live end-to-end run on `chelsea_burnley_target10` (click on the real #10, raw track 201)
-  # extended the chain from 2 fragments to 36 and one of those 36 (raw track 186) put the red
-  # TARGET box on a DIFFERENT physical player (a Burnley player in claret, not Chelsea's blue #10)
-  # -- confirmed by eye on the actual rendered frame at t=35s. Root cause, also measured directly:
-  # `Track.team_confidence` on this take is ESSENTIALLY UNINFORMATIVE -- 229 of 231 raw tracks read
-  # EXACTLY 0.30 (2 read 0.0), so "team cluster matches" carries almost no real discriminating power
-  # here despite reading as a clean boolean match. `min_height_ratio` alone did not catch it either
-  # (0.926, comfortably inside the floor). This is exactly the anti-pattern CLAUDE.md forbids
-  # outright ("Draw a red target box you can't associate to a real track") -- so until a genuinely
-  # reliable corroborating signal exists (jersey-number agreement is wired to accept one when a
-  # caller supplies it, `jersey_by_track_id`, but the pipeline's own automatic call does not
-  # currently pass one -- see `src/pipeline/run.py`'s `extend_chain_with_profile` call), this stays
-  # off and `stitch_timeline`'s own conservative same-take fragment joining is the only chain
-  # extension applied. Do not re-enable without re-measuring on real footage first.
+  # ⛔ STILL DISABLED BY DEFAULT, 2026-09-01 -- re-measured after wiring jersey-number
+  # corroboration (`src/pipeline/run.py` now calls `collect_track_jersey_digits` and passes a real
+  # `jersey_by_track_id` into `extend_chain_with_profile`), and the SAME failure reproduced.
+  #
+  # Original finding: a live end-to-end run on `chelsea_burnley_target10` (click on the real #10,
+  # raw track 201) extended the chain from 2 fragments to 36 and one of those 36 (raw track 186)
+  # put the red TARGET box on a DIFFERENT physical player (a Burnley player in claret, not
+  # Chelsea's blue #10) -- confirmed by eye on the rendered frame.
+  #
+  # Follow-up (same day): jersey-number reads were wired in as a real corroborating/veto signal
+  # and DID fire (30/231 tracks got a confident PARSeq read this run) -- but re-running the exact
+  # same click produced the exact same result: track 186 STILL joined the chain, still a different
+  # physical player (re-confirmed by eye on a fresh crop). Root-caused further, not assumed:
+  # `Track.team` itself is degenerate on this take, not just `team_confidence` -- **194 of 231
+  # tracks read `team=1`, only 35 read `team=0`**, i.e. ADR-12's own colour clustering has failed
+  # to separate Chelsea-blue from Burnley-claret into two real clusters here, collapsing most of
+  # BOTH teams onto one label. Track 186 and the real target (201) both read `team=1`, so the
+  # "same team" check passes trivially -- it is not corroborating evidence, it is noise. Jersey
+  # reads did not catch this specific pair: track 186 has only 13 boxes (~1.2s lifespan), too
+  # short to accumulate a confident majority read, so it carried NO jersey evidence and fell
+  # through to the broken colour+height test alone.
+  #
+  # Conclusion: colour-based corroboration cannot be trusted on a take where team clustering
+  # itself has collapsed, and jersey corroboration only helps candidates that live long enough to
+  # be read -- exactly the short, fast-churning fragments that most need help are the ones jersey
+  # reads can't reach. This needs a take-level "is team clustering even usable here" gate (e.g.
+  # requiring real inter-cluster separation, not just a confidence number) before colour can be
+  # trusted at all -- not built yet. Until then: `stitch_timeline`'s own tight gap/distance
+  # thresholds (unaffected by any of this) remain the only chain extension applied, and a click
+  # that loses its box across a real fragmentation break needs a fresh click rather than automatic
+  # bridging. Do not re-enable without a real take-level colour-separation check, re-measured on
+  # real footage.
   enabled: false
   min_height_ratio: 0.60 # ⚠️ REASONED-BUT-UNMEASURED (same epistemic status as
   # `configs/annotations.yaml: colour_reference_lab`'s non-blue entries) -- box height shrinks with
@@ -129,3 +146,12 @@ click_reid:
   # meant to tolerate normal depth change while still rejecting an obviously differently-sized
   # person (a 6ft midfielder vs a goalkeeper standing much closer to camera). Revisit the moment a
   # real labeled slice exists to measure the true same-player height-ratio distribution.
+  max_jersey_samples_per_track: 8 # 2026-09-01 follow-up to the disabled note above: jersey-number
+  # agreement is the fix for the measured team_confidence failure (colour alone let a different
+  # physical player join the chain). `configs/annotations.yaml: jersey_reid.max_frames_per_candidate`
+  # measured ~21% of crops clear the legibility gate on this same footage, and was raised to 20 for
+  # a SMALL pool of near-time candidates. This call site scans EVERY track in the take (up to 232 on
+  # `chelsea_burnley_target10`), so the per-track budget is kept smaller to bound total added
+  # runtime to one click -- 8 tries still gives a real shot at ADR-15's own
+  # `identity.yaml: aggregation.min_agreeing_frames` (2) bar at that yield, without multiplying by
+  # 20x across a whole take's worth of tracks. Revisit if real runs show this too thin.

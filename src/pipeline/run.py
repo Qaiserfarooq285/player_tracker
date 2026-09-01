@@ -68,13 +68,14 @@ from src.highlights.selection import (
     select_targets,
     timeline_coverage_seconds,
 )
+from src.identity.jersey_models import free_optional_jersey_stack, load_optional_jersey_stack
 from src.identity.verify import TakeIdentityResult
 from src.ingest.discovery import VideoRef, find_videos, parse_filename
 from src.pipeline.annotated_video import render_full_annotated_video
 from src.pipeline.player_output import write_player_output
 from src.pipeline.profiler import build_run_profile
 from src.stats.stats import build_player_stats, write_stat_card
-from src.track.click_reid import extend_chain_with_profile
+from src.track.click_reid import collect_track_jersey_digits, extend_chain_with_profile
 from src.track.run import run_track_stage
 from src.track.tracker import assign_take_id
 
@@ -435,28 +436,69 @@ def run_pipeline_for_video(
             tracks_by_take: dict[int, list] = defaultdict(list)
             for tr in tracks:
                 tracks_by_take[tr.take_id].append(tr)
-            for sel_take in selection.takes:
-                if sel_take.method != "manual_override" or sel_take.seed_track_id is None:
-                    continue
-                extended_ids, _evidence = extend_chain_with_profile(
-                    sel_take.seed_track_id,
-                    sel_take.track_ids,
-                    tracks_by_take.get(sel_take.take_id, []),
-                    click_reid_cfg,
-                )
-                if extended_ids != sel_take.track_ids:
-                    logger.info(
-                        "click_reid: take=%d extended manual-override chain from %d to %d "
-                        "fragment(s) (seed=%d)",
-                        sel_take.take_id,
-                        len(sel_take.track_ids),
-                        len(extended_ids),
+
+            # Jersey-number corroboration (2026-09-01 fix for the measured failure documented in
+            # configs/highlights.yaml: click_reid's own comment -- colour cluster alone let a
+            # DIFFERENT physical player join a clicked chain, because Track.team_confidence reads
+            # as an uninformative constant on real broadcast footage). Loaded/freed once per run,
+            # only when this stage actually runs (a manual override exists and the feature is
+            # enabled) -- never for the common auto-selected path.
+            native_meta = probe(video_path)
+            native_w, native_h = native_meta["width"], native_meta["height"]
+            scale_x = native_w / frame_width if frame_width else 1.0
+            scale_y = native_h / frame_height if frame_height else 1.0
+            legibility_model, parseq_model, parseq_transform = load_optional_jersey_stack(
+                configs["identity"]
+            )
+            try:
+                for sel_take in selection.takes:
+                    if sel_take.method != "manual_override" or sel_take.seed_track_id is None:
+                        continue
+                    take_tracks = tracks_by_take.get(sel_take.take_id, [])
+                    jersey_by_track_id = collect_track_jersey_digits(
+                        video_path,
+                        take_tracks,
+                        scale_x,
+                        scale_y,
+                        native_w,
+                        native_h,
+                        configs["identity"],
+                        legibility_model,
+                        parseq_model,
+                        parseq_transform,
+                        click_reid_cfg["max_jersey_samples_per_track"],
+                        configs["identity"]["aggregation"],
+                        use_nvdec=use_nvdec,
+                    )
+                    if jersey_by_track_id:
+                        logger.info(
+                            "click_reid: take=%d got confident jersey reads for %d/%d track(s)",
+                            sel_take.take_id,
+                            len(jersey_by_track_id),
+                            len(take_tracks),
+                        )
+                    extended_ids, _evidence = extend_chain_with_profile(
                         sel_take.seed_track_id,
+                        sel_take.track_ids,
+                        take_tracks,
+                        click_reid_cfg,
+                        jersey_by_track_id,
                     )
-                    sel_take.track_ids = extended_ids
-                    sel_take.coverage_seconds = timeline_coverage_seconds(
-                        extended_ids, tracks_by_take.get(sel_take.take_id, [])
-                    )
+                    if extended_ids != sel_take.track_ids:
+                        logger.info(
+                            "click_reid: take=%d extended manual-override chain from %d to %d "
+                            "fragment(s) (seed=%d)",
+                            sel_take.take_id,
+                            len(sel_take.track_ids),
+                            len(extended_ids),
+                            sel_take.seed_track_id,
+                        )
+                        sel_take.track_ids = extended_ids
+                        sel_take.coverage_seconds = timeline_coverage_seconds(
+                            extended_ids, take_tracks
+                        )
+            finally:
+                free_optional_jersey_stack(legibility_model, parseq_model)
         save_json(selection, selection_path)
         selection_cache.write_meta()
     timings.append(
