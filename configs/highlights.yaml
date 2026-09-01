@@ -98,3 +98,34 @@ export:
   max_clips: 15
   target_reel_seconds: null # null = no cap; otherwise the lowest-ranked tail clips are trimmed
   # (best-first order preserved) until the remaining total fits.
+
+click_reid:
+  # Click-anchored re-identification (`src/track/click_reid.py`): when a human clicks a player in
+  # the web UI, `stitch_timeline` already extends the click forward through nearby same-take
+  # fragments; this block WOULD extend it FURTHER across a break that chain's own gap/distance
+  # thresholds (selection.stitch_max_gap_s/stitch_max_dist above) didn't bridge, using the clicked
+  # player's own measured colour (team cluster) + height as corroborating evidence (owner request,
+  # 2026-09-01: "keep in mind the colour and jersy number and height").
+  #
+  # ⛔ DISABLED BY DEFAULT, 2026-09-01 -- real failure measured on real footage, not a hypothetical.
+  # A live end-to-end run on `chelsea_burnley_target10` (click on the real #10, raw track 201)
+  # extended the chain from 2 fragments to 36 and one of those 36 (raw track 186) put the red
+  # TARGET box on a DIFFERENT physical player (a Burnley player in claret, not Chelsea's blue #10)
+  # -- confirmed by eye on the actual rendered frame at t=35s. Root cause, also measured directly:
+  # `Track.team_confidence` on this take is ESSENTIALLY UNINFORMATIVE -- 229 of 231 raw tracks read
+  # EXACTLY 0.30 (2 read 0.0), so "team cluster matches" carries almost no real discriminating power
+  # here despite reading as a clean boolean match. `min_height_ratio` alone did not catch it either
+  # (0.926, comfortably inside the floor). This is exactly the anti-pattern CLAUDE.md forbids
+  # outright ("Draw a red target box you can't associate to a real track") -- so until a genuinely
+  # reliable corroborating signal exists (jersey-number agreement is wired to accept one when a
+  # caller supplies it, `jersey_by_track_id`, but the pipeline's own automatic call does not
+  # currently pass one -- see `src/pipeline/run.py`'s `extend_chain_with_profile` call), this stays
+  # off and `stitch_timeline`'s own conservative same-take fragment joining is the only chain
+  # extension applied. Do not re-enable without re-measuring on real footage first.
+  enabled: false
+  min_height_ratio: 0.60 # ⚠️ REASONED-BUT-UNMEASURED (same epistemic status as
+  # `configs/annotations.yaml: colour_reference_lab`'s non-blue entries) -- box height shrinks with
+  # camera-motion/depth between two fragments of the SAME player; 0.60 is a conservative floor
+  # meant to tolerate normal depth change while still rejecting an obviously differently-sized
+  # person (a 6ft midfielder vs a goalkeeper standing much closer to camera). Revisit the moment a
+  # real labeled slice exists to measure the true same-player height-ratio distribution.

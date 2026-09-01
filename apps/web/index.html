@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Football Player Tracker & Match Analytics Dashboard</title>
+  <!-- Google Fonts & Icons -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Outfit:wght@400;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body class="dark-theme">
+
+  <!-- Main Navigation Header -->
+  <header class="navbar">
+    <div class="nav-container">
+      <div class="brand">
+        <div class="brand-icon">
+          <i class="fa-solid fa-futbol fa-spin-hover"></i>
+        </div>
+        <div class="brand-text">
+          <span class="brand-title">PITCH<span class="accent-text">VISION</span> AI</span>
+          <span class="brand-subtitle">Player Tracking & Performance Analytics Engine</span>
+        </div>
+      </div>
+      
+      <div class="nav-stats">
+        <div class="status-badge gpu-badge" id="gpu-status">
+          <i class="fa-solid fa-microchip"></i>
+          <span>NVIDIA RTX A2000 12GB (CUDA)</span>
+        </div>
+        <div class="status-badge model-badge">
+          <i class="fa-solid fa-brain"></i>
+          <span>YOLO • ByteTrack • PARSeq</span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Application Container -->
+  <main class="main-container">
+
+    <!-- Architecture & Pipeline Flow Visualizer Banner -->
+    <section class="pipeline-visualizer-card">
+      <div class="card-header">
+        <h2><i class="fa-solid fa-diagram-project"></i> AI Pipeline Architecture</h2>
+        <span class="badge badge-pulse"><i class="fa-solid fa-circle"></i> Pipeline Active</span>
+      </div>
+      
+      <div class="pipeline-flow-diagram">
+        <div class="flow-step step-input active">
+          <div class="step-icon"><i class="fa-solid fa-video"></i></div>
+          <div class="step-label">Football Video</div>
+          <div class="step-sub">Input Video Clip</div>
+        </div>
+
+        <div class="flow-arrow"><i class="fa-solid fa-chevron-right"></i></div>
+
+        <div class="flow-step step-detect" id="node-detect">
+          <div class="step-icon"><i class="fa-solid fa-expand"></i></div>
+          <div class="step-label">Player Detection</div>
+          <div class="step-sub">YOLO / RF-DETR</div>
+        </div>
+
+        <div class="flow-arrow"><i class="fa-solid fa-chevron-right"></i></div>
+
+        <div class="flow-step step-track" id="node-track">
+          <div class="step-icon"><i class="fa-solid fa-route"></i></div>
+          <div class="step-label">Player Tracking</div>
+          <div class="step-sub">ByteTrack / BoT-SORT</div>
+        </div>
+
+        <div class="flow-arrow"><i class="fa-solid fa-chevron-right"></i></div>
+
+        <div class="flow-step step-ocr" id="node-ocr">
+          <div class="step-icon"><i class="fa-solid fa-shirt"></i></div>
+          <div class="step-label">Jersey Number OCR</div>
+          <div class="step-sub">SoccerNet / PARSeq</div>
+        </div>
+
+        <div class="flow-arrow"><i class="fa-solid fa-chevron-right"></i></div>
+
+        <div class="flow-step step-identity" id="node-identity">
+          <div class="step-icon"><i class="fa-solid fa-id-card"></i></div>
+          <div class="step-label">Player Identity</div>
+          <div class="step-sub" id="identity-target-badge">Target Jersey #11</div>
+        </div>
+
+        <div class="flow-arrow"><i class="fa-solid fa-chevron-right"></i></div>
+
+        <div class="flow-step step-analytics" id="node-analytics">
+          <div class="step-icon"><i class="fa-solid fa-chart-line"></i></div>
+          <div class="step-label">Event & Movement</div>
+          <div class="step-sub">Goals • Passes • Speed</div>
+        </div>
+
+        <div class="flow-arrow"><i class="fa-solid fa-chevron-right"></i></div>
+
+        <div class="flow-step step-stats" id="node-stats">
+          <div class="step-icon"><i class="fa-solid fa-trophy"></i></div>
+          <div class="step-label">Player Stats</div>
+          <div class="step-sub">Stat Card & Reels</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Upload & Setup Grid Section -->
+    <section class="setup-section grid-2col">
+      <!-- Input Video & Target Jersey Setup Form -->
+      <div class="glass-card setup-card">
+        <div class="card-header">
+          <h3><i class="fa-solid fa-cloud-arrow-up"></i> Select Video & Target Jersey</h3>
+        </div>
+
+        <!-- Sample Videos Selector -->
+        <div class="form-group">
+          <label><i class="fa-solid fa-film"></i> Select Input Match Video</label>
+          <div class="select-wrapper">
+            <select id="video-select" class="form-control">
+              <option value="clip1 43.mp4">clip1 43.mp4 (Target #43 - 4K Veo Camera)</option>
+              <option value="clip2 77.mp4" selected>clip2 77.mp4 (Target #77 - 4K Veo Camera)</option>
+              <option value="video1/clip1.mp4">video1/clip1.mp4 (Match Clip 1)</option>
+              <option value="video2/clip2.mp4">video2/clip2.mp4 (Match Clip 2)</option>
+              <option value="Jordan Thomas Highlight Video.mp4">Jordan Thomas Highlight Video.mp4 (Compilation)</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- File Upload Zone -->
+        <div class="upload-dropzone" id="upload-zone">
+          <i class="fa-solid fa-file-video upload-icon"></i>
+          <p class="upload-text">Drag & drop your football video here or <span>browse</span></p>
+          <span class="upload-sub">Supports MP4, MOV, AVI (up to 4K resolution)</span>
+          <input type="file" id="file-input" accept="video/*" hidden>
+        </div>
+
+        <!-- Target Jersey Input & Quick Select Chips -->
+        <div class="form-group margin-top-md">
+          <label><i class="fa-solid fa-shirt"></i> Target Jersey Number</label>
+          <div class="jersey-input-row">
+            <div class="jersey-number-badge">#</div>
+            <input type="number" id="target-jersey-input" class="form-control jersey-input" value="10" min="1" max="99">
+          </div>
+          <div class="jersey-chips">
+            <span class="chip-label">Quick Select:</span>
+            <button class="chip active" onclick="setJersey(10)">#10</button>
+            <button class="chip" onclick="setJersey(11)">#11</button>
+            <button class="chip" onclick="setJersey(7)">#7</button>
+            <button class="chip" onclick="setJersey(77)">#77</button>
+            <button class="chip" onclick="setJersey(43)">#43</button>
+          </div>
+        </div>
+
+        <!-- Optional Track ID & Manual Annotation Sidecar Inputs -->
+        <div class="form-group margin-top-md">
+          <div class="collapsible-header" onclick="toggleCollapsible('annotations-collapse')">
+            <label><i class="fa-solid fa-crosshair"></i> Advanced Target Locking (Track ID & Manual Annotation)</label>
+            <i class="fa-solid fa-chevron-down toggle-icon"></i>
+          </div>
+          <div id="annotations-collapse" class="collapsible-content hidden margin-top-md">
+            <div class="form-group">
+              <label><i class="fa-solid fa-hashtag"></i> Track ID Override (Optional)</label>
+              <input type="text" id="track-id-input" class="form-control" placeholder="e.g. 10 or 0:10 (locks tracker onto exact player track ID)">
+              <span class="form-hint">If auto-detection picks the player standing in front, enter player #10's specific track ID here.</span>
+            </div>
+            
+            <div class="form-group margin-top-md">
+              <label><i class="fa-solid fa-pen-to-square"></i> Manual Sidecar Annotation (For Low Legibility / Distractor Clips)</label>
+              <textarea id="manual-annotations-input" class="form-control text-area" rows="3" placeholder="Min 0:00 player #10 in blue takes a touch&#10;Min 0:15 player #10 in blue makes a pass&#10;Min 0:58 player #10 in blue scores a goal"></textarea>
+              <span class="form-hint">Format: <code>Min MM:SS player #10 in [colour] [action]</code> (guarantees tracking lock on #10).</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Interactive Click-to-Track Player Box -->
+        <div class="form-group margin-top-md">
+          <label><i class="fa-solid fa-hand-pointer"></i> Interactive Click-to-Track Player (Click directly on player #10)</label>
+          <div class="click-preview-wrapper" id="click-preview-wrapper" style="position: relative; cursor: crosshair; background: #000; border-radius: 8px; overflow: hidden; border: 1px solid rgba(255,255,255,0.15);">
+            <video id="preview-video" style="width: 100%; display: block; max-height: 240px; object-fit: contain;" controls preload="metadata">
+              <source id="preview-video-src" src="/media/clip1 43.mp4" type="video/mp4">
+            </video>
+            <div id="click-marker" class="hidden" style="position: absolute; width: 44px; height: 80px; border: 3px solid #ef4444; background: rgba(239, 68, 68, 0.2); transform: translate(-50%, -50%); pointer-events: none; box-shadow: 0 0 12px #ef4444; border-radius: 4px; box-sizing: border-box;">
+              <div id="click-marker-label" style="position: absolute; top: -22px; left: -3px; background: #ef4444; color: #fff; font-size: 11px; font-weight: 800; padding: 2px 6px; border-radius: 3px; white-space: nowrap; font-family: 'JetBrains Mono', monospace;">#10 | TARGET</div>
+            </div>
+          </div>
+          <span class="form-hint" id="click-hint"><i class="fa-solid fa-info-circle"></i> Pause video at any frame and click directly on player #10 to pin tracking target.</span>
+
+          <button id="btn-load-players" type="button" class="btn btn-secondary btn-block margin-top-sm">
+            <i class="fa-solid fa-users-viewfinder"></i> Load Players at This Moment
+          </button>
+          <span class="form-hint">Detects every visible player at the video's current paused time and shows a clickable box on each -- click the exact player you want, no jersey number needed.</span>
+
+          <div id="frame-players-wrapper" class="frame-players-wrapper hidden">
+            <img id="frame-players-image" alt="Detected players at this moment" />
+            <div id="frame-players-boxes"></div>
+          </div>
+          <span class="form-hint hidden" id="frame-players-hint"></span>
+        </div>
+
+        <!-- Action Button -->
+        <button id="btn-process" class="btn btn-primary btn-block btn-lg margin-top-md">
+          <i class="fa-solid fa-play"></i> Run Player Tracking & Analytics
+        </button>
+      </div>
+
+      <!-- Live Pipeline Processing & Logs Display -->
+      <div class="glass-card logs-card">
+        <div class="card-header">
+          <h3><i class="fa-solid fa-terminal"></i> Pipeline Execution Progress</h3>
+          <span class="badge" id="job-status-badge">Idle</span>
+        </div>
+
+        <!-- Progress Bar -->
+        <div class="progress-wrapper">
+          <div class="progress-info">
+            <span id="current-stage-name">Ready for analysis</span>
+            <span id="progress-percentage">0%</span>
+          </div>
+          <div class="progress-bar-bg">
+            <div class="progress-bar-fill" id="progress-fill" style="width: 0%;"></div>
+          </div>
+        </div>
+
+        <!-- Terminal Logs Container -->
+        <div class="terminal-logs" id="terminal-logs">
+          <div class="log-entry log-info"><span class="log-time">[SYSTEM]</span> Ready to process football video. Select clip and target jersey number above.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Main Results & Analytics Dashboard Section (Revealed when results ready) -->
+    <section class="dashboard-section" id="results-dashboard">
+      
+      <!-- Dashboard Top Header Bar -->
+      <div class="dashboard-header-bar glass-card">
+        <div class="player-profile-summary">
+          <div class="jersey-avatar">
+            <span id="dash-jersey-num">11</span>
+          </div>
+          <div class="player-details">
+            <h2 id="dash-player-title">TARGET PLAYER #11</h2>
+            <div class="player-meta-tags">
+              <span class="meta-tag" id="dash-identity-status"><i class="fa-solid fa-shield-check"></i> Identity: Verified (PARSeq OCR)</span>
+              <span class="meta-tag"><i class="fa-solid fa-video"></i> Source: <span id="dash-video-name">clip2 77.mp4</span></span>
+              <span class="meta-tag"><i class="fa-solid fa-crosshair"></i> Tracker: ByteTrack</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="header-actions">
+          <button class="btn btn-secondary" onclick="exportStatCard()"><i class="fa-solid fa-file-export"></i> Export Stat Card</button>
+          <button class="btn btn-secondary" onclick="downloadAnnotatedVideo()"><i class="fa-solid fa-download"></i> Download Video</button>
+        </div>
+      </div>
+
+      <!-- Video Player & Player Stats Grid -->
+      <div class="grid-video-stats">
+        
+        <!-- Interactive Video Player Container -->
+        <div class="glass-card video-card">
+          <div class="card-header">
+            <h3><i class="fa-solid fa-circle-play"></i> Annotated Player Tracking Video</h3>
+            <div class="video-toggles">
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-boxes" checked>
+                <span class="slider"></span>
+                <span class="toggle-label">Boxes & Labels</span>
+              </label>
+              <label class="toggle-switch">
+                <input type="checkbox" id="toggle-ball" checked>
+                <span class="slider"></span>
+                <span class="toggle-label">Ball Path</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="video-player-wrapper">
+            <video id="annotated-video-player" controls preload="metadata" poster="">
+              <source src="/media/output/clip2_77/original_annotated_video.mp4" type="video/mp4">
+              Your browser does not support the video tag.
+            </video>
+          </div>
+
+          <!-- Video Controls & Quick Seek Event Markers -->
+          <div class="video-event-bar">
+            <span class="bar-title">Event Timeline Markers:</span>
+            <div class="event-markers-list" id="event-markers-list">
+              <!-- Event markers populated dynamically -->
+            </div>
+          </div>
+        </div>
+
+        <!-- Target Player Stat Card (User Prompt Specification) -->
+        <div class="glass-card stat-card-container">
+          <div class="card-header">
+            <h3><i class="fa-solid fa-shirt"></i> PLAYER STATS CARD</h3>
+            <span class="jersey-label" id="statcard-jersey-tag">#11</span>
+          </div>
+
+          <div class="stats-grid">
+            <div class="stat-box highlight-gold">
+              <div class="stat-icon"><i class="fa-solid fa-futbol"></i></div>
+              <div class="stat-value" id="stat-goals">1</div>
+              <div class="stat-label">Goals</div>
+            </div>
+
+            <div class="stat-box highlight-cyan">
+              <div class="stat-icon"><i class="fa-solid fa-handshake"></i></div>
+              <div class="stat-value" id="stat-assists">1</div>
+              <div class="stat-label">Assists</div>
+            </div>
+
+            <div class="stat-box">
+              <div class="stat-icon"><i class="fa-solid fa-shoe-prints"></i></div>
+              <div class="stat-value" id="stat-touches">14</div>
+              <div class="stat-label">Touches</div>
+            </div>
+
+            <div class="stat-box">
+              <div class="stat-icon"><i class="fa-solid fa-arrow-right-arrow-left"></i></div>
+              <div class="stat-value" id="stat-passes">9</div>
+              <div class="stat-label">Passes (Same-Colour)</div>
+            </div>
+
+            <div class="stat-box">
+              <div class="stat-icon"><i class="fa-solid fa-person-running"></i></div>
+              <div class="stat-value" id="stat-sprints">5</div>
+              <div class="stat-label">Sprints / Runs</div>
+            </div>
+
+            <div class="stat-box">
+              <div class="stat-icon"><i class="fa-solid fa-bullseye"></i></div>
+              <div class="stat-value" id="stat-shots">3</div>
+              <div class="stat-label">Shots</div>
+            </div>
+
+            <div class="stat-box">
+              <div class="stat-icon"><i class="fa-solid fa-shield"></i></div>
+              <div class="stat-value" id="stat-tackles">2</div>
+              <div class="stat-label">Tackles</div>
+            </div>
+
+            <div class="stat-box">
+              <div class="stat-icon"><i class="fa-solid fa-hands-glove"></i></div>
+              <div class="stat-value" id="stat-saves">0</div>
+              <div class="stat-label">Saves (Goalkeeper)</div>
+            </div>
+          </div>
+
+          <!-- Secondary Metrics -->
+          <div class="secondary-metrics">
+            <div class="metric-row">
+              <span class="metric-name"><i class="fa-solid fa-stopwatch"></i> Possession Time:</span>
+              <span class="metric-val" id="stat-possession">38.5 s</span>
+            </div>
+            <div class="metric-row">
+              <span class="metric-name"><i class="fa-solid fa-person-walking"></i> Distance Covered:</span>
+              <span class="metric-val" id="stat-distance">245.8 m (uncalibrated)</span>
+            </div>
+            <div class="metric-row">
+              <span class="metric-name"><i class="fa-solid fa-repeat"></i> Turnovers (Lost Ball):</span>
+              <span class="metric-val" id="stat-turnovers">2</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tactical 2D Pitch & Event Timeline Row -->
+      <div class="grid-2col margin-top-lg">
+        
+        <!-- 2D Tactical Pitch Canvas & Movement Heatmap -->
+        <div class="glass-card pitch-card">
+          <div class="card-header">
+            <h3><i class="fa-solid fa-compass"></i> 2D Tactical Pitch & Movement Trajectory</h3>
+            <div class="pitch-controls">
+              <button class="pitch-btn active" onclick="togglePitchMode('trajectory')">Trajectory</button>
+              <button class="pitch-btn" onclick="togglePitchMode('heatmap')">Heatmap</button>
+            </div>
+          </div>
+
+          <div class="pitch-container">
+            <canvas id="pitch-canvas" width="600" height="380"></canvas>
+          </div>
+          <div class="pitch-legend">
+            <span><i class="fa-solid fa-circle legend-run"></i> Normal Run</span>
+            <span><i class="fa-solid fa-circle legend-sprint"></i> High Speed Sprint</span>
+            <span><i class="fa-solid fa-star legend-action"></i> Key Event</span>
+          </div>
+        </div>
+
+        <!-- Full Timestamped Event Timeline -->
+        <div class="glass-card timeline-card">
+          <div class="card-header">
+            <h3><i class="fa-solid fa-list-check"></i> Timestamped Event Timeline</h3>
+            <span class="badge" id="timeline-count-badge">7 Events</span>
+          </div>
+
+          <div class="table-wrapper">
+            <table class="events-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Event Type</th>
+                  <th>Confidence</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="events-tbody">
+                <!-- Populated dynamically -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Highlight Reels Gallery -->
+      <div class="glass-card margin-top-lg highlights-section">
+        <div class="card-header">
+          <h3><i class="fa-solid fa-clapperboard"></i> Per-Category Highlight Reels</h3>
+          <span class="badge">Auto Generated Clips</span>
+        </div>
+
+        <div class="highlights-grid" id="highlights-grid">
+          <div class="reel-card" onclick="playReel('passes')">
+            <div class="reel-thumbnail">
+              <i class="fa-solid fa-arrow-right-arrow-left reel-icon"></i>
+              <span class="reel-badge">Passes Reel</span>
+            </div>
+            <div class="reel-info">
+              <h4>Passes Highlight Reel</h4>
+              <p>Every completed same-colour pass</p>
+            </div>
+          </div>
+
+          <div class="reel-card" onclick="playReel('goals')">
+            <div class="reel-thumbnail gold-thumb">
+              <i class="fa-solid fa-futbol reel-icon"></i>
+              <span class="reel-badge">Goals Reel</span>
+            </div>
+            <div class="reel-info">
+              <h4>Goals Highlight Reel</h4>
+              <p>Goal scored by target player</p>
+            </div>
+          </div>
+
+          <div class="reel-card" onclick="playReel('assists')">
+            <div class="reel-thumbnail cyan-thumb">
+              <i class="fa-solid fa-handshake reel-icon"></i>
+              <span class="reel-badge">Assists Reel</span>
+            </div>
+            <div class="reel-info">
+              <h4>Assists Highlight Reel</h4>
+              <p>Passes leading directly to goals</p>
+            </div>
+          </div>
+
+          <div class="reel-card" onclick="playReel('sprints')">
+            <div class="reel-thumbnail">
+              <i class="fa-solid fa-person-running reel-icon"></i>
+              <span class="reel-badge">Sprints Reel</span>
+            </div>
+            <div class="reel-info">
+              <h4>Sprints & Runs Reel</h4>
+              <p>High speed movement runs</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </section>
+
+  </main>
+
+  <script src="js/app.js"></script>
+</body>
+</html>

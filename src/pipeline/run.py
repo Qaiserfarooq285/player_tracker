@@ -63,13 +63,18 @@ from src.goal.detect import detect_goal_structures_for_video
 from src.highlights.cutting import cut_clips
 from src.highlights.ranking import rank_events
 from src.highlights.reel import build_reel, select_for_export
-from src.highlights.selection import SelectionResult, select_targets
+from src.highlights.selection import (
+    SelectionResult,
+    select_targets,
+    timeline_coverage_seconds,
+)
 from src.identity.verify import TakeIdentityResult
 from src.ingest.discovery import VideoRef, find_videos, parse_filename
 from src.pipeline.annotated_video import render_full_annotated_video
 from src.pipeline.player_output import write_player_output
 from src.pipeline.profiler import build_run_profile
 from src.stats.stats import build_player_stats, write_stat_card
+from src.track.click_reid import extend_chain_with_profile
 from src.track.run import run_track_stage
 from src.track.tracker import assign_take_id
 
@@ -395,8 +400,10 @@ def run_pipeline_for_video(
     # --- Stage 5: target selection (cached) ----------------------------------------------------
     t0 = time.time()
     selection_path = work_dir / "selection.json"
+    click_reid_cfg = configs["highlights"].get("click_reid", {})
     selection_cache_config = {
         "selection_cfg": configs["highlights"]["selection"],
+        "click_reid_cfg": click_reid_cfg,
         "n_tracks": len(tracks),
         "n_arrow_hints": len(arrow_hints),
         "n_takes": len(takes),
@@ -418,6 +425,38 @@ def run_pipeline_for_video(
             configs["highlights"]["selection"],
             manual_overrides=manual_overrides,
         )
+        # Click-anchored re-identification (owner request 2026-09-01, `src/track/click_reid.py`):
+        # extend a MANUAL-OVERRIDE take's own stitched chain across a break `stitch_timeline`
+        # itself didn't bridge, using the clicked player's own team-cluster + height as
+        # corroborating evidence. Deliberately scoped to `manual_override` selections only -- the
+        # click is the strongest identity evidence this pipeline has (Golden Rule 4); auto-selected
+        # takes (arrow_vote/heuristic_fallback) are untouched.
+        if click_reid_cfg.get("enabled", False) and manual_overrides:
+            tracks_by_take: dict[int, list] = defaultdict(list)
+            for tr in tracks:
+                tracks_by_take[tr.take_id].append(tr)
+            for sel_take in selection.takes:
+                if sel_take.method != "manual_override" or sel_take.seed_track_id is None:
+                    continue
+                extended_ids, _evidence = extend_chain_with_profile(
+                    sel_take.seed_track_id,
+                    sel_take.track_ids,
+                    tracks_by_take.get(sel_take.take_id, []),
+                    click_reid_cfg,
+                )
+                if extended_ids != sel_take.track_ids:
+                    logger.info(
+                        "click_reid: take=%d extended manual-override chain from %d to %d "
+                        "fragment(s) (seed=%d)",
+                        sel_take.take_id,
+                        len(sel_take.track_ids),
+                        len(extended_ids),
+                        sel_take.seed_track_id,
+                    )
+                    sel_take.track_ids = extended_ids
+                    sel_take.coverage_seconds = timeline_coverage_seconds(
+                        extended_ids, tracks_by_take.get(sel_take.take_id, [])
+                    )
         save_json(selection, selection_path)
         selection_cache.write_meta()
     timings.append(
@@ -865,6 +904,7 @@ def main(
                 ref.path,
                 configs,
                 annotations_path,
+                target_jersey=target_jersey,
                 work_root=work_root,
                 output_root=output_root,
             )
