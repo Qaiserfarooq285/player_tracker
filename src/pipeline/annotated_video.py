@@ -92,6 +92,12 @@ _BANNER_FONT_SCALE = 1.4
 _BANNER_FONT_THICKNESS = 3
 _BANNER_SECONDS = 2.0  # how long the CUT banner stays on screen after a take starts
 
+_MAX_BOX_INTERP_GAP_S = 0.35  # largest gap between two TRACKING samples that `interpolated_bbox`
+# will bridge. Tracking runs at 10 fps (configs/hardware.yaml) => a normal consecutive-sample gap
+# is 0.10s, so this comfortably covers a couple of dropped samples while refusing to invent a
+# straight-line path across a real occlusion (Golden Rule 5) -- beyond it, the honest
+# nearest-sample behaviour is kept.
+
 # Live-panel categories, matching statcard.md's own summary lines (CLAUDE.md §13.2) so the
 # overlay never presents a number the stat card itself doesn't also report (Golden Rule 5).
 _PANEL_EVENT_TYPES = (
@@ -187,6 +193,61 @@ class _SortedTimeIndex:
             return None
         best = min(candidates, key=lambda i: abs(self._keys[i] - t))
         return self._items[best] if abs(self._keys[best] - t) <= tolerance else None
+
+    def bracketing(self, t: float) -> tuple[object | None, object | None, float]:
+        """`(before, after, frac)` -- the two samples straddling `t`, plus where `t` sits between
+        them in `[0, 1]`. Either side is `None` when `t` falls outside the sampled range.
+
+        Exists for `interpolated_bbox` below: this index is sampled at the TRACKING fps (10 by
+        default), well below the video's own frame rate (25-30), so `nearest` alone holds a box
+        still for 2-3 rendered frames and then snaps -- see that function's docstring for the real
+        owner-reported artifact this fixes.
+        """
+        if not self._items:
+            return None, None, 0.0
+        pos = bisect_left(self._keys, t)
+        before = self._items[pos - 1] if pos - 1 >= 0 else None
+        after = self._items[pos] if pos < len(self._items) else None
+        if before is None or after is None:
+            return before, after, 0.0
+        span = self._keys[pos] - self._keys[pos - 1]
+        frac = 0.0 if span <= 0 else (t - self._keys[pos - 1]) / span
+        return before, after, min(1.0, max(0.0, frac))
+
+
+def interpolated_bbox(
+    index: _SortedTimeIndex, t: float, tolerance: float, max_interp_gap_s: float
+) -> BBox | None:
+    """A track's box at `t`, linearly interpolated between the two surrounding TRACKING samples.
+
+    Owner-reported artifact, root-caused 2026-09-01 ("the frame is moving and wrong detection"):
+    tracking is sampled at `configs/hardware.yaml`'s tracking fps (10) while the video renders at
+    its own frame rate (25 fps measured on the real broadcast inputs), so there are ~2.5 rendered
+    frames per tracking sample. Snapping each rendered frame to the NEAREST sample therefore holds
+    a box motionless for two or three frames and then jumps it, and with a 0.3s tolerance the drawn
+    box can sit up to ~0.15s (~4 frames) behind where the player actually is. On a running player
+    that is a large, obvious offset -- the box visibly trails the body and looks like a wrong
+    detection even though the underlying track is correct.
+
+    Interpolating between the bracketing samples puts the box where the player actually is on every
+    rendered frame, at zero model cost. Only gaps up to `max_interp_gap_s` are bridged: across a
+    longer gap (an occlusion, a missed detection run) the two samples are not the same continuous
+    motion any more, so interpolating would invent a straight-line path the player never took --
+    that case honestly falls back to the existing nearest-sample behaviour (Golden Rule 5).
+    """
+    before, after, frac = index.bracketing(t)
+    if before is not None and after is not None:
+        gap = after.t - before.t
+        if 0 < gap <= max_interp_gap_s:
+            b0, b1 = before.bbox, after.bbox
+            return BBox(
+                x1=b0.x1 + (b1.x1 - b0.x1) * frac,
+                y1=b0.y1 + (b1.y1 - b0.y1) * frac,
+                x2=b0.x2 + (b1.x2 - b0.x2) * frac,
+                y2=b0.y2 + (b1.y2 - b0.y2) * frac,
+            )
+    nearest = index.nearest(t, tolerance)
+    return nearest.bbox if nearest is not None else None
 
 
 def red_box_track_ids(identity: TakeIdentityResult | None) -> set[int]:
@@ -795,11 +856,16 @@ def render_full_annotated_video(
             target_ids = red_box_track_ids(identity)
 
             for tr in take_tracks:
-                box = box_index_by_track[(tr.take_id, tr.id)].nearest(t, 0.3)
-                if box is None:
+                # Interpolated, not nearest-snapped: tracking is sampled well below the video's
+                # own frame rate, so snapping visibly lags the box behind a moving player -- see
+                # `interpolated_bbox`'s own docstring for the measured numbers.
+                bbox = interpolated_bbox(
+                    box_index_by_track[(tr.take_id, tr.id)], t, 0.3, _MAX_BOX_INTERP_GAP_S
+                )
+                if bbox is None:
                     continue
-                x1, y1 = box.bbox.x1 * scale_x, box.bbox.y1 * scale_y
-                x2, y2 = box.bbox.x2 * scale_x, box.bbox.y2 * scale_y
+                x1, y1 = bbox.x1 * scale_x, bbox.y1 * scale_y
+                x2, y2 = bbox.x2 * scale_x, bbox.y2 * scale_y
                 if tr.id in target_ids:
                     # ADR-18 (3): track ID and jersey identity are DIFFERENT concepts (a Track.id
                     # is a within-take tracker artifact that resets at every cut; a jersey number

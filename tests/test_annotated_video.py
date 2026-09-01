@@ -3,6 +3,8 @@ GPU/video I/O."""
 
 from __future__ import annotations
 
+import pytest
+
 import src.pipeline.annotated_video as annotated_video_mod
 from src.common.types import BBox, Event, EventType, Take, Track, TrackBox
 from src.goal.detect import GoalStructure
@@ -18,6 +20,7 @@ from src.pipeline.annotated_video import (
     _SortedTimeIndex,
     _target_panel_header,
     _tracked_goal_bboxes_for_take,
+    interpolated_bbox,
     red_box_track_ids,
 )
 
@@ -162,6 +165,68 @@ def test_box_index_keyed_by_take_and_track_id_avoids_cross_take_collision():
     # a naive flat {track_id: index} dict would have collided these -- confirm the fix actually
     # keeps them distinct (this is the assertion that would have caught the real bug)
     assert index_by_key[(0, 1)] is not index_by_key[(5, 1)]
+
+
+# ---------------------------------------------------------------------------
+# interpolated_bbox -- owner-reported artifact, root-caused 2026-09-01 ("the frame is moving and
+# wrong detection"): tracking is sampled at 10 fps while the real broadcast inputs render at 25
+# fps, so nearest-sample snapping held a box still for 2-3 rendered frames and then jumped it,
+# visibly lagging a moving player. Interpolating between the bracketing tracking samples puts the
+# box where the player actually is on every rendered frame.
+# ---------------------------------------------------------------------------
+
+
+def _moving_track(times_and_cx: list[tuple[float, float]]) -> Track:
+    return Track(id=1, take_id=0, boxes=[_track_box(t, cx) for t, cx in times_and_cx])
+
+
+def test_interpolated_bbox_halfway_between_two_samples():
+    track = _moving_track([(0.0, 100.0), (0.1, 200.0)])
+    index = _SortedTimeIndex(track.boxes, key=lambda b: b.t)
+    bbox = interpolated_bbox(index, 0.05, tolerance=0.3, max_interp_gap_s=0.35)
+    assert bbox is not None
+    assert bbox.cx == 150.0  # exactly halfway between 100 and 200
+
+
+def test_interpolated_bbox_at_a_sample_matches_it_exactly():
+    track = _moving_track([(0.0, 100.0), (0.1, 200.0), (0.2, 300.0)])
+    index = _SortedTimeIndex(track.boxes, key=lambda b: b.t)
+    assert interpolated_bbox(index, 0.1, 0.3, 0.35).cx == 200.0
+
+
+def test_interpolated_bbox_close_to_one_endpoint_is_mostly_that_endpoint():
+    track = _moving_track([(0.0, 0.0), (0.1, 100.0)])
+    index = _SortedTimeIndex(track.boxes, key=lambda b: b.t)
+    bbox = interpolated_bbox(index, 0.09, 0.3, 0.35)
+    assert bbox.cx == pytest.approx(90.0)  # 90% of the way from 0 to 100
+
+
+def test_interpolated_bbox_beyond_max_gap_falls_back_to_nearest_sample():
+    """A gap wider than max_interp_gap_s is NOT a continuous motion (occlusion / missed
+    detections) -- interpolating across it would invent a straight-line path the player never
+    took (Golden Rule 5), so the honest nearest-sample behaviour is kept instead."""
+    track = _moving_track([(0.0, 0.0), (10.0, 1000.0)])  # 10s gap, way past any real cadence
+    index = _SortedTimeIndex(track.boxes, key=lambda b: b.t)
+    bbox = interpolated_bbox(index, 5.0, tolerance=20.0, max_interp_gap_s=0.35)
+    # nearest() picks whichever of the two samples is closer in time -- t=5.0 is equidistant, so
+    # bisect_left's tie-break (the earlier index) wins; either real sample is honest, a fabricated
+    # midpoint is not.
+    assert bbox.cx in (0.0, 1000.0)
+
+
+def test_interpolated_bbox_outside_sampled_range_falls_back_to_nearest():
+    track = _moving_track([(1.0, 100.0), (1.1, 200.0)])
+    index = _SortedTimeIndex(track.boxes, key=lambda b: b.t)
+    # t=5.0 is well past the last sample -- bracketing() returns (last, None), so this must fall
+    # back to nearest() rather than crash or extrapolate.
+    bbox = interpolated_bbox(index, 5.0, tolerance=10.0, max_interp_gap_s=0.35)
+    assert bbox is not None
+    assert bbox.cx == 200.0
+
+
+def test_interpolated_bbox_empty_index_is_none():
+    index = _SortedTimeIndex([], key=lambda b: b.t)
+    assert interpolated_bbox(index, 1.0, 0.3, 0.35) is None
 
 
 # ---------------------------------------------------------------------------
