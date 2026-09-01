@@ -34,6 +34,7 @@ from src.common.logging import get_logger
 from src.common.types import Annotation, BallDetection, Event, Take, Track
 from src.common.video import probe
 from src.detect.overlay_mask import ArrowHint
+from src.identity.jersey_models import free_optional_jersey_stack, load_optional_jersey_stack
 from src.identity.jersey_ocr import free_easyocr_reader, load_easyocr_reader
 from src.identity.verify import TakeIdentityResult
 from src.pipeline.annotated_video import render_full_annotated_video
@@ -176,8 +177,17 @@ def build_manual_identity_by_take(
     # when Stage B's jersey-reid signal is actually enabled and there is at least one annotation to
     # process; freed in the `finally` below regardless of how the loop below exits.
     reader = None
+    legibility_model = None
+    parseq_model = None
+    parseq_transform = None
     if jersey_reid_enabled and any(annotations_by_take.values()):
         reader = load_easyocr_reader(identity_cfg["ocr"])
+        # Owner-authorized 2026-08-31 (CLAUDE.md §7): same optional, fail-soft legibility ->
+        # PARSeq-SoccerNet stack ADR-15's own `src.identity.verify` loads, reused here so
+        # manual-mode jersey re-identification (Stage B) gets the same stronger signal ahead of
+        # the pre-existing EasyOCR/Gemini chain. Missing/disabled checkpoints degrade this to
+        # exactly the prior behaviour (`load_optional_jersey_stack` never raises).
+        legibility_model, parseq_model, parseq_transform = load_optional_jersey_stack(identity_cfg)
 
     # Only needed when Stage B's jersey-reid signal is enabled (see the two call sites below) --
     # computed defensively via `.get` so a minimal test config without this key (jersey_reid
@@ -258,6 +268,9 @@ def build_manual_identity_by_take(
                                     reader,
                                     gemini_api_key,
                                     use_nvdec,
+                                    legibility_model=legibility_model,
+                                    parseq_model=parseq_model,
+                                    parseq_transform=parseq_transform,
                                 )
                             )
                             if reacq_id is not None:
@@ -318,6 +331,9 @@ def build_manual_identity_by_take(
                                 # of near-time candidates could exhaust the budget on unrelated
                                 # players before ever reaching the one colour already selected.
                                 priority_track_id=track_id,
+                                legibility_model=legibility_model,
+                                parseq_model=parseq_model,
+                                parseq_transform=parseq_transform,
                             )
                         )
                         arrow_evidence = {
@@ -389,6 +405,7 @@ def build_manual_identity_by_take(
     finally:
         if reader is not None:
             free_easyocr_reader(reader)
+        free_optional_jersey_stack(legibility_model, parseq_model)
 
     return identity_by_take, debug
 

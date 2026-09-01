@@ -39,7 +39,9 @@ from src.common.video import decode_frames
 from src.detect.overlay_mask import ArrowHint
 from src.highlights.selection import _center_distance, _contains, _nearest_box
 from src.identity.jersey_ocr import read_jersey_digits, upscale_crop
+from src.identity.jersey_parseq import read_jersey_number_parseq
 from src.identity.jersey_vlm import classify_jersey_number
+from src.identity.legibility import is_legible
 from src.identity.verify import FrameRead, aggregate_take_identity
 from src.team.classifier import per_track_lab_median, torso_region
 
@@ -252,6 +254,9 @@ def read_jersey_number_for_candidates(
     gemini_api_key: str | None,
     use_nvdec: bool = True,
     priority_track_id: int | None = None,
+    legibility_model=None,
+    parseq_model=None,
+    parseq_transform=None,
 ) -> tuple[int | None, str | None, dict]:
     """Stage B ("streamed-gathering-treehouse" plan, revised 2026-08-31 after a real owner-found
     misidentification on `chelsea_burnley_target10`) -- best-effort jersey-NUMBER read across
@@ -259,6 +264,15 @@ def read_jersey_number_for_candidates(
     `claimed_jersey_number` (the annotation's own stated number): the strongest possible
     re-identification signal available, since two teammates in identical kit are only
     distinguishable by the printed number, not by colour.
+
+    **Reading chain, owner-authorized 2026-08-31 (CLAUDE.md §7), same order as
+    `src.identity.verify._collect_reads_for_take`:** a legibility gate
+    (`src/identity/legibility.py`) first screens each crop; a legible crop is read by
+    PARSeq-SoccerNet (`src/identity/jersey_parseq.py`) before falling back to the PRE-EXISTING
+    EasyOCR/Gemini chain. `legibility_model`/`parseq_model`/`parseq_transform` default to `None`,
+    which degrades this exactly to the prior OCR-first/VLM-escalation behaviour (missing/disabled
+    checkpoints are not an error here -- see `src.identity.jersey_models.load_optional_jersey_stack`,
+    which the caller in `src.pipeline.manual_events` uses to load these once per video).
 
     **Multi-frame-per-candidate, not one snapshot** (the real fix): for EACH candidate, up to
     `jersey_reid_cfg['max_frames_per_candidate']` crops are sampled across THAT candidate's OWN
@@ -292,18 +306,20 @@ def read_jersey_number_for_candidates(
     nearby players. `None` (the default) preserves plain deterministic track-id order.
 
     Returns `(track_id, source, evidence)`:
-    - `(track_id, "ocr"|"vlm"|"mixed", evidence)` when EXACTLY ONE candidate's own aggregated
-      reads verify to `str(claimed_jersey_number)`.
+    - `(track_id, "parseq_soccernet"|"ocr"|"vlm"|"mixed", evidence)` when EXACTLY ONE candidate's
+      own aggregated reads verify to `str(claimed_jersey_number)`.
     - `(None, None, evidence)` when no candidate's reads verify to the claimed number, OR when MORE
       THAN ONE candidate's reads do (an honest "can't disambiguate", never an arbitrary pick --
       Golden Rule 5; `evidence['outcome']` names which case happened).
-    `evidence` always carries `{n_crops_considered, n_too_small, n_ocr_confident, n_vlm_calls,
-    n_vlm_failed, reads: [{track_id, source, digits, confidence}, ...], outcome}` -- the FULL
-    per-candidate-per-frame trail, not just the winner (Golden Rule 5).
+    `evidence` always carries `{n_crops_considered, n_too_small, n_legible, n_parseq_confident,
+    n_ocr_confident, n_vlm_calls, n_vlm_failed, reads: [{track_id, source, digits, confidence}, ...],
+    outcome}` -- the FULL per-candidate-per-frame trail, not just the winner (Golden Rule 5).
     """
     evidence: dict = {
         "n_crops_considered": 0,
         "n_too_small": 0,
+        "n_legible": 0,
+        "n_parseq_confident": 0,
         "n_ocr_confident": 0,
         "n_vlm_calls": 0,
         "n_vlm_failed": 0,
@@ -321,6 +337,8 @@ def read_jersey_number_for_candidates(
     ocr_cfg = identity_cfg["ocr"]
     vlm_cfg = identity_cfg["vlm"]
     agg_cfg = identity_cfg["aggregation"]
+    legibility_cfg = identity_cfg.get("legibility", {})
+    parseq_cfg = identity_cfg.get("parseq_soccernet", {})
     max_vlm = jersey_reid_cfg["max_vlm_escalations_per_call"]
     max_frames_per_candidate = jersey_reid_cfg["max_frames_per_candidate"]
 
@@ -391,6 +409,40 @@ def read_jersey_number_for_candidates(
             crop = upscale_crop(crop, upscale_factor)
             evidence["n_crops_considered"] += 1
             frame_index += 1
+
+            # Owner-authorized 2026-08-31 (CLAUDE.md §7): legibility gate -> PARSeq-SoccerNet,
+            # ahead of the pre-existing EasyOCR path (same chain/order as
+            # `src.identity.verify._collect_reads_for_take`). `legibility_model`/`parseq_model`
+            # are `None` whenever the NC-restricted checkpoints weren't loaded -- this block is
+            # then a no-op and control falls straight through to the unchanged OCR/VLM chain.
+            if legibility_model is not None and parseq_model is not None:
+                leg = is_legible(crop, legibility_model, legibility_cfg)
+                if leg.is_legible:
+                    evidence["n_legible"] += 1
+                    parseq_read = read_jersey_number_parseq(
+                        crop, parseq_model, parseq_transform, parseq_cfg
+                    )
+                    if parseq_read.is_confident:
+                        evidence["n_parseq_confident"] += 1
+                        candidate_reads.append(
+                            FrameRead(
+                                t=target_t,
+                                frame_index=frame_index,
+                                source="parseq_soccernet",
+                                digits=parseq_read.digits,
+                                confidence=parseq_read.confidence,
+                                raw=parseq_read.raw_text,
+                            )
+                        )
+                        evidence["reads"].append(
+                            {
+                                "track_id": tr.id,
+                                "source": "parseq_soccernet",
+                                "digits": parseq_read.digits,
+                                "confidence": parseq_read.confidence,
+                            }
+                        )
+                        continue
 
             ocr_read = read_jersey_digits(reader, crop, ocr_cfg)
             if ocr_read.is_confident:
