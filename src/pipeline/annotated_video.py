@@ -37,8 +37,32 @@ from src.track.tracker import assign_take_id
 
 logger = get_logger("annotated_video")
 
-# Native-4K-scaled drawing constants (overlay_target.py's own constants were tuned for its 960px
-# preview output; this renders at native resolution, ~4x larger, so line/font sizes scale up).
+# Drawing constants below are all expressed at a 4K REFERENCE WIDTH and scaled per frame by
+# `_overlay_scale` (see below) -- never used raw.
+#
+# Owner-reported bug, root-caused 2026-09-01: they used to be applied raw, with the note "this
+# renders at native resolution, ~4x larger, so line/font sizes scale up". That silently assumed
+# every input is 4K. It is not: the real broadcast inputs (`video2`/`video3`) are 1280x720, i.e.
+# 3x narrower, so the whole overlay rendered ~3x oversized -- the red TARGET label alone spanned
+# most of the frame width and occluded the play it was supposed to annotate (confirmed by
+# extracting real frames at t=58s/59s). Scaling by the frame's own width fixes this generically
+# for ANY input resolution rather than per-video, which is the standing requirement.
+_REFERENCE_WIDTH_PX = 3840  # the width every size constant in this module was tuned at
+_MIN_OVERLAY_SCALE = 0.30  # floor so overlays stay legible on small/SD inputs instead of
+# collapsing to sub-pixel lines and unreadable 0.2-scale text.
+
+
+def _overlay_scale(frame_width: int) -> float:
+    """Per-frame multiplier for every size constant in this module, so the overlay is
+    proportional to the actual video rather than assuming 4K."""
+    return max(_MIN_OVERLAY_SCALE, frame_width / _REFERENCE_WIDTH_PX)
+
+
+def _px(value: float, scale: float, minimum: int = 1) -> int:
+    """Scale a pixel-valued constant, never below `minimum` (a 0px line draws nothing)."""
+    return max(minimum, int(round(value * scale)))
+
+
 _RED = (0, 0, 255)  # BGR
 _GREEN = (0, 200, 0)
 _RED_THICKNESS = 6
@@ -251,17 +275,19 @@ def _draw_event_caption(frame: np.ndarray, active_events: list[tuple[int, Event]
     if not active_events:
         return
     frame_h, frame_w = frame.shape[:2]
+    sc = _overlay_scale(frame_w)
+    font_scale = _CAPTION_FONT_SCALE * sc
+    thickness = _px(_CAPTION_FONT_THICKNESS, sc)
+    pad = _px(_CAPTION_PADDING_PX, sc)
     for i, (number, ev) in enumerate(active_events):
         text = f"#{number} | {_event_caption_label(ev)} | {_format_caption_timestamp(ev.t_start)}"
-        (tw, th), baseline = cv2.getTextSize(
-            text, _CAPTION_FONT, _CAPTION_FONT_SCALE, _CAPTION_FONT_THICKNESS
-        )
+        (tw, th), baseline = cv2.getTextSize(text, _CAPTION_FONT, font_scale, thickness)
         x = (frame_w - tw) // 2
-        y = frame_h - _CAPTION_BOTTOM_MARGIN_PX - i * _CAPTION_LINE_HEIGHT_PX
+        y = frame_h - _px(_CAPTION_BOTTOM_MARGIN_PX, sc) - i * _px(_CAPTION_LINE_HEIGHT_PX, sc)
         cv2.rectangle(
             frame,
-            (x - _CAPTION_PADDING_PX, y - th - _CAPTION_PADDING_PX),
-            (x + tw + _CAPTION_PADDING_PX, y + baseline + _CAPTION_PADDING_PX // 2),
+            (x - pad, y - th - pad),
+            (x + tw + pad, y + baseline + pad // 2),
             _CAPTION_BG_COLOR,
             -1,
         )
@@ -270,9 +296,9 @@ def _draw_event_caption(frame: np.ndarray, active_events: list[tuple[int, Event]
             text,
             (x, y),
             _CAPTION_FONT,
-            _CAPTION_FONT_SCALE,
+            font_scale,
             _CAPTION_TEXT_COLOR,
-            _CAPTION_FONT_THICKNESS,
+            thickness,
             cv2.LINE_AA,
         )
 
@@ -289,17 +315,19 @@ def _draw_box_with_label(
     font_scale: float,
     font_thickness: int,
 ) -> None:
+    scale = _overlay_scale(frame.shape[1])
+    pad_y, pad_x, text_x = _px(10, scale), _px(16, scale), _px(8, scale)
     p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
     cv2.rectangle(frame, p1, p2, color, box_thickness)
     (tw, th), baseline = cv2.getTextSize(label, _LABEL_FONT, font_scale, font_thickness)
-    label_y = max(th + 10, p1[1] - 10)
+    label_y = max(th + pad_y, p1[1] - pad_y)
     cv2.rectangle(
-        frame, (p1[0], label_y - th - 10), (p1[0] + tw + 16, label_y + baseline), color, -1
+        frame, (p1[0], label_y - th - pad_y), (p1[0] + tw + pad_x, label_y + baseline), color, -1
     )
     cv2.putText(
         frame,
         label,
-        (p1[0] + 8, label_y),
+        (p1[0] + text_x, label_y),
         _LABEL_FONT,
         font_scale,
         (0, 0, 0),
@@ -340,30 +368,36 @@ def _draw_live_panel(
         lines.append(("IDENTITY: unverified in this segment", _PANEL_HEADER_COLOR))
         lines.append(("No target player statistics for this segment", _PANEL_TEXT_COLOR))
 
-    max_text_w = max(
-        cv2.getTextSize(text, _PANEL_FONT, _PANEL_FONT_SCALE, _PANEL_FONT_THICKNESS)[0][0]
-        for text, _color in lines
-    )
-    panel_w = max_text_w + 2 * _PANEL_PADDING_PX
-    panel_h = _PANEL_PADDING_PX * 2 + len(lines) * _PANEL_LINE_HEIGHT_PX
     frame_h, frame_w = frame.shape[:2]
-    x0 = frame_w - _PANEL_MARGIN_PX - panel_w
-    y0 = _PANEL_MARGIN_PX
+    sc = _overlay_scale(frame_w)
+    font_scale = _PANEL_FONT_SCALE * sc
+    thickness = _px(_PANEL_FONT_THICKNESS, sc)
+    padding = _px(_PANEL_PADDING_PX, sc)
+    line_height = _px(_PANEL_LINE_HEIGHT_PX, sc)
+    margin = _px(_PANEL_MARGIN_PX, sc)
+
+    max_text_w = max(
+        cv2.getTextSize(text, _PANEL_FONT, font_scale, thickness)[0][0] for text, _color in lines
+    )
+    panel_w = max_text_w + 2 * padding
+    panel_h = padding * 2 + len(lines) * line_height
+    x0 = frame_w - margin - panel_w
+    y0 = margin
 
     overlay = frame.copy()
     cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h), _PANEL_BG_COLOR, -1)
     cv2.addWeighted(overlay, _PANEL_ALPHA, frame, 1 - _PANEL_ALPHA, 0, dst=frame)
 
     for i, (text, color) in enumerate(lines):
-        y = y0 + _PANEL_PADDING_PX + (i + 1) * _PANEL_LINE_HEIGHT_PX - 12
+        y = y0 + padding + (i + 1) * line_height - _px(12, sc)
         cv2.putText(
             frame,
             text,
-            (x0 + _PANEL_PADDING_PX, y),
+            (x0 + padding, y),
             _PANEL_FONT,
-            _PANEL_FONT_SCALE,
+            font_scale,
             color,
-            _PANEL_FONT_THICKNESS,
+            thickness,
             cv2.LINE_AA,
         )
 
@@ -418,19 +452,24 @@ def _draw_goal_regions(frame: np.ndarray, polygons: list[np.ndarray]) -> None:
     """Draw every prepared goal-region polygon (ADR-20/21) — a no-op when `polygons` is empty
     (the default, no region configured for this slug), never a placeholder/"not configured" note
     (Golden Rule 5 spirit: don't manufacture visual noise for an absent feature)."""
+    sc = _overlay_scale(frame.shape[1])
     for pts in polygons:
         cv2.polylines(
-            frame, [pts], isClosed=True, color=_GOAL_REGION_COLOR, thickness=_GOAL_REGION_THICKNESS
+            frame,
+            [pts],
+            isClosed=True,
+            color=_GOAL_REGION_COLOR,
+            thickness=_px(_GOAL_REGION_THICKNESS, sc),
         )
         label_x, label_y = int(pts[0][0][0]), int(pts[0][0][1])
         cv2.putText(
             frame,
             _GOAL_REGION_LABEL,
-            (label_x, max(label_y - 10, 20)),
+            (label_x, max(label_y - _px(10, sc), _px(20, sc))),
             _GOAL_REGION_LABEL_FONT,
-            _GOAL_REGION_LABEL_FONT_SCALE,
+            _GOAL_REGION_LABEL_FONT_SCALE * sc,
             _GOAL_REGION_COLOR,
-            _GOAL_REGION_LABEL_FONT_THICKNESS,
+            _px(_GOAL_REGION_LABEL_FONT_THICKNESS, sc),
             cv2.LINE_AA,
         )
 
@@ -512,18 +551,20 @@ def _bbox_to_polygon(bbox: BBox) -> np.ndarray:
 
 def _draw_cut_banner(frame: np.ndarray, take_id: int, verified: bool) -> None:
     width = frame.shape[1]
-    cv2.rectangle(frame, (0, 0), (width, _BANNER_HEIGHT_PX), _BANNER_BG_COLOR, -1)
+    sc = _overlay_scale(width)
+    banner_h = _px(_BANNER_HEIGHT_PX, sc)
+    cv2.rectangle(frame, (0, 0), (width, banner_h), _BANNER_BG_COLOR, -1)
     text = f"CUT -- take {take_id}"
     if not verified:
         text += "   |   IDENTITY: unverified in this segment"
     cv2.putText(
         frame,
         text,
-        (24, int(_BANNER_HEIGHT_PX * 0.65)),
+        (_px(24, sc), int(banner_h * 0.65)),
         _BANNER_FONT,
-        _BANNER_FONT_SCALE,
+        _BANNER_FONT_SCALE * sc,
         _BANNER_TEXT_COLOR,
-        _BANNER_FONT_THICKNESS,
+        _px(_BANNER_FONT_THICKNESS, sc),
         cv2.LINE_AA,
     )
 
@@ -658,6 +699,9 @@ def render_full_annotated_video(
     native_w, native_h, native_fps = native_meta["width"], native_meta["height"], native_meta["fps"]
     scale_x = native_w / detect_frame_width if detect_frame_width else 1.0
     scale_y = native_h / detect_frame_height if detect_frame_height else 1.0
+    # Every drawing constant in this module is expressed at a 4K reference width; scale them to
+    # THIS video's real size so the overlay is proportional on 720p broadcast as well as on 4K.
+    overlay_scale = _overlay_scale(native_w)
 
     tracks_by_take: dict[int, list[Track]] = {}
     for tr in tracks:
@@ -769,9 +813,9 @@ def render_full_annotated_video(
                         y2,
                         f"#{identity.jersey_number} | TARGET | ID: {tr.id}",
                         _RED,
-                        _RED_THICKNESS,
-                        _LABEL_FONT_SCALE_TARGET,
-                        _LABEL_THICKNESS_TARGET,
+                        _px(_RED_THICKNESS, overlay_scale),
+                        _LABEL_FONT_SCALE_TARGET * overlay_scale,
+                        _px(_LABEL_THICKNESS_TARGET, overlay_scale),
                     )
                 else:
                     # ADR-18 (3): "ID: {n}" (not a bare "#{n}") -- a bare "#10" visually reads as a
@@ -789,9 +833,9 @@ def render_full_annotated_video(
                         y2,
                         f"ID: {display_id}",
                         _GREEN,
-                        _GREEN_THICKNESS,
-                        _LABEL_FONT_SCALE_OTHER,
-                        _LABEL_THICKNESS_OTHER,
+                        _px(_GREEN_THICKNESS, overlay_scale),
+                        _LABEL_FONT_SCALE_OTHER * overlay_scale,
+                        _px(_LABEL_THICKNESS_OTHER, overlay_scale),
                     )
 
             ball = ball_index.nearest(t, 0.2)

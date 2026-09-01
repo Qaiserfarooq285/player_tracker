@@ -231,7 +231,21 @@ jersey_reid:
   # call, not per-candidate -- a take with many same-kit candidates still cannot turn this into an
   # unbounded VLM scan; real measured cost per test video is reported in the plan's own
   # verification stage, not assumed here.
-  max_frames_per_candidate: 3 # owner-reported fix: sample up to this many frames spread across
+  max_frames_per_candidate: 20 # RAISED from 3 (2026-09-01, ADR-21 follow-up) -- 3 was starving
+  # this stage so badly that it never once succeeded. Measured across all four real association
+  # calls on video2 + video3: 39-48 crops considered per call yielded only 7-11 confident reads
+  # (~21%), spread over ~16 candidates -- about 0.6 reads per candidate, against an
+  # `identity.yaml: aggregation.min_agreeing_frames` bar of 2. Every call returned `no_match`, so
+  # identity silently fell back to the old colour-only path, which is exactly the misidentification
+  # this whole stage exists to prevent. The original value's own reasoning ("3 attempts gives a
+  # real chance at 2 agreeing") assumed a far higher per-crop yield than the footage delivers.
+  # Sized from the measured yield rather than guessed: at p=0.21 per crop, P(>=2 confident reads)
+  # is 0.06 at n=3, 0.56 at n=12, and 0.94 at n=20. Cost stays local and cheap -- the gate is a
+  # resnet34 and PARSeq is small (a 2,564-crop scan runs in ~2 min on the A2000), and note
+  # `n_legible == n_parseq_confident` in all four calls, so the legibility gate, not PARSeq, is
+  # the limiter. VLM cost does NOT scale with this: `max_vlm_escalations_per_call` remains a hard
+  # per-call ceiling.
+  # (original note, still true) sample up to this many frames spread across
   # EACH candidate's own box lifespan (`src.annotations.associate._candidate_target_timestamps`),
   # not just one crop near the annotation's own instant -- a player side-on at that exact moment
   # may be facing the camera elsewhere in the same track. Reasoned (not separately measured): the
