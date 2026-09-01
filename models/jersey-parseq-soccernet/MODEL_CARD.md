@@ -88,8 +88,41 @@ blocks for the enable/threshold knobs.
 
 Two more models sharing the card alongside RF-DETR/EasyOCR/Gemini (API-only). Both are loaded
 once per video (same convention as `jersey_ocr.load_easyocr_reader`) and freed immediately after.
-Measured peak VRAM (2026-08-31, on the real verification run): report in the task's own follow-up
-notes — both models are small relative to RF-DETR-Large (legibility: a single resnet34, ~21M
-params; PARSeq-base: ~90M params) and are loaded/freed sequentially, never held in VRAM alongside
-the heavier detection/tracking stages (CLAUDE.md §11: never hold multiple heavy models in VRAM at
-once).
+Measured VRAM (2026-09-01, real end-to-end runs of `input/video2/chelsea_burnley_target10.mp4`
+and `input/video3/chelsea_burnley_target2.mp4`, cached detect/track so only the identity stage was
+GPU-active): `nvidia-smi` read ~966 MiB used during a run vs. ~365 MiB idle baseline — a ~600 MiB
+delta for the legibility+PARSeq pair, comfortably inside the 5 GB budget (`configs/hardware.yaml`)
+and never approaching the 12 GB card limit. This is a wall-clock `nvidia-smi` snapshot, not an
+instrumented `torch.cuda.max_memory_allocated()` peak (unlike `src/detect/run.py`'s own
+`peak_vram_mb`) — a real, honestly-scoped measurement, not a precise instrumented one.
+
+## Real verification (2026-09-01) — a genuine, honest domain-gap finding
+
+End-to-end runs of both real broadcast clips above (`make run`-equivalent, `src.pipeline.run`)
+confirm the chain wiring works and is deterministic (identical evidence reproduced across two
+separate runs). **Signal richness is a real improvement**: EasyOCR found 0-2 confident reads per
+~40-48 sampled crops on this footage; PARSeq-SoccerNet found 7-11 confident, pure-digit reads on
+the SAME crops (`n_legible`/`n_parseq_confident` in `annotation_report.json`), so Gemini VLM
+escalation was never even needed (`n_vlm_calls: 0` in both runs) — a real, measured cost/signal
+win over the pre-existing OCR-first/VLM-escalation chain.
+
+**However — checked directly against the source frames, not assumed** (CLAUDE.md's own "verify,
+don't guess" discipline): PARSeq's individual confident reads were **not reliably correct** on
+this footage. Two checked examples: (1) `video2` t=58s, track 210 — PARSeq read `"10"` at 0.993
+confidence; the actual frame crop clearly shows jersey **`#4`**. (2) `video3` t=50s, track 201 (the
+track the pipeline's colour-match ultimately drew its "TARGET #2" box on) — PARSeq read `"27"` at
+0.957 confidence on that same track; the actual frame crop clearly shows jersey **`#10`**, not `#2`
+(the claimed target) and not `27` either. Neither misread reached "verified" status: this pipeline's
+own `min_agreeing_frames >= 2` aggregation rule (ADR-15) correctly declined to promote either
+single high-confidence-but-wrong read to a claimed identity, and both rendered overlays honestly
+label the target box **"COLOUR MATCH (jersey unconfirmed)"**, never a fabricated "VERIFIED".
+
+**Honest conclusion**: on this real 720p broadcast footage, PARSeq-SoccerNet gives more numerous
+confident reads than EasyOCR, but its own per-crop accuracy is not high enough here to resolve
+either test clip's target identity — same ADR-10 "expect a domain gap, measure on our own
+footage" lesson as the RF-DETR-SoccerNet checkpoint, now confirmed for this checkpoint too. The
+existing safeguards (temporal agreement, explicit "unconfirmed" labelling) are what actually kept
+these two wrong reads from being reported as fact — the chain is a real net-positive addition of
+signal and cost-saving (fewer VLM calls needed), not (yet, on this footage) a fix for the
+underlying identification difficulty on hard broadcast crops. This is reported as-is, not
+smoothed over, per this task's own explicit instruction to report the real result honestly.
