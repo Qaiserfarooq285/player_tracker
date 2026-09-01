@@ -238,3 +238,16 @@ jersey_reid:
   # SAME order of magnitude as `identity.yaml: aggregation.min_agreeing_frames` (2) plus one spare
   # try, since >= 2 independent AGREEING reads are required before a candidate counts as confirmed
   # -- 3 attempts gives a real chance at 2 agreeing even if one of the three is ambiguous/wrong.
+  min_disambiguation_margin: 0.20 # ADR-21 follow-up. When MORE THAN ONE candidate track verifies
+  # as the SAME claimed number -- physically impossible, only one player wears it -- prefer the
+  # better-supported track if it leads the runner-up by at least this much AGREEMENT FRACTION
+  # (share of that candidate's own reads backing the number); otherwise keep the honest
+  # "ambiguous -> caption only, no box" outcome rather than guessing (Golden Rule 5).
+  # Measured cause of the real collision on `chelsea_burnley_target10` take 0: a ByteTrack ID
+  # SWITCH, not an OCR failure -- track 201 visibly contains a claret Burnley player at t=39s and
+  # Chelsea's blue #10 at t=50s, so it picks up a PARTIAL set of the real holder's reads (44%)
+  # while the true, clean #10 chain (track 191, confirmed by eye) sits at 73%. A 0.29 real margin.
+  # 0.20 is set BELOW that observed gap so the correct pick survives, but high enough that two
+  # genuinely comparable claims stay ambiguous. Compared against the raw agreement fraction, NOT
+  # the blended `confidence`, half of which is PARSeq's own uncalibrated self-confidence (ADR-21).
+  # ⚠️ Calibrated on ONE observed collision -- a conservative rule, not a well-sampled threshold.

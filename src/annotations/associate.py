@@ -341,6 +341,7 @@ def read_jersey_number_for_candidates(
     parseq_cfg = identity_cfg.get("parseq_soccernet", {})
     max_vlm = jersey_reid_cfg["max_vlm_escalations_per_call"]
     max_frames_per_candidate = jersey_reid_cfg["max_frames_per_candidate"]
+    min_disambiguation_margin = jersey_reid_cfg["min_disambiguation_margin"]
 
     lifespans_by_track: dict[int, tuple[float, float]] = {
         tr.id: _candidate_lifespan(tr, take, t, window_s) for tr in candidates
@@ -394,6 +395,7 @@ def read_jersey_number_for_candidates(
     frame_index = 0
     verified_track_ids: list[int] = []
     supporting_sources_by_track: dict[int, set[str]] = {}
+    agreement_by_track: dict[int, float] = {}
 
     # Deterministic order, EXCEPT the caller's own colour/arrow pick (if any) goes first -- see
     # this function's own `priority_track_id` docstring for the real cost-exhaustion bug this
@@ -501,15 +503,44 @@ def read_jersey_number_for_candidates(
             supporting_sources_by_track[tr.id] = {
                 r.source for r in candidate_reads if r.frame_index in agg["evidence_frames"]
             }
+            # share of THIS candidate's own reads backing the claimed number -- the tie-break
+            # signal below. Deliberately the raw agreement fraction rather than `agg["confidence"]`,
+            # which is half made of PARSeq's own self-reported confidence and is uncalibrated on
+            # small crops (ADR-21) -- a tie-break must not be decided by the miscalibrated half.
+            agreement_by_track[tr.id] = sum(
+                1 for r in candidate_reads if r.digits == str(claimed_jersey_number)
+            ) / len(candidate_reads)
 
     if not verified_track_ids:
         evidence["outcome"] = "no_match"
         return None, None, evidence
 
     if len(verified_track_ids) > 1:
-        evidence["outcome"] = "ambiguous_multiple_candidates_matched"
+        # More than one track verified as the SAME number, which is physically impossible -- only
+        # one player wears it. Measured cause on real footage (video2 take 0): a ByteTrack ID
+        # SWITCH, where one track drifts across two different people (track 201 showed a claret
+        # player at t=39s and Chelsea's blue #10 at t=50s), so it accumulates a partial set of the
+        # real holder's reads. That makes the read counts genuinely lopsided rather than tied.
+        #
+        # Prefer the clearly-better-supported track when the margin is decisive; otherwise keep the
+        # honest "ambiguous -> no box" outcome (Golden Rule 5) rather than guessing between two
+        # comparable claims. Both the pick and its margin go into the evidence trail.
+        ranked = sorted(verified_track_ids, key=lambda t: (-agreement_by_track[t], t))
+        best, runner_up = ranked[0], ranked[1]
+        margin = agreement_by_track[best] - agreement_by_track[runner_up]
         evidence["ambiguous_track_ids"] = sorted(verified_track_ids)
-        return None, None, evidence
+        evidence["agreement_by_track"] = {
+            t: round(agreement_by_track[t], 3) for t in sorted(verified_track_ids)
+        }
+        if margin < min_disambiguation_margin:
+            evidence["outcome"] = "ambiguous_multiple_candidates_matched"
+            evidence["disambiguation_margin"] = round(margin, 3)
+            return None, None, evidence
+        evidence["outcome"] = "matched_after_disambiguation"
+        evidence["disambiguation_margin"] = round(margin, 3)
+        evidence["disambiguated_from"] = sorted(verified_track_ids)
+        sources = supporting_sources_by_track[best]
+        return best, ("mixed" if len(sources) > 1 else next(iter(sources))), evidence
 
     track_id = verified_track_ids[0]
     sources = supporting_sources_by_track[track_id]

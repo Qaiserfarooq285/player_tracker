@@ -436,11 +436,16 @@ def _jersey_reid_identity_cfg() -> dict:
     }
 
 
-def _jersey_reid_cfg(max_vlm: int = 6, max_frames: int = 2) -> dict:
+def _jersey_reid_cfg(
+    max_vlm: int = 6, max_frames: int = 2, min_disambiguation_margin: float = 0.20
+) -> dict:
     return {
         "enabled": True,
         "max_vlm_escalations_per_call": max_vlm,
         "max_frames_per_candidate": max_frames,
+        # ADR-21 follow-up: how far ahead the better-supported track must be, in agreement
+        # fraction, before a same-number collision is resolved instead of reported ambiguous.
+        "min_disambiguation_margin": min_disambiguation_margin,
     }
 
 
@@ -969,3 +974,92 @@ def test_read_jersey_number_for_candidates_none_models_preserve_prior_ocr_only_b
     assert (track_id, source) == (1, "ocr")
     assert evidence["n_legible"] == 0
     assert evidence["n_parseq_confident"] == 0
+
+
+# ---------------------------------------------------------------------------
+# ADR-21 follow-up -- same-number collision disambiguation.
+#
+# Two tracks verifying as the SAME number is physically impossible (only one player wears it).
+# Measured cause on real footage (video2 take 0): a ByteTrack ID SWITCH -- track 201 visibly
+# contains a claret Burnley player at t=39s and Chelsea's blue #10 at t=50s, so it accumulates a
+# PARTIAL set of the real holder's reads (44%) while the true clean #10 chain (track 191,
+# confirmed by eye) sits at 73%. Lopsided, not tied -- so prefer the clearly-better-supported
+# track, and stay honestly ambiguous when the two claims are comparable.
+# ---------------------------------------------------------------------------
+
+
+def _fake_ocr_alternating(marker_to_digits: dict[int, list[str | None]]):
+    """Per-marker cycle of digit reads, so different candidates can be given different AGREEMENT
+    fractions for the same claimed number (the fixed-digit fake above always yields 100%)."""
+    calls: dict[int, int] = {}
+
+    def _fake(reader, crop, ocr_cfg):
+        marker = int(crop[0, 0, 0])
+        seq = marker_to_digits.get(marker, [None])
+        idx = calls.get(marker, 0)
+        calls[marker] = idx + 1
+        digits = seq[idx % len(seq)]
+        return OcrRead(
+            digits=digits, confidence=0.9 if digits else 0.0, is_confident=digits is not None
+        )
+
+    return _fake
+
+
+def _collision_case(monkeypatch, track_b_reads: list[str | None], margin: float):
+    box_a = BBox(x1=10, y1=10, x2=40, y2=70)
+    box_b = BBox(x1=100, y1=10, x2=130, y2=70)
+    frame = _marker_frame()
+    _stamp_box(frame, box_a, marker=1)
+    _stamp_box(frame, box_b, marker=2)
+    monkeypatch.setattr(associate_mod, "decode_frames", _fake_decode_over_range(frame))
+    monkeypatch.setattr(
+        associate_mod,
+        "read_jersey_digits",
+        _fake_ocr_alternating({1: ["7"], 2: track_b_reads}),
+    )
+    times = [2.0, 4.0, 6.0, 8.0]
+    return read_jersey_number_for_candidates(
+        "fake.mp4",
+        _take_for_reid(),
+        [_candidate(1, times, box_a), _candidate(2, times, box_b)],
+        t=5.0,
+        claimed_jersey_number=7,
+        identity_cfg=_jersey_reid_identity_cfg(),
+        jersey_reid_cfg=_jersey_reid_cfg(max_frames=4, min_disambiguation_margin=margin),
+        decode_cfg=_DECODE_CFG,
+        sampling_cfg=_SAMPLING_CFG,
+        reader=object(),
+        gemini_api_key=None,
+    )
+
+
+def test_collision_resolved_toward_the_clearly_better_supported_track(monkeypatch):
+    """Track 1 reads "7" every time (100%); track 2 only 2 of 4 times (50%, a clear plurality
+    over "9"/"5" -- a 2-2 split would be a TIE and would not verify at all). A 0.5 margin
+    clears the 0.20 floor, so the stronger track wins instead of both being discarded."""
+    track_id, source, evidence = _collision_case(monkeypatch, ["7", "7", "9", "5"], margin=0.20)
+    assert track_id == 1
+    assert source == "ocr"
+    assert evidence["outcome"] == "matched_after_disambiguation"
+    assert evidence["disambiguated_from"] == [1, 2]
+    assert evidence["disambiguation_margin"] == 0.5
+    assert evidence["agreement_by_track"] == {1: 1.0, 2: 0.5}
+
+
+def test_collision_stays_ambiguous_when_margin_is_not_decisive(monkeypatch):
+    """Same lopsided evidence, but with a margin requirement the gap does not clear -- the honest
+    'no box' outcome must survive rather than the tie-break quietly always firing."""
+    track_id, source, evidence = _collision_case(monkeypatch, ["7", "7", "9", "5"], margin=0.75)
+    assert (track_id, source) == (None, None)
+    assert evidence["outcome"] == "ambiguous_multiple_candidates_matched"
+    assert evidence["disambiguation_margin"] == 0.5
+    assert evidence["ambiguous_track_ids"] == [1, 2]
+
+
+def test_equally_supported_collision_is_never_broken_arbitrarily(monkeypatch):
+    """Two identical claims stay ambiguous at any sane margin -- Golden Rule 5."""
+    track_id, source, evidence = _collision_case(monkeypatch, ["7"], margin=0.20)
+    assert (track_id, source) == (None, None)
+    assert evidence["outcome"] == "ambiguous_multiple_candidates_matched"
+    assert evidence["disambiguation_margin"] == 0.0
