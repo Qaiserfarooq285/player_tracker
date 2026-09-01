@@ -551,6 +551,11 @@ def run_manual_events_pipeline_for_video(
         # dict (e.g. a minimal test fixture) -- `render_full_annotated_video` already treats a
         # missing/`None` goal_region_cfg as "no polygon configured", the correct default anyway.
         goal_region_cfg=configs.get("goal_region"),
+        # `.get` chain for the same reason as `goal_region` above: a minimal test fixture's
+        # configs dict need not carry every stage's block, and the renderer already treats a
+        # missing/`None` selection_cfg as "don't stitch display identities", falling back to raw
+        # track ids -- the pre-existing behaviour, not a failure.
+        selection_cfg=(configs.get("highlights") or {}).get("selection"),
     )
     logger.info("manual-mode annotated video render -> %s", final_video_path)
 

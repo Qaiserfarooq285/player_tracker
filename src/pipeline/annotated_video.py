@@ -32,6 +32,7 @@ from src.common.viz import draw_ball
 from src.goal.detect import GoalStructure, goal_bbox_at, take_motion_score
 from src.identity.verify import TakeIdentityResult
 from src.pipeline.player_output import _TIMELINE_EVENT_TYPES, _key_moment_label
+from src.track.continuity import build_take_identities
 from src.track.tracker import assign_take_id
 
 logger = get_logger("annotated_video")
@@ -631,6 +632,7 @@ def render_full_annotated_video(
     goal_structure_cfg: dict | None = None,
     hardware_cfg: dict | None = None,
     profile_cfg: dict | None = None,
+    selection_cfg: dict | None = None,
 ) -> Path:
     """Render CLAUDE.md §13.1's primary output for one video: the WHOLE input, at native
     resolution/fps, red-boxed only during known-identity takes, green everywhere else, with a
@@ -661,6 +663,28 @@ def render_full_annotated_video(
     for tr in tracks:
         tracks_by_take.setdefault(tr.take_id, []).append(tr)
     take_by_id = {tk.id: tk for tk in takes}
+
+    # Display the STITCHED identity, not the raw per-fragment Track.id. ByteTrack is motion/IoU
+    # only (no appearance model), so a single real player is routinely split across many raw
+    # fragments -- MEASURED on work/chelsea_burnley_target10 take 0: 231 raw fragments for the
+    # ~13-18 people actually on screen, median fragment life 2.0s, 34% under 1s. Labelling boxes
+    # with `Track.id` therefore makes a player's on-screen number visibly churn every couple of
+    # seconds, which is exactly what the owner reported. `build_take_identities` already chains
+    # those fragments into persistent per-take identities (231 -> 80 on that same take) and is
+    # already the basis of the target's own identity lock, so reusing it here costs nothing new
+    # and makes every OTHER player's label as stable as the target's already is.
+    # NOT a full fix on its own: 80 chains is still ~5x the real head-count, so a label can still
+    # change when the stitcher itself loses a player -- honest partial improvement, not a claim of
+    # perfect identity (Golden Rule 5).
+    display_identity_by_take: dict[int, dict[int, int]] = {}
+    if selection_cfg is not None:
+        for take_id_key, take_track_list in tracks_by_take.items():
+            try:
+                identity_of, _conf = build_take_identities(take_track_list, selection_cfg)
+            except AssertionError:  # defensive: mixed-take list should be impossible here
+                logger.warning("skipping display-identity stitching for take=%s", take_id_key)
+                continue
+            display_identity_by_take[take_id_key] = identity_of
 
     # Presort ONCE (see _SortedTimeIndex docstring) -- the naive per-call `_nearest_by_time` would
     # otherwise re-sort ball_detections (~7000 items for a whole 234s video) and every track's own
@@ -751,14 +775,19 @@ def render_full_annotated_video(
                     )
                 else:
                     # ADR-18 (3): "ID: {n}" (not a bare "#{n}") -- a bare "#10" visually reads as a
-                    # jersey number, which this is NOT (it is only ever a raw, per-take Track.id).
+                    # jersey number, which this is NOT (it is only ever a tracker-side id).
+                    # The id shown is the STITCHED identity where available (see
+                    # `display_identity_by_take` above), falling back to the raw fragment id only
+                    # when stitching wasn't computed -- so a player's label stays put across the
+                    # short fragment breaks ByteTrack produces constantly on crowded footage.
+                    display_id = display_identity_by_take.get(take_id, {}).get(tr.id, tr.id)
                     _draw_box_with_label(
                         frame,
                         x1,
                         y1,
                         x2,
                         y2,
-                        f"ID: {tr.id}",
+                        f"ID: {display_id}",
                         _GREEN,
                         _GREEN_THICKNESS,
                         _LABEL_FONT_SCALE_OTHER,

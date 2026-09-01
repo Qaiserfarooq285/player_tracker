@@ -372,6 +372,7 @@ def run_extended_pipeline_for_video(
         goal_structure_cfg=configs["goal_structure"],
         hardware_cfg=configs["hardware"],
         profile_cfg=configs["profile"],
+        selection_cfg=configs["highlights"]["selection"],
     )
     logger.info("annotated video render: %.1fs -> %s", time.time() - t0, final_video_path)
 

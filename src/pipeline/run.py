@@ -649,6 +649,7 @@ def run_pipeline_for_video(
         goal_structure_cfg=configs["goal_structure"],
         hardware_cfg=configs["hardware"],
         profile_cfg=configs["profile"],
+        selection_cfg=configs["highlights"]["selection"],
     )
     timings.append(
         StageTiming(
