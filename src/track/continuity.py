@@ -94,6 +94,9 @@ def extend_chain_forward(
 
     max_gap_s = stitch_cfg["stitch_max_gap_s"]
     max_dist = stitch_cfg["stitch_max_dist"]
+    # Optional (absent -> gate disabled, preserving the exact prior behaviour for any caller whose
+    # config predates this key) -- see the gate's own comment in the candidate loop below.
+    max_speed = stitch_cfg.get("stitch_max_speed_bbox_heights_per_s")
     team_threshold = stitch_cfg["team_match_confidence_threshold"]
 
     chain: list[Track] = [pool[seed_track_id]]
@@ -115,6 +118,18 @@ def extend_chain_forward(
                 continue
             dist = _spatial_jump(current, cand.boxes[0])
             if dist >= max_dist:
+                continue
+            # Physical-plausibility gate (2026-09-01). `max_dist` alone is gap-BLIND: it allows the
+            # same 3.0-bbox-height jump whether the fragment reappears 0.04s or 1.4s later, so a
+            # short-gap join can imply a speed no human reaches. Measured failure it fixes: on
+            # `chelsea_burnley_target10` take 0 the clicked Chelsea #10 (track 1) was joined to a
+            # CLARET BURNLEY #21 (track 47) across a 0.76s gap and 2.34 bbox-heights -- i.e.
+            # 3.08 bbox-heights/SECOND. This project's own measured speed distribution
+            # (configs/events.yaml: sprint_speed_threshold's comment, 1977+17885 real samples on
+            # two clips) puts p95 at 2.10-2.31 and the observed MAXIMUM at 3.70, so 3.08 is
+            # faster than 95% of all real player movement ever measured here -- implausible for
+            # one continuous player, and exactly the signature of a jump to a different person.
+            if max_speed is not None and gap > 0 and (dist / gap) >= max_speed:
                 continue
             agrees = _team_agrees(current, cand, team_threshold)
             if (

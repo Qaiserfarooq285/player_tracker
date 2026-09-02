@@ -30,6 +30,19 @@ selection:
   # divided by their mean bbox height). Not derived from sprint_speed_threshold * stitch_max_gap_s
   # on purpose (that product is ~6) — kept independently tunable since a lost-then-reacquired
   # track's real path is rarely a straight line at that speed.
+  stitch_max_speed_bbox_heights_per_s: 2.5 # ADDED 2026-09-01. `stitch_max_dist` above is
+  # gap-BLIND -- it permits the same 3.0-bbox-height jump whether the fragment reappears 0.04s or
+  # 1.4s later, so a short-gap join can imply a speed no human reaches. This gate divides the jump
+  # by the actual gap and rejects physically implausible continuations.
+  # Grounded in THIS project's own measured speed distribution (see configs/events.yaml:
+  # sprint_speed_threshold's comment -- 1977 samples on clip2 + 17885 on clip4, two different
+  # venues): median 0.46, p90 1.67-1.80, p95 2.10-2.31, observed MAX 3.70 bbox-heights/s.
+  # 2.5 sits just above p95 and well under the observed max, so ordinary and even sprinting
+  # continuations pass while an implausible jump does not.
+  # Measured failure this fixes: the owner clicked Chelsea's blue #10 (raw track 1) and
+  # `stitch_timeline` joined a CLARET BURNLEY #21 (track 47) across a 0.76s gap / 2.34
+  # bbox-heights = 3.08 bbox-heights/s -- faster than 95% of all real movement measured here, and
+  # the direct cause of the owner-reported "the target frame switch to another player".
   team_match_confidence_threshold: 0.5 # team agreement is used ONLY as a stitching TIEBREAKER
   # (never a hard filter — ADR-12: team labels can be low-confidence/unbalanced on some takes),
   # and only when BOTH candidate fragments' team_confidence clear this bar.
@@ -140,13 +153,37 @@ click_reid:
   # bridging. Do not re-enable without a real take-level colour-separation check, re-measured on
   # real footage.
   enabled: false
+  prune_jersey_disagreement: true # ✅ ON by default -- the SUBTRACTIVE half, and unlike `enabled`
+  # above it is safe: it can only REMOVE a fragment from a clicked player's chain, never introduce
+  # a new physical player. Measured need, 2026-09-01 on `chelsea_burnley_target10` take 0 (after
+  # the 10 -> 25 fps change): the owner clicked Chelsea's blue #10 (raw track 1, which the ADR-21
+  # reader confirms as "10" on 15/16 sampled frames = 94%), and `stitch_timeline` then joined raw
+  # track 47 across a 0.76s gap -- visually a CLARET BURNLEY #21, i.e. the wrong team entirely.
+  # The chain "covered" 60.5s of a 61.3s take while showing the wrong person for its last 35s:
+  # exactly the owner-reported "the target frame switch to another player".
+  # Neither other signal catches it -- `Track.team` is degenerate here (194/231 tracks share one
+  # label) and a torso-colour median is swamped by grass background (track 47 measures
+  # near-neutral, not claret) -- but the printed NUMBER does: "10" vs "21". A fragment with NO
+  # confident read is always KEPT (absence of evidence is not evidence of a different player,
+  # Golden Rule 5), so this degrades to a clean no-op on footage where numbers aren't legible.
   min_height_ratio: 0.60 # ⚠️ REASONED-BUT-UNMEASURED (same epistemic status as
   # `configs/annotations.yaml: colour_reference_lab`'s non-blue entries) -- box height shrinks with
   # camera-motion/depth between two fragments of the SAME player; 0.60 is a conservative floor
   # meant to tolerate normal depth change while still rejecting an obviously differently-sized
   # person (a 6ft midfielder vs a goalkeeper standing much closer to camera). Revisit the moment a
   # real labeled slice exists to measure the true same-player height-ratio distribution.
-  max_jersey_samples_per_track: 8 # 2026-09-01 follow-up to the disabled note above: jersey-number
+  max_jersey_samples_per_track: 40 # RAISED from 8, 2026-09-01, owner-authorized ("no matter how
+  # much it computationally expensive i want good results"). MEASURED reason: 8 was too thin to
+  # judge a long track. Raw track 47 on `chelsea_burnley_target10` take 0 is 856 boxes over 35.6s
+  # and is visually a CLARET BURNLEY #21, but at 8 samples it yielded only 4 confident reads
+  # ({24:2, 10:1, 21:1}) -> no verified majority at all -> `prune_chain_by_jersey` correctly kept
+  # it (absence of evidence is not evidence), and the wrong player stayed in the clicked #10's
+  # chain. At 24 samples the same track reads "#21" (5/11 = 45%), which DOES clear the agreement
+  # floor and disagrees with the seed's "#10" (15/16 = 94%) -> dropped, which is the whole point.
+  # 40 gives long tracks real evidence while still being bounded: the identity decode runs at
+  # `configs/identity.yaml: crop.identity_fps_sample` (2 fps), so a 35s track only has ~71 decoded
+  # frames to draw from anyway, and short tracks are capped by their own box count.
+  # (superseded note, kept for the reasoning) the original 8 was sized as follows: jersey-number
   # agreement is the fix for the measured team_confidence failure (colour alone let a different
   # physical player join the chain). `configs/annotations.yaml: jersey_reid.max_frames_per_candidate`
   # measured ~21% of crops clear the legibility gate on this same footage, and was raised to 20 for

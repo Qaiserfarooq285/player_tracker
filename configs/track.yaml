@@ -19,9 +19,15 @@ bytetrack:
   # 56->47 tracks, 15->8 short-lived (<0.5s) tracks. ⚠️ Verified only on clip2 so far — re-check
   # against clip4 (different venues/player density) before tuning further.
   track_activation_threshold: 0.35 # confidence required to start a new track
-  lost_track_buffer: 30 # frames to keep a lost track alive before dropping it
+  lost_track_buffer: 75 # frames to keep a lost track alive before dropping it. RAISED from 30
+  # together with the 10 -> 25 fps change in configs/hardware.yaml (2026-09-01): this is counted in
+  # FRAMES, so leaving it at 30 while sampling 2.5x denser would have quietly CUT its wall-clock
+  # tolerance from 3.0s to 1.2s and made track fragmentation WORSE -- the opposite of the intent.
+  # 75 frames @ 25 fps preserves the original ~3.0s tolerance exactly, so this change is purely
+  # "same behaviour, finer temporal resolution" rather than a second, confounded variable.
   minimum_matching_threshold: 0.85 # threshold for associating detections to existing tracks
-  frame_rate: 10 # must match configs/hardware.yaml stages.detect.fps_sample
+  frame_rate: 25 # must match configs/hardware.yaml stages.detect.fps_sample (feeds ByteTrack's
+  # own Kalman motion model timebase -- a mismatch here makes every motion prediction wrong)
 
 reset_ids_at_cuts: true # Golden Rule 3: track only within a take; reset IDs at every camera cut
 

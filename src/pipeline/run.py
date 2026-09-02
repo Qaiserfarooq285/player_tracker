@@ -75,7 +75,11 @@ from src.pipeline.annotated_video import render_full_annotated_video
 from src.pipeline.player_output import write_player_output
 from src.pipeline.profiler import build_run_profile
 from src.stats.stats import build_player_stats, write_stat_card
-from src.track.click_reid import collect_track_jersey_digits, extend_chain_with_profile
+from src.track.click_reid import (
+    collect_track_jersey_digits,
+    extend_chain_with_profile,
+    prune_chain_by_jersey,
+)
 from src.track.run import run_track_stage
 from src.track.tracker import assign_take_id
 
@@ -432,7 +436,10 @@ def run_pipeline_for_video(
         # corroborating evidence. Deliberately scoped to `manual_override` selections only -- the
         # click is the strongest identity evidence this pipeline has (Golden Rule 4); auto-selected
         # takes (arrow_vote/heuristic_fallback) are untouched.
-        if click_reid_cfg.get("enabled", False) and manual_overrides:
+        if (
+            click_reid_cfg.get("enabled", False)
+            or click_reid_cfg.get("prune_jersey_disagreement", False)
+        ) and manual_overrides:
             tracks_by_take: dict[int, list] = defaultdict(list)
             for tr in tracks:
                 tracks_by_take[tr.take_id].append(tr)
@@ -477,6 +484,35 @@ def run_pipeline_for_video(
                             len(jersey_by_track_id),
                             len(take_tracks),
                         )
+                    # SUBTRACTIVE pass first: drop any fragment `stitch_timeline` joined whose own
+                    # confident jersey read CONTRADICTS the clicked seed's. Safe to run by default
+                    # (it can only remove, never introduce, a physical player) -- see
+                    # `prune_chain_by_jersey`'s own docstring for the measured blue-#10 -> claret
+                    # -#21 join this exists to stop.
+                    if click_reid_cfg.get("prune_jersey_disagreement", False):
+                        kept_ids, prune_trail = prune_chain_by_jersey(
+                            sel_take.seed_track_id, sel_take.track_ids, jersey_by_track_id
+                        )
+                        dropped = [e for e in prune_trail if e.get("dropped")]
+                        if dropped:
+                            for e in dropped:
+                                logger.warning(
+                                    "click_reid: take=%d DROPPED fragment track=%s from the "
+                                    "clicked chain -- it reads jersey #%s but the clicked player "
+                                    "reads #%s (a different player was stitched in)",
+                                    sel_take.take_id,
+                                    e["track_id"],
+                                    e["fragment_jersey"],
+                                    e["seed_jersey"],
+                                )
+                            sel_take.track_ids = kept_ids
+                            sel_take.coverage_seconds = timeline_coverage_seconds(
+                                kept_ids, take_tracks
+                            )
+
+                    if not click_reid_cfg.get("enabled", False):
+                        continue
+
                     extended_ids, _evidence = extend_chain_with_profile(
                         sel_take.seed_track_id,
                         sel_take.track_ids,

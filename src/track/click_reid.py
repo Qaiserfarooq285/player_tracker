@@ -242,6 +242,59 @@ def collect_track_jersey_digits(
     return jersey_by_track_id
 
 
+def prune_chain_by_jersey(
+    seed_track_id: int,
+    chain_track_ids: list[int],
+    jersey_by_track_id: dict[int, str],
+) -> tuple[list[int], list[dict]]:
+    """Drop any fragment of a clicked player's chain whose own confident jersey read CONTRADICTS
+    the seed's. Returns `(kept_ids, evidence_trail)`.
+
+    This is the SUBTRACTIVE counterpart to `extend_chain_with_profile`, and unlike that additive
+    one it is safe to run by default: it can only ever REMOVE a fragment, never introduce a new
+    physical player into the chain. Worst case (no confident reads anywhere) it is a no-op.
+
+    Measured need, 2026-09-01 on `chelsea_burnley_target10` take 0 at 25 fps: the owner clicked
+    Chelsea's blue #10 (raw track 1, which the ADR-21 reader confirms as "10" on 15 of 16 sampled
+    frames -- 94%). `stitch_timeline` then joined raw track 47 across a 0.76s gap, and track 47 is
+    visually a CLARET BURNLEY #21 -- a different team, let alone a different player. The chain
+    therefore covered 60.5s of the take while showing the wrong person for its last 35s, which is
+    exactly the owner-reported "the target frame switch to another player".
+
+    Neither of the pipeline's other signals catches it: `Track.team` is degenerate on this take
+    (194 of 231 raw tracks share one label), and a torso-colour median is heavily contaminated by
+    grass background (track 47 measures near-neutral, not claret). The printed NUMBER does catch
+    it -- the two fragments read "10" and "21" respectively -- so a disagreement veto is the one
+    signal here that reflects reality rather than noise.
+
+    A fragment with NO confident read is KEPT, never dropped: absence of evidence is not evidence
+    of a different player (Golden Rule 5), and dropping unread fragments would silently gut the
+    chain on footage where numbers are rarely legible (the 4K amateur clips read 0/801).
+    """
+    seed_digits = jersey_by_track_id.get(seed_track_id)
+    if seed_digits is None:
+        return chain_track_ids, [{"skipped": "seed has no confident jersey read"}]
+
+    kept: list[int] = []
+    trail: list[dict] = []
+    for tid in chain_track_ids:
+        digits = jersey_by_track_id.get(tid)
+        if digits is not None and digits != seed_digits:
+            trail.append(
+                {
+                    "track_id": tid,
+                    "dropped": True,
+                    "reason": "jersey_disagrees_with_clicked_seed",
+                    "seed_jersey": seed_digits,
+                    "fragment_jersey": digits,
+                }
+            )
+            continue
+        kept.append(tid)
+        trail.append({"track_id": tid, "dropped": False, "fragment_jersey": digits})
+    return kept, trail
+
+
 def extend_chain_with_profile(
     seed_track_id: int,
     stitched_track_ids: list[int],

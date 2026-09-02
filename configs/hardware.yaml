@@ -32,7 +32,22 @@ stages:
   detect:
     batch_size: 2
     image_size: 1280
-    fps_sample: 10 # detection+tracking: 5-12 fps per CLAUDE.md §11
+    fps_sample: 25 # RAISED from 10, 2026-09-01, owner-authorized ("no matter how much it
+    # computationally expensive i want good results") to attack ID switches at their source.
+    # MEASURED cause: the owner clicked the real #10 (raw track 1, reads "10" 8/10) and the target
+    # box later moved to a different player. The clicked player's own selected chain was NINE
+    # fragments over 37.7s -- every one of those 8 joins is a chance for `stitch_timeline` to pick
+    # the wrong same-kit teammate, and two joined fragments (64, 154) are not players at all
+    # (empty-grass boxes). ByteTrack here is motion/IoU-only with NO appearance model
+    # (`supervision` 0.30), so its ONLY defence against a swap is that boxes overlap enough
+    # between consecutive samples. At 10 fps on 25 fps footage that is a 100ms gap; at 25 fps it
+    # is 40ms, so inter-frame displacement drops ~2.5x, association gets much easier, tracks
+    # fragment less, and there are simply fewer risky stitch joins to get wrong.
+    # ⚠️ MUST stay in sync with `configs/track.yaml: bytetrack.frame_rate` (the Kalman motion
+    # model's own timebase) AND with `lost_track_buffer`, which is counted in FRAMES -- raising
+    # fps without scaling that buffer would SHORTEN its wall-clock tolerance and make
+    # fragmentation worse, not better. Both were updated together.
+    # Cost: detection is ~2.5x slower (measured ~3 min -> expect ~7-8 min for this 70s clip).
 
   ball:
     batch_size: 1
@@ -46,7 +61,7 @@ stages:
     fps_sample: 1 # one calibration per take for static cams (ADR-3); sparse otherwise
 
   track:
-    fps_sample: 10 # matches detect.fps_sample; tracker consumes the detector's output
+    fps_sample: 25 # matches detect.fps_sample; tracker consumes the detector's output
 
   team:
     batch_size: 8
