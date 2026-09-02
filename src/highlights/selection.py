@@ -267,6 +267,7 @@ def select_targets(
     frame_height: float,
     selection_cfg: dict,
     manual_overrides: dict[int, int] | None = None,
+    camera_motion_by_take: dict | None = None,
 ) -> SelectionResult:
     """Run Stage 5 target selection for every take of one video.
 
@@ -281,6 +282,13 @@ def select_targets(
         tracks_by_take[tr.take_id].append(tr)
 
     votes_by_take = vote_seed_tracks(arrow_hints, tracks, takes, selection_cfg)
+
+    def _motion_for(take: Take):
+        """That take's own camera-motion model, or `None` (which makes every stitch comparison
+        fall back to the raw image-space distance, i.e. the exact pre-2026-09-01 behaviour)."""
+        if not camera_motion_by_take:
+            return None
+        return camera_motion_by_take.get(take.id)
 
     take_selections: list[TakeSelection] = []
     for take in takes:
@@ -297,7 +305,9 @@ def select_targets(
                     take.id,
                 )
             else:
-                track_ids, _stitch_conf = stitch_timeline(seed, take_tracks, selection_cfg)
+                track_ids, _stitch_conf = stitch_timeline(
+                    seed, take_tracks, selection_cfg, _motion_for(take)
+                )
                 confidence = selection_cfg["manual_override_confidence"]
                 take_selections.append(
                     TakeSelection(
@@ -319,7 +329,9 @@ def select_targets(
             vote_share = take_votes[seed_candidate] / total_votes
             min_vote_share = selection_cfg["arrow_min_vote_share"]
             if vote_share >= min_vote_share:
-                track_ids, stitch_conf = stitch_timeline(seed_candidate, take_tracks, selection_cfg)
+                track_ids, stitch_conf = stitch_timeline(
+                    seed_candidate, take_tracks, selection_cfg, _motion_for(take)
+                )
                 confidence = vote_share * stitch_conf
                 take_selections.append(
                     TakeSelection(
@@ -369,7 +381,9 @@ def select_targets(
             )
             continue
 
-        track_ids, stitch_conf = stitch_timeline(seed, take_tracks, selection_cfg)
+        track_ids, stitch_conf = stitch_timeline(
+            seed, take_tracks, selection_cfg, _motion_for(take)
+        )
         ceiling = selection_cfg["heuristic_fallback_confidence_ceiling"]
         confidence = min(ceiling, stitch_conf)
         take_selections.append(

@@ -75,6 +75,7 @@ from src.pipeline.annotated_video import render_full_annotated_video
 from src.pipeline.player_output import write_player_output
 from src.pipeline.profiler import build_run_profile
 from src.stats.stats import build_player_stats, write_stat_card
+from src.track.camera_motion import CameraMotionReport, estimate_camera_motion_for_video
 from src.track.click_reid import (
     collect_track_jersey_digits,
     extend_chain_with_profile,
@@ -402,6 +403,49 @@ def run_pipeline_for_video(
         )
     )
 
+    # --- Stage 4.9: camera motion (cached) -----------------------------------------------------
+    # Fragment stitching compares positions in IMAGE space, where a fast camera pan makes a
+    # stationary player look like a sprinter -- measured on real footage: during the 24-26s pan in
+    # `chelsea_burnley_target10`, camera translation spikes from a 2.01 px/frame median to 12.84,
+    # and the CORRECT continuation of the clicked #10 reads 3.45 bbox-heights/s raw (rejected) vs
+    # 0.24 compensated (accepted), while the WRONG one goes the other way, 3.07 raw -> 6.41
+    # compensated. See src/track/camera_motion.py's module docstring.
+    t0 = time.time()
+    camera_motion_path = work_dir / "track" / "camera_motion.json"
+    camera_motion_cfg = configs["profile"]["motion"]
+    camera_motion_cache = StageCache(
+        camera_motion_path,
+        {
+            "motion_cfg": camera_motion_cfg,
+            "fps": configs["hardware"]["stages"]["track"]["fps_sample"],
+            "scale_width": configs["hardware"]["decode"].get("scale_width"),
+            "n_takes": len(takes),
+        },
+        stage="camera_motion",
+    )
+    if camera_motion_cache.hit():
+        camera_motion = CameraMotionReport.model_validate(load_json(camera_motion_path))
+    else:
+        camera_motion = estimate_camera_motion_for_video(
+            str(video_path),
+            takes,
+            camera_motion_cfg,
+            fps=configs["hardware"]["stages"]["track"]["fps_sample"],
+            scale_width=configs["hardware"]["decode"].get("scale_width"),
+            use_nvdec=use_nvdec,
+        )
+        save_json(camera_motion.model_dump(mode="json"), camera_motion_path)
+        camera_motion_cache.write_meta()
+    camera_motion_by_take = camera_motion.by_take()
+    timings.append(
+        StageTiming(
+            stage="camera_motion",
+            wall_seconds=round(time.time() - t0, 2),
+            vram_peak_mb=None,
+            notes=f"takes={len(camera_motion.takes)}",
+        )
+    )
+
     # --- Stage 5: target selection (cached) ----------------------------------------------------
     t0 = time.time()
     selection_path = work_dir / "selection.json"
@@ -414,6 +458,7 @@ def run_pipeline_for_video(
         "n_takes": len(takes),
         "target_jersey": target_jersey,
         "manual_overrides": manual_overrides or {},
+        "camera_motion_takes": len(camera_motion.takes),
     }
     selection_cache = StageCache(selection_path, selection_cache_config, stage="selection")
     if selection_cache.hit():
@@ -429,6 +474,7 @@ def run_pipeline_for_video(
             frame_height,
             configs["highlights"]["selection"],
             manual_overrides=manual_overrides,
+            camera_motion_by_take=camera_motion_by_take,
         )
         # Click-anchored re-identification (owner request 2026-09-01, `src/track/click_reid.py`):
         # extend a MANUAL-OVERRIDE take's own stitched chain across a break `stitch_timeline`

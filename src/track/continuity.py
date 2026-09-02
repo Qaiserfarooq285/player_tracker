@@ -40,15 +40,31 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _spatial_jump(a: Track, b_start_box: TrackBox) -> float:
+def _spatial_jump(a: Track, b_start_box: TrackBox, motion=None) -> float:
     """Normalised distance (bbox-heights, same unit as `configs/events.yaml: sprint`) between
-    track `a`'s LAST box and `b_start_box` (candidate fragment's first box)."""
+    track `a`'s LAST box and `b_start_box` (candidate fragment's first box).
+
+    When a `TakeCameraMotion` is supplied, both centres are first mapped into the take's own
+    reference frame so the result measures how far the PLAYER moved, not how far the CAMERA
+    swung (`src/track/camera_motion.py` -- see its module docstring for the measured 14x
+    inflation this removes during a real pan). Without one, this is the original raw
+    image-space distance, unchanged.
+    """
+    from src.track.camera_motion import compensated_jump
+
     a_box = a.boxes[-1]
-    dx = a_box.bbox.cx - b_start_box.bbox.cx
-    dy = a_box.bbox.cy - b_start_box.bbox.cy
-    dist = (dx * dx + dy * dy) ** 0.5
     mean_h = (a_box.bbox.height + b_start_box.bbox.height) / 2.0
-    return dist / mean_h if mean_h > 0 else float("inf")
+    jump, _compensated = compensated_jump(
+        a_box.t,
+        a_box.bbox.cx,
+        a_box.bbox.cy,
+        b_start_box.t,
+        b_start_box.bbox.cx,
+        b_start_box.bbox.cy,
+        mean_h,
+        motion,
+    )
+    return jump
 
 
 def _team_agrees(a: Track, b: Track, threshold: float) -> bool | None:
@@ -72,6 +88,7 @@ def extend_chain_forward(
     pool: dict[int, Track],
     used: set[int],
     stitch_cfg: dict,
+    motion=None,
 ) -> list[Track]:
     """Greedily extend `seed_track_id` forward in time within `pool`, consuming any fragment not
     already in `used` that satisfies the join rule -- mutates `used` IN PLACE (adding every
@@ -116,7 +133,7 @@ def extend_chain_forward(
             gap = cand.boxes[0].t - current_end_t
             if gap < 0 or gap >= max_gap_s:
                 continue
-            dist = _spatial_jump(current, cand.boxes[0])
+            dist = _spatial_jump(current, cand.boxes[0], motion)
             if dist >= max_dist:
                 continue
             # Physical-plausibility gate (2026-09-01). `max_dist` alone is gap-BLIND: it allows the
@@ -168,7 +185,10 @@ def chain_confidence(chain: list[Track], stitch_cfg: dict) -> float:
 
 
 def stitch_timeline(
-    seed_track_id: int, take_tracks: list[Track], selection_cfg: dict
+    seed_track_id: int,
+    take_tracks: list[Track],
+    selection_cfg: dict,
+    motion=None,
 ) -> tuple[list[int], float]:
     """Extend `seed_track_id` forward within `take_tracks` (all belonging to the SAME take -- the
     caller guarantees this, and it is also asserted defensively below).
@@ -187,7 +207,7 @@ def stitch_timeline(
     assert len(take_ids) <= 1, "stitch_timeline must only ever see one take's tracks"
 
     used: set[int] = set()
-    chain = extend_chain_forward(seed_track_id, by_id, used, selection_cfg)
+    chain = extend_chain_forward(seed_track_id, by_id, used, selection_cfg, motion)
     confidence = chain_confidence(chain, selection_cfg)
 
     logger.info(
