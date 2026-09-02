@@ -96,6 +96,18 @@ class TakeIdentityResult(BaseModel):
     evidence_frames: list[int]
     location_method: str  # SelectionMethod from src/highlights/selection.py, as a plain str
     location_track_ids: list[int]
+    track_active_windows: dict[int, list[tuple[float, float]]] = {}  # owner-reported bug fix,
+    # 2026-09-02: which time window(s) each target track's RED box should actually render in.
+    # Manual mode can name more than one jersey per take (an assist/goal pair, e.g. #10 assists at
+    # 0:50, #2 scores at 0:58) -- without this, `location_track_ids` unions every annotated
+    # track for the WHOLE take, so BOTH #10's and #2's chains rendered a persistent red "TARGET"
+    # box for all 61s, including eight seconds after #10's only event, at the exact moment of #2's
+    # goal (confirmed on a real rendered frame: two simultaneous red boxes, one on each player,
+    # with no way to tell which one the viewer should actually be watching).
+    # Empty dict (the default) = "not populated by this caller" -> every track in
+    # `location_track_ids` is treated as always-active, i.e. the exact pre-existing behaviour
+    # (single-target callers: ADR-15 verified pipeline, `--track-id` manual override). Only
+    # manual-events mode (multi-target takes) populates this.
     jersey_by_track_id: dict[int, int] = {}  # owner-reported bug fix, 2026-09-01: which jersey
     # number each individual target track belongs to. `jersey_number` above is a SINGLE take-level
     # value, which is wrong whenever one take legitimately names more than one target player --

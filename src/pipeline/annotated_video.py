@@ -250,6 +250,29 @@ def interpolated_bbox(
     return nearest.bbox if nearest is not None else None
 
 
+def is_target_active_at(identity: TakeIdentityResult | None, track_id: int, t: float) -> bool:
+    """Whether `track_id`'s RED "target" box should render at time `t`.
+
+    Owner-reported bug fix, 2026-09-02: manual mode can name more than one jersey per take (an
+    assist/goal pair), and until this existed EVERY annotated track rendered red for the WHOLE
+    take -- confirmed on a real frame: #10's box (only annotated at 0:50) was still drawn red at
+    0:58, simultaneously with #2's own correct box for their goal at that instant, with nothing
+    distinguishing which one mattered right then.
+
+    `identity.track_active_windows` is empty for every caller that never populates it (the ADR-15
+    verified pipeline, a `--track-id` manual override) -- those keep the exact original "always
+    active" behaviour. Manual mode populates real windows per track, so a track outside its own
+    window here simply renders as an ordinary green box (via the caller's own fallback), never a
+    fabricated red one -- the event's caption still fires at its own instant regardless.
+    """
+    if identity is None:
+        return False
+    windows = identity.track_active_windows.get(track_id)
+    if not windows:
+        return True
+    return any(start <= t <= end for start, end in windows)
+
+
 def red_box_track_ids(identity: TakeIdentityResult | None) -> set[int]:
     """The verified-identity GATE (CLAUDE.md §13.1): which raw track ids get the thick RED "target"
     box this take. Empty for `None`/an unverified take -- those takes get green boxes for every
@@ -866,7 +889,7 @@ def render_full_annotated_video(
                     continue
                 x1, y1 = bbox.x1 * scale_x, bbox.y1 * scale_y
                 x2, y2 = bbox.x2 * scale_x, bbox.y2 * scale_y
-                if tr.id in target_ids:
+                if tr.id in target_ids and is_target_active_at(identity, tr.id, t):
                     # ADR-18 (3): track ID and jersey identity are DIFFERENT concepts (a Track.id
                     # is a within-take tracker artifact that resets at every cut; a jersey number
                     # is a verified identity) -- show BOTH explicitly so no viewer ever reads

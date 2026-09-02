@@ -216,6 +216,11 @@ def build_manual_identity_by_take(
             # track belongs to, so a take naming two different target players (an assist/goal
             # pair) labels each box with its own number instead of one take-level number.
             jersey_by_track_id: dict[int, int] = {}
+            # owner-reported bug fix 2026-09-02: remember WHEN each associated track was actually
+            # the subject of an annotation, so its red box only renders near ITS OWN event(s) --
+            # without this, a take naming two different players (assist/goal pair) drew BOTH
+            # persistently red for the entire take, including during the OTHER player's own event.
+            track_event_times: dict[int, list[float]] = defaultdict(list)
             any_jersey_confirmed = False  # owner-reported bug fix 2026-08-31: True only when AT
             # LEAST ONE of this take's own annotations actually resolved via a real digit read
             # (association_signal starting "jersey_"), never just because SOME track got a
@@ -393,6 +398,7 @@ def build_manual_identity_by_take(
                 if track_id is not None:
                     associated_ids.add(track_id)
                     jersey_by_track_id[track_id] = ann.jersey_number
+                    track_event_times[track_id].append(ann.t)
                 if association_signal.startswith("jersey_"):
                     any_jersey_confirmed = True
 
@@ -413,6 +419,12 @@ def build_manual_identity_by_take(
             # (events_by_number groups by each annotation's OWN jersey_number, not by this
             # take-level identity record).
             jersey_number = min(a.jersey_number for a in anns)
+            pre_roll_s = configs["highlights"]["clip"]["pre_roll_s"]
+            post_roll_s = configs["highlights"]["clip"]["post_roll_s"]
+            track_active_windows = {
+                track_id: [(t - pre_roll_s, t + post_roll_s) for t in times]
+                for track_id, times in track_event_times.items()
+            }
             identity_by_take[take_id] = TakeIdentityResult(
                 take_id=take_id,
                 jersey_number=jersey_number,
@@ -422,6 +434,7 @@ def build_manual_identity_by_take(
                 location_method="manual_annotation_colour_match",
                 location_track_ids=sorted(associated_ids),
                 jersey_by_track_id=jersey_by_track_id,
+                track_active_windows=track_active_windows,
                 association_confirmed_by_jersey=any_jersey_confirmed,
             )
     finally:

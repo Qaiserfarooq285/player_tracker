@@ -78,6 +78,12 @@ def _selection_cfg() -> dict:
     return load_yaml("configs/highlights.yaml")["selection"]
 
 
+def _clip_cfg() -> dict:
+    # real pre_roll_s/post_roll_s -- also the source for `track_active_windows`'s own window size
+    # (2026-09-02 fix), so these fixtures exercise the real values, not a placeholder.
+    return load_yaml("configs/highlights.yaml")["clip"]
+
+
 def test_build_manual_identity_by_take_verified_when_association_succeeds(monkeypatch):
     take = _take(0, 0.0, 10.0)
     track = _track(1, 1.0)
@@ -98,7 +104,11 @@ def test_build_manual_identity_by_take_verified_when_association_succeeds(monkey
         {0: [track]},
         {0: anns},
         "fake.mp4",
-        {"annotations": {"track_association": {}}, "hardware": {"decode": {}}},
+        {
+            "annotations": {"track_association": {}},
+            "hardware": {"decode": {}},
+            "highlights": {"clip": _clip_cfg()},
+        },
     )
     assert identity_by_take[0].status == "verified"
     assert identity_by_take[0].jersey_number == 2
@@ -128,7 +138,11 @@ def test_build_manual_identity_by_take_no_identity_when_association_fails(monkey
         {0: [track]},
         {0: anns},
         "fake.mp4",
-        {"annotations": {"track_association": {}}, "hardware": {"decode": {}}},
+        {
+            "annotations": {"track_association": {}},
+            "hardware": {"decode": {}},
+            "highlights": {"clip": _clip_cfg()},
+        },
     )
     assert identity_by_take == {}
 
@@ -157,7 +171,11 @@ def test_build_manual_identity_by_take_arrow_fallback_recorded_in_debug(monkeypa
         {0: [track]},
         {0: anns},
         "fake.mp4",
-        {"annotations": {"track_association": {}}, "hardware": {"decode": {}}},
+        {
+            "annotations": {"track_association": {}},
+            "hardware": {"decode": {}},
+            "highlights": {"clip": _clip_cfg()},
+        },
         arrow_hints=["not empty -- just needs to be truthy for this monkeypatched test"],
     )
     assert identity_by_take[0].status == "verified"
@@ -225,7 +243,7 @@ def test_build_manual_identity_by_take_locks_onto_same_track_despite_closer_dist
     configs = {
         "annotations": {"track_association": {}},
         "hardware": {"decode": {}},
-        "highlights": {"selection": _selection_cfg()},
+        "highlights": {"selection": _selection_cfg(), "clip": _clip_cfg()},
     }
     identity_by_take, debug = me_mod.build_manual_identity_by_take(
         [take], {0: [track_a, track_b]}, {0: anns}, "fake.mp4", configs
@@ -279,7 +297,7 @@ def test_build_manual_identity_by_take_honest_caption_only_when_locked_identity_
     configs = {
         "annotations": {"track_association": {}},
         "hardware": {"decode": {}},
-        "highlights": {"selection": _selection_cfg()},
+        "highlights": {"selection": _selection_cfg(), "clip": _clip_cfg()},
     }
     identity_by_take, debug = me_mod.build_manual_identity_by_take(
         [take], {0: [track_a, track_b]}, {0: anns}, "fake.mp4", configs
@@ -320,7 +338,7 @@ def test_build_manual_identity_by_take_two_distinct_jerseys_lock_independently(m
     configs = {
         "annotations": {"track_association": {}},
         "hardware": {"decode": {}},
-        "highlights": {"selection": _selection_cfg()},
+        "highlights": {"selection": _selection_cfg(), "clip": _clip_cfg()},
     }
     identity_by_take, debug = me_mod.build_manual_identity_by_take(
         [take], {0: [track_a, track_c]}, {0: anns}, "fake.mp4", configs
@@ -343,7 +361,7 @@ def test_run_manual_events_pipeline_smoke(tmp_path, monkeypatch):
     video_path.write_bytes(b"not a real video -- every I/O boundary below is mocked")
     sidecar = tmp_path / "match.annotations.txt"
     sidecar.write_text(
-        "Min 0:01 player #2 in white takes a touch\n"
+        "Min 0:01 player #10 in white takes a touch\n"
         "Min 0:02 player #2 in white makes a pass\n"
         "malformed line with no jersey token\n"
     )
@@ -409,20 +427,21 @@ def test_run_manual_events_pipeline_smoke(tmp_path, monkeypatch):
         "detect": {},
         "track": {},
         "team": {},
-        "highlights": {},
+        "highlights": {"clip": _clip_cfg()},
     }
 
     result = me_mod.run_manual_events_pipeline_for_video(
         video_path,
         configs,
         sidecar,
+        target_jersey=10,
         work_root=tmp_path / "work",
         output_root=tmp_path / "output",
         use_nvdec=False,
     )
 
     assert result["mode"] == "manual_events"
-    assert result["jersey_numbers"] == [2]
+    assert result["jersey_numbers"] == [10]
     assert result["n_annotations_parsed"] == 2
     assert result["n_problems"] == 1
 
@@ -431,8 +450,8 @@ def test_run_manual_events_pipeline_smoke(tmp_path, monkeypatch):
 
     assert len(written_players) == 1
     written = written_players[0]
-    assert written["jersey_number"] == 2
-    assert written["n_events"] == 2  # touch + pass
+    assert written["jersey_number"] == 10
+    assert written["n_events"] == 1  # #10 touch; #2's pass is a non-target event caption
     assert written["possession_seconds"] is None
     assert written["distance_result"] is None
     assert written["identity_status"] == "Human-provided (manual annotation)"
@@ -469,9 +488,48 @@ def _jersey_reid_configs(selection_cfg: dict) -> dict:
             "jersey_reid": {"enabled": True, "max_vlm_escalations_per_call": 2},
         },
         "hardware": {"decode": {}},
-        "highlights": {"selection": selection_cfg},
+        "highlights": {"selection": selection_cfg, "clip": _clip_cfg()},
         "identity": {"ocr": {}},
     }
+
+
+def test_initial_lock_requires_a_confirmed_jersey_when_strict_mode_is_enabled(monkeypatch):
+    """A same-kit colour match is only a candidate, never proof that it is the requested jersey.
+
+    This guards the real broadcast failure where the renderer showed TARGET #10 on another blue
+    Chelsea player after OCR returned no unique #10 match.
+    """
+    _stub_easyocr(monkeypatch)
+    take = _take(0, 0.0, 10.0)
+    track = _track(5, 1.0)
+    anns = [_annotation(1.0, jersey=7)]
+
+    monkeypatch.setattr(
+        me_mod,
+        "associate_annotation_to_track",
+        lambda *a, **k: (
+            5,
+            10.0,
+            {"arrow_track_id": None, "arrow_distance_px": None, "agreement": "colour_only"},
+        ),
+    )
+    monkeypatch.setattr(
+        me_mod,
+        "read_jersey_number_for_candidates",
+        lambda *a, **k: (None, None, {"outcome": "ambiguous_multiple_candidates_matched"}),
+    )
+    configs = _jersey_reid_configs(_selection_cfg())
+    configs["annotations"]["jersey_reid"]["require_confirmed_jersey"] = True
+
+    identity_by_take, debug = me_mod.build_manual_identity_by_take(
+        [take], {0: [track]}, {0: anns}, "fake.mp4", configs
+    )
+
+    entry = debug["0:1.00"]
+    assert identity_by_take == {}
+    assert entry["track_id"] is None
+    assert entry["association_signal"] == "jersey_unverified"
+    assert entry["unverified_colour_candidate_track_id"] == 5
 
 
 def test_initial_lock_prefers_confident_jersey_read_over_colour_pick(monkeypatch):
