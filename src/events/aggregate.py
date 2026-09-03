@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from src.common.logging import DropCounter
 from src.common.types import BallDetection, Event, EventType, Take, Track
+from src.events.ball_track import build_ball_state_series, reference_player_height
 from src.events.possession import (
     DEFAULT_BALL_FPS,
     detect_dribbles,
@@ -39,20 +40,39 @@ def compute_take_all_events(
     fps_sample: float,
     ball_fps: float = DEFAULT_BALL_FPS,
     drops: DropCounter | None = None,
+    camera_motion=None,
 ) -> tuple[list[Event], dict[int, int], dict[int, float]]:
     """Every best-effort event category for ONE take, across ALL of that take's own tracks.
 
     Returns `(events, identity_of, identity_confidence)` — the `build_take_identities` partition
     is returned alongside so a caller can attribute a subset to one verified target
     (`attribute_events_to_target` below) without recomputing identities a second time.
+
+    `camera_motion` (`src.track.camera_motion.TakeCameraMotion`, optional): when supplied, the
+    ball trajectory state built here for touch detection is expressed in the take's own reference
+    frame rather than raw image space (2026-09-02 -- a fast pan otherwise inflates the ball's
+    apparent velocity the same way it inflated fragment-stitching jumps, measured earlier the same
+    day). `None` degrades to the raw, uncompensated series -- never a hard requirement, since not
+    every caller has a camera-motion model available yet.
     """
     identity_of, identity_confidence = build_take_identities(take_tracks, selection_cfg)
+
+    ball_states = build_ball_state_series(
+        take_balls,
+        events_cfg["ball"],
+        reference_player_height(take_tracks),
+        motion=camera_motion,
+    )
 
     events: list[Event] = []
     for tr in take_tracks:
         events.extend(detect_sprints(tr, events_cfg, fps_sample, drops))
     events.extend(detect_shots(take_balls, take.id, frame_width, events_cfg, drops))
-    events.extend(detect_touches(take_balls, take_tracks, take.id, events_cfg, identity_of, drops))
+    events.extend(
+        detect_touches(
+            take_balls, take_tracks, take.id, events_cfg, ball_states, identity_of, drops
+        )
+    )
 
     runs = possession_runs_for_take(take_balls, take_tracks, events_cfg, identity_of)
     events.extend(

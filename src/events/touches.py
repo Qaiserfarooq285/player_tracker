@@ -23,10 +23,12 @@ either way, since `take_id` is always stamped from the caller's own bucketing).
 
 from __future__ import annotations
 
+import math
 import uuid
 
 from src.common.logging import DropCounter
 from src.common.types import BallDetection, BBox, DetectionClass, Event, EventType, Track, TrackBox
+from src.events.ball_track import BallState, nearest_ball_state
 
 # Track classes that can plausibly "have" the ball for touch/possession purposes — a match
 # official is never credited with a touch/possession (CLAUDE.md task; matches
@@ -97,11 +99,43 @@ def touch_confidence(distance_px: float, ball_conf: float, touch_cfg: dict) -> f
     return min(touch_cfg["max_confidence"], max(touch_cfg["min_confidence"], raw))
 
 
+def has_contact_evidence(
+    ball_states: list[BallState], t: float, touch_cfg: dict
+) -> tuple[bool, dict]:
+    """Whether the ball's OWN trajectory shows real evidence of contact around instant `t` --
+    owner spec: "ball trajectory/velocity/direction changes after the interaction... Do NOT count
+    a touch because the ball is nearby [or] bounding boxes overlap." Proximity alone (the caller's
+    own distance/gate) is necessary but never sufficient.
+
+    Compares the ball's velocity vector shortly BEFORE `t` to shortly AFTER `t`
+    (`touch_cfg['contact_window_s']` each side) -- a single "how much did the vector change"
+    magnitude naturally covers a direction change (a deflection/pass away), a speed increase (a
+    kick), AND a speed decrease (a trap/first touch) without needing three separate tests.
+
+    Returns `(has_evidence, debug)` -- `debug` always carries the before/after states (or `None`)
+    and the computed delta, so a caller building `Event.evidence` never has to re-derive it.
+    Missing or `known=False` ball state on EITHER side is an HONEST "cannot confirm" -> `False`,
+    never treated as "no change detected, so nothing happened" being conflated with an actual
+    steady-state reading (Golden Rule 5: absence of ball evidence is not evidence of no contact,
+    but it is also not evidence FOR a touch -- accuracy over completeness, per spec).
+    """
+    window = touch_cfg["contact_window_s"]
+    before = nearest_ball_state(ball_states, t - window, window)
+    after = nearest_ball_state(ball_states, t + window, window)
+    debug = {"before": before, "after": after, "delta_v": None}
+    if before is None or after is None or not before.known or not after.known:
+        return False, debug
+    delta_v = math.hypot(after.vx - before.vx, after.vy - before.vy)
+    debug["delta_v"] = delta_v
+    return delta_v >= touch_cfg["min_velocity_change"], debug
+
+
 def detect_touches(
     balls: list[BallDetection],
     tracks: list[Track],
     take_id: int | None,
     events_cfg: dict,
+    ball_states: list[BallState],
     identity_of: dict[int, int] | None = None,
     drops: DropCounter | None = None,
 ) -> list[Event]:
@@ -117,7 +151,17 @@ def detect_touches(
 
     Debounced per (stitched) identity via `touch_min_gap_s`: continuous ball proximity to the same
     player (e.g. a stationary close-control dribble) fires one touch per debounce window, not one
-    per ball sample.
+    per ball sample. This value is compared in real SECONDS against `ball.t` timestamps, so it is
+    already FPS-independent by construction (a 25fps and a 10fps take with the same real-world
+    dribble rate produce the same debounce behaviour) -- no separate "FPS-aware" conversion needed.
+
+    `ball_states` (`src.events.ball_track.build_ball_state_series`, built ONCE per take by the
+    caller) supplies the CONTACT evidence this heuristic was missing entirely before 2026-09-02:
+    proximity alone used to be sufficient ("a coarse proxy for actual ball contact" -- this
+    module's own prior docstring, now fixed). `has_contact_evidence` requires a measurable
+    velocity-vector change in the ball's own trajectory around the candidate instant; proximity
+    without it is dropped as `touch_no_contact_evidence`, never counted (owner spec: "Do NOT count
+    a touch because... the ball is nearby").
     """
     take_ids = {tr.take_id for tr in tracks}
     assert len(take_ids) <= 1, "detect_touches must only ever see one take's tracks"
@@ -152,6 +196,12 @@ def detect_touches(
                 drops.drop("touch_debounced")
             continue
 
+        contact, contact_debug = has_contact_evidence(ball_states, ball.t, touch_cfg)
+        if not contact:
+            if drops is not None:
+                drops.drop("touch_no_contact_evidence")
+            continue
+
         confidence = touch_confidence(distance, ball.conf, touch_cfg)
         if confidence < min_emit:
             if drops is not None:
@@ -168,12 +218,13 @@ def detect_touches(
                 player_track_id=identity_id,
                 take_id=take_id,
                 confidence=confidence,
-                source="ball_proximity_heuristic",
+                source="ball_proximity_and_velocity_change_heuristic",
                 evidence={
                     "raw_track_id": raw_id,
                     "distance_px": distance,
                     "touch_distance_px": touch_cfg["touch_distance_px"],
                     "ball_confidence": ball.conf,
+                    "ball_velocity_delta": contact_debug["delta_v"],
                     "calibrated": False,
                     "unit": "pixels_at_detect_stage_resolution",
                 },

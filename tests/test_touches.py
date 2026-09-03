@@ -9,6 +9,7 @@ import pytest
 from src.common.io import load_yaml
 from src.common.types import BallDetection, BBox, DetectionClass, EventType, Track, TrackBox
 from src.events import touches
+from src.events.ball_track import BallState
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -34,6 +35,28 @@ def _ball(t: float, cx: float, cy: float, conf: float = 0.9) -> BallDetection:
         frame_index=int(round(t * 30)),
         t=t,
     )
+
+
+def _contact_evidence_at(*instants: float, cfg: dict | None = None) -> list[BallState]:
+    """A `ball_states` fixture giving `has_contact_evidence` a real, strong velocity-vector change
+    straddling EACH of `instants` -- one BEFORE (stationary) and one AFTER (moving fast) sample
+    per instant, comfortably clearing `touch.min_velocity_change`. Lets these tests keep verifying
+    proximity/debounce/take-scoping logic in isolation from Stage 3's own contact-evidence gate
+    (`tests/test_events.py`/a dedicated contact-evidence test file covers that gate itself)."""
+    cfg = cfg or _events_config()
+    window = cfg["touch"]["contact_window_s"]
+    fast = cfg["touch"]["min_velocity_change"] * 2.0
+    states = []
+    for t in instants:
+        states.append(BallState(
+            t=t - window, x=0.0, y=0.0, vx=0.0, vy=0.0, speed=0.0, direction_deg=None,
+            confidence=0.9, is_interpolated=False, is_camera_compensated=False, known=True,
+        ))
+        states.append(BallState(
+            t=t + window, x=0.0, y=0.0, vx=fast, vy=0.0, speed=fast, direction_deg=0.0,
+            confidence=0.9, is_interpolated=False, is_camera_compensated=False, known=True,
+        ))
+    return states
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +147,9 @@ def test_detect_touches_fires_when_ball_is_at_player_bbox():
         id=5, take_id=2, boxes=[_box(1.0, 100.0, 100.0)], dominant_class=DetectionClass.PLAYER
     )
     ball = _ball(1.0, 100.0, 100.0)
-    events = touches.detect_touches([ball], [track], take_id=2, events_cfg=cfg)
+    events = touches.detect_touches(
+        [ball], [track], take_id=2, events_cfg=cfg, ball_states=_contact_evidence_at(1.0, cfg=cfg)
+    )
     assert len(events) == 1
     ev = events[0]
     assert ev.type == EventType.TOUCH
@@ -141,7 +166,7 @@ def test_detect_touches_does_not_fire_when_ball_is_far_from_every_player():
         id=1, take_id=0, boxes=[_box(1.0, 100.0, 100.0)], dominant_class=DetectionClass.PLAYER
     )
     ball = _ball(1.0, 100.0 + far_dist, 100.0)
-    events = touches.detect_touches([ball], [track], take_id=0, events_cfg=cfg)
+    events = touches.detect_touches([ball], [track], take_id=0, events_cfg=cfg, ball_states=[])
     assert events == []
 
 
@@ -151,7 +176,7 @@ def test_detect_touches_excludes_referees():
         id=1, take_id=0, boxes=[_box(1.0, 100.0, 100.0)], dominant_class=DetectionClass.REFEREE
     )
     ball = _ball(1.0, 100.0, 100.0)
-    events = touches.detect_touches([ball], [referee], take_id=0, events_cfg=cfg)
+    events = touches.detect_touches([ball], [referee], take_id=0, events_cfg=cfg, ball_states=[])
     assert events == []
 
 
@@ -164,7 +189,10 @@ def test_detect_touches_debounces_rapid_repeats_for_the_same_identity():
         dominant_class=DetectionClass.PLAYER,
     )
     balls = [_ball(t, 100.0, 100.0) for t in [0.0, 0.05, 0.1, 0.9]]
-    events = touches.detect_touches(balls, [track], take_id=0, events_cfg=cfg)
+    events = touches.detect_touches(
+        balls, [track], take_id=0, events_cfg=cfg,
+        ball_states=_contact_evidence_at(0.0, 0.9, cfg=cfg),
+    )
     # min_gap_s=0.3: samples at 0.0/0.05/0.1 collapse to ONE touch, 0.9 is far enough for a second
     assert [e.t_start for e in events] == pytest.approx([0.0, 0.9])
 
@@ -178,7 +206,10 @@ def test_detect_touches_debounce_is_per_identity_not_global():
         id=2, take_id=0, boxes=[_box(0.01, 500.0, 500.0)], dominant_class=DetectionClass.PLAYER
     )
     balls = [_ball(0.0, 100.0, 100.0), _ball(0.01, 500.0, 500.0)]
-    events = touches.detect_touches(balls, [track_a, track_b], take_id=0, events_cfg=cfg)
+    events = touches.detect_touches(
+        balls, [track_a, track_b], take_id=0, events_cfg=cfg,
+        ball_states=_contact_evidence_at(0.0, 0.01, cfg=cfg),
+    )
     assert {e.player_track_id for e in events} == {1, 2}
 
 
@@ -194,7 +225,8 @@ def test_detect_touches_uses_identity_map_when_provided():
     balls = [_ball(0.0, 100.0, 100.0), _ball(1.0, 100.0, 100.0)]
     identity_of = {10: 10, 11: 10}
     events = touches.detect_touches(
-        balls, [frag_a, frag_b], take_id=0, events_cfg=cfg, identity_of=identity_of
+        balls, [frag_a, frag_b], take_id=0, events_cfg=cfg,
+        ball_states=_contact_evidence_at(0.0, 1.0, cfg=cfg), identity_of=identity_of,
     )
     assert {e.player_track_id for e in events} == {10}
     assert all(e.evidence["raw_track_id"] in (10, 11) for e in events)
@@ -214,7 +246,9 @@ def test_detect_touches_rejects_mixed_take_ids():
     )
     ball = _ball(0.0, 100.0, 100.0)
     with pytest.raises(AssertionError):
-        touches.detect_touches([ball], [same_take, other_take], take_id=0, events_cfg=cfg)
+        touches.detect_touches(
+            [ball], [same_take, other_take], take_id=0, events_cfg=cfg, ball_states=[]
+        )
 
 
 def test_detect_touches_ignores_low_confidence_ball_detections():
@@ -223,5 +257,103 @@ def test_detect_touches_ignores_low_confidence_ball_detections():
         id=1, take_id=0, boxes=[_box(0.0, 100.0, 100.0)], dominant_class=DetectionClass.PLAYER
     )
     low_conf_ball = _ball(0.0, 100.0, 100.0, conf=cfg["touch"]["min_ball_conf"] - 0.01)
-    events = touches.detect_touches([low_conf_ball], [track], take_id=0, events_cfg=cfg)
+    events = touches.detect_touches(
+        [low_conf_ball], [track], take_id=0, events_cfg=cfg, ball_states=[]
+    )
     assert events == []
+
+
+# ---------------------------------------------------------------------------
+# has_contact_evidence -- the actual Stage 3 fix (owner spec: "Do NOT count a touch because...
+# the ball is nearby [or] bounding boxes overlap" -- proximity alone must never be sufficient).
+# ---------------------------------------------------------------------------
+
+
+def test_no_contact_evidence_when_ball_velocity_is_unchanged():
+    """Ball moving steadily past a player at constant velocity -- no real interaction, must NOT
+    register as contact evidence even though it was 'nearby' at some instant."""
+    cfg = _events_config()
+    window = cfg["touch"]["contact_window_s"]
+    states = [
+        BallState(t=1.0 - window, x=0, y=0, vx=5.0, vy=0.0, speed=5.0, direction_deg=0.0,
+                   confidence=0.9, is_interpolated=False, is_camera_compensated=True, known=True),
+        BallState(t=1.0 + window, x=0, y=0, vx=5.0, vy=0.0, speed=5.0, direction_deg=0.0,
+                   confidence=0.9, is_interpolated=False, is_camera_compensated=True, known=True),
+    ]
+    has_evidence, debug = touches.has_contact_evidence(states, 1.0, cfg["touch"])
+    assert has_evidence is False
+    assert debug["delta_v"] == pytest.approx(0.0)
+
+
+def test_contact_evidence_when_ball_direction_reverses():
+    """A real deflection/pass-away: velocity flips direction -- must register as contact."""
+    cfg = _events_config()
+    window = cfg["touch"]["contact_window_s"]
+    states = [
+        BallState(t=1.0 - window, x=0, y=0, vx=5.0, vy=0.0, speed=5.0, direction_deg=0.0,
+                   confidence=0.9, is_interpolated=False, is_camera_compensated=True, known=True),
+        BallState(t=1.0 + window, x=0, y=0, vx=-5.0, vy=0.0, speed=5.0, direction_deg=180.0,
+                   confidence=0.9, is_interpolated=False, is_camera_compensated=True, known=True),
+    ]
+    has_evidence, debug = touches.has_contact_evidence(states, 1.0, cfg["touch"])
+    assert has_evidence is True
+    assert debug["delta_v"] == pytest.approx(10.0)
+
+
+def test_contact_evidence_when_ball_starts_moving_from_rest():
+    """A kick away from a stationary/controlled ball -- speed 0 -> fast is contact evidence too,
+    not just a direction reversal."""
+    cfg = _events_config()
+    window = cfg["touch"]["contact_window_s"]
+    fast = cfg["touch"]["min_velocity_change"] * 1.5
+    states = [
+        BallState(t=1.0 - window, x=0, y=0, vx=0.0, vy=0.0, speed=0.0, direction_deg=None,
+                   confidence=0.9, is_interpolated=False, is_camera_compensated=True, known=True),
+        BallState(t=1.0 + window, x=0, y=0, vx=fast, vy=0.0, speed=fast, direction_deg=0.0,
+                   confidence=0.9, is_interpolated=False, is_camera_compensated=True, known=True),
+    ]
+    has_evidence, _debug = touches.has_contact_evidence(states, 1.0, cfg["touch"])
+    assert has_evidence is True
+
+
+def test_no_contact_evidence_when_ball_state_missing_on_either_side():
+    """Owner spec: missing ball evidence must be an honest 'cannot confirm', never treated as
+    'no change, so nothing happened' being read as a pass."""
+    cfg = _events_config()
+    window = cfg["touch"]["contact_window_s"]
+    only_before = [
+        BallState(t=1.0 - window, x=0, y=0, vx=5.0, vy=0.0, speed=5.0, direction_deg=0.0,
+                   confidence=0.9, is_interpolated=False, is_camera_compensated=True, known=True),
+    ]
+    has_evidence, debug = touches.has_contact_evidence(only_before, 1.0, cfg["touch"])
+    assert has_evidence is False
+    assert debug["delta_v"] is None
+
+
+def test_no_contact_evidence_when_ball_state_is_unknown():
+    """A ball state marked known=False (e.g. across a gap Stage 2 declined to bridge) must not be
+    used as evidence FOR a touch, even if its (fabricated-looking) velocity happens to differ."""
+    cfg = _events_config()
+    window = cfg["touch"]["contact_window_s"]
+    states = [
+        BallState(t=1.0 - window, x=0, y=0, vx=0.0, vy=0.0, speed=0.0, direction_deg=None,
+                   confidence=0.9, is_interpolated=False, is_camera_compensated=True, known=False),
+        BallState(t=1.0 + window, x=0, y=0, vx=50.0, vy=0.0, speed=50.0, direction_deg=0.0,
+                   confidence=0.9, is_interpolated=False, is_camera_compensated=True, known=True),
+    ]
+    has_evidence, _debug = touches.has_contact_evidence(states, 1.0, cfg["touch"])
+    assert has_evidence is False
+
+
+def test_small_velocity_change_below_threshold_is_not_contact():
+    cfg = _events_config()
+    window = cfg["touch"]["contact_window_s"]
+    tiny = cfg["touch"]["min_velocity_change"] * 0.1
+    states = [
+        BallState(t=1.0 - window, x=0, y=0, vx=0.0, vy=0.0, speed=0.0, direction_deg=None,
+                   confidence=0.9, is_interpolated=False, is_camera_compensated=True, known=True),
+        BallState(t=1.0 + window, x=0, y=0, vx=tiny, vy=0.0, speed=tiny, direction_deg=0.0,
+                   confidence=0.9, is_interpolated=False, is_camera_compensated=True, known=True),
+    ]
+    has_evidence, _debug = touches.has_contact_evidence(states, 1.0, cfg["touch"])
+    assert has_evidence is False

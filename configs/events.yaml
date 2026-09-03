@@ -14,9 +14,17 @@ ball:
   min_conf_for_state: 0.3 # identical value/reasoning to touch.min_ball_conf/possession.min_ball_conf
   # below (kept independently named per-consumer, same pattern as those two) -- a sample below this
   # is dropped from the state series entirely (a hole, never a low-confidence BallState object).
-  smoothing_window_frames: 3 # identical value/reasoning to shot.smoothing_window_frames -- same
-  # "ball moves faster/more erratically than a player, shorter window than sprint's 5" logic,
-  # applied here to the full 2D position series rather than just a 1D speed scalar.
+  smoothing_window_frames: 12 # ⚠️ MEASURED, 2026-09-02, on chelsea_burnley_target10 (real ball
+  # detections, camera-motion-compensated): swept 3/5/8/12/20 against every proximity-qualifying
+  # touch candidate's own delta_v. Raw ball-centroid jitter dominates the signal at small windows
+  # (median delta_v 7.53 bbox-h/s at window=3, still 4.80 at window=8) and never fully disappears
+  # even at window=20 (median 2.33) -- ball detection on this footage is inherently noisy (small,
+  # fast object, CLAUDE.md's own "ball is the weak spot"). 12 is where the median (3.43) and the
+  # p25 (0.94) both settle into a stable, much-reduced range without over-smoothing into the
+  # 20-sample window's own risk of blurring two adjacent real touches together. Deliberately
+  # LARGER than shot.smoothing_window_frames=3 -- that scalar feeds a sustained-direction segment
+  # test tolerant of noise; this feeds a single before/after DELTA comparison
+  # (touch.min_velocity_change below), which is far more noise-sensitive.
   max_gap_bridge_s: 0.5 # a gap between two CONFIDENT ball samples wider than this breaks velocity
   # computation across it (emits known=False right after) -- Stage 2's own
   # configs/detect.yaml: ball_interpolation.max_gap_frames already declined to bridge a gap this
@@ -297,6 +305,22 @@ touch:
   min_ball_conf: 0.3 # ignore ball detections below this confidence — identical value/reasoning to
   # `shot.min_ball_conf` above (also softly deweights long interpolated stretches via
   # `configs/detect.yaml: ball_interpolation.interpolated_conf_penalty`).
+  contact_window_s: 0.2 # how far before/after a candidate instant `has_contact_evidence`
+  # (src/events/touches.py) looks for the ball's own state to compare -- same order of magnitude
+  # as match_tolerance_s/touch_min_gap_s above, wide enough to find a real before/after BallState
+  # sample at the ball's own ~30fps native rate even after gaps, narrow enough that "before" and
+  # "after" cannot straddle two separate real touches.
+  min_velocity_change: 2.0 # ⚠️ MEASURED-BUT-NOT-CLEANLY-SEPARATED, 2026-09-02, real data
+  # (chelsea_burnley_target10, camera-compensated, 1166 proximity-qualifying candidate instants).
+  # No clean bimodal gap was found between "ball merely nearby" and "real contact" in this raw
+  # signal -- the delta_v distribution rises continuously (p25=0.94, median=3.43 at
+  # ball.smoothing_window_frames=12) rather than showing two separated clusters. 2.0 sits just
+  # above the measured median as a REASONED, deliberately strict cut (owner's own stated
+  # preference, "accuracy over completeness"): roughly half of proximity-qualifying instants are
+  # rejected as `touch_no_contact_evidence` rather than the previous behaviour of accepting ALL of
+  # them. This is real signal, not noise alone (a genuine touch changes the ball's velocity vector
+  # by definition), but the exact cut point is honestly reasoned, not proven optimal -- revisit
+  # the moment hand-labeled real touch instants exist to fit against.
   min_confidence: 0.1
   max_confidence: 0.45 # HARD CEILING (Golden Rule 5): the most directly-grounded heuristic in
   # this file (literal measured pixel proximity), so it gets the highest ceiling of the new
