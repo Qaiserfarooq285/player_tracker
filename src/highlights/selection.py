@@ -23,7 +23,7 @@ human seam fully intact** so an overnight/unattended run can still complete end 
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
@@ -33,9 +33,34 @@ from src.detect.overlay_mask import ArrowHint
 from src.track.continuity import stitch_timeline as stitch_timeline  # re-export, see below
 from src.track.tracker import assign_take_id
 
+# `src.track.target`/`src.track.target_verify` are imported LAZILY (inside the functions that
+# actually call into them below), never at module level: `src.track.target` -> `src.track.
+# click_reid` -> `src.identity.verify` -> `src.highlights.selection` (this module, for its own
+# `select_targets` re-export) is a real circular import at module-load time. `from __future__
+# import annotations` (above) already defers every type annotation in this file to a string, so
+# the type hints below (`TargetProfile`, `KitColourSample`, `TargetVerdict`, ...) never need a
+# runtime import at all -- only the few call sites that actually construct/compare these types
+# (`_update_profile_after_take`, `_select_take_with_profile`) import them locally.
+if TYPE_CHECKING:
+    from src.track.target import KitColourSample, TargetProfile
+    from src.track.target_verify import TargetVerdict
+
 logger = get_logger(__name__)
 
-SelectionMethod = Literal["arrow_vote", "heuristic_fallback", "manual_override", "none"]
+# "streamed-gathering-treehouse" plan Stage 4: `target_reidentified` (a non-override take resolved
+# by verifying the persistent TargetProfile against its own candidate tracks) and `target_lost`
+# (no candidate -- including a manual override that itself failed verification -- ever cleared
+# ACCEPT) join the pre-existing four. Both are ONLY ever produced when a `TargetProfile` is
+# supplied to `select_targets` (see `_select_take_with_profile` below); the no-profile path below
+# never constructs either literal, so every pre-existing caller/test is unaffected.
+SelectionMethod = Literal[
+    "arrow_vote",
+    "heuristic_fallback",
+    "manual_override",
+    "none",
+    "target_reidentified",
+    "target_lost",
+]
 
 
 class TakeSelection(BaseModel):
@@ -66,6 +91,14 @@ class TakeSelection(BaseModel):
     identity_status: Literal["verified", "unverified"] | None = None
     identity_confidence: float = 0.0
     identity_evidence_frames: list[int] = Field(default_factory=list)
+
+    # "streamed-gathering-treehouse" plan Stage 4: the full `TargetVerdict.evidence` trail behind
+    # a `target_reidentified`/`target_lost` decision (or a profile-verified `manual_override`) --
+    # Golden Rule 5, every accept/reject traceable. Left at its empty-dict default for every
+    # pre-existing method (arrow_vote/heuristic_fallback/none, and a profile-less
+    # manual_override) -- the no-profile selection LOGIC is unaffected; only the serialized
+    # `selection.json` gains one new, harmless `"evidence": {}` key per take.
+    evidence: dict = Field(default_factory=dict)
 
 
 class SelectionResult(BaseModel):
@@ -253,6 +286,225 @@ def heuristic_fallback_seed(
 
 
 # ---------------------------------------------------------------------------
+# 3b. target-profile-driven per-take resolution ("streamed-gathering-treehouse" plan Stage 4) --
+# used ONLY by `select_targets` when it is given a `TargetProfile`; the arrow-vote/heuristic
+# fallback code above is a completely separate branch this never calls into.
+# ---------------------------------------------------------------------------
+
+
+def _reasonable_candidates(take_tracks: list[Track], selection_cfg: dict) -> list[Track]:
+    """Which of this take's own tracks are even worth verifying against the target profile --
+    the SAME outfield-player-only, minimum-duration filter `heuristic_fallback_seed` already uses
+    for its own candidate pool (`configs/highlights.yaml: selection.heuristic.
+    min_track_duration_s`), reused rather than inventing a second bar: a fragment too short to
+    trust for the no-profile heuristic is equally not worth a full `verify_candidate` call for the
+    profile-driven path."""
+    min_duration = selection_cfg["heuristic"]["min_track_duration_s"]
+    return [
+        tr
+        for tr in take_tracks
+        if tr.dominant_class != DetectionClass.REFEREE and tr.boxes and tr.duration >= min_duration
+    ]
+
+
+def _lost_selection(take: Take, take_duration: float, evidence: dict) -> TakeSelection:
+    """A take where no candidate ever cleared `verify_candidate`'s ACCEPT bar -- `track_ids=[]`,
+    `confidence=0.0`, NEVER a substitute player (plan Stage 4's own central rule)."""
+    return TakeSelection(
+        take_id=take.id,
+        method="target_lost",
+        seed_track_id=None,
+        track_ids=[],
+        confidence=0.0,
+        coverage_seconds=0.0,
+        take_duration_seconds=take_duration,
+        evidence=evidence,
+    )
+
+
+def _last_position_evidence(track_ids: list[int], take_tracks: list[Track]) -> dict:
+    """`{last_cx, last_cy, last_bbox_height}` from the LAST box (by time) across `track_ids`' own
+    stitched fragments -- populates the three keys `src.track.target_verify.verify_candidate`'s
+    own `_trajectory_score` reads out of `profile.links[-1].evidence` (its docstring names this
+    exact population step as deferred to "a later, out-of-scope pipeline stage": this module).
+    Empty dict when `track_ids` resolves to no boxes at all (nothing to record)."""
+    by_id = {tr.id: tr for tr in take_tracks}
+    all_boxes = [b for tid in track_ids if (tr := by_id.get(tid)) is not None for b in tr.boxes]
+    if not all_boxes:
+        return {}
+    last = max(all_boxes, key=lambda b: b.t)
+    return {
+        "last_cx": last.bbox.cx,
+        "last_cy": last.bbox.cy,
+        "last_bbox_height": last.bbox.height,
+    }
+
+
+def _update_profile_after_take(
+    profile: TargetProfile,
+    take: Take,
+    selection: TakeSelection,
+    take_tracks: list[Track],
+    kit_by_track: dict[int, KitColourSample],
+    target_cfg: dict,
+) -> None:
+    """Append this take's own resolution to `profile.links` (mutating `profile` IN PLACE -- see
+    `select_targets`'s own docstring for why this is a deliberate side effect, not an oversight),
+    and -- only for an accepted link at/above `target_cfg['memory_update_min_confidence']` -- fold
+    its winning track's own kit-colour sample into the memory bank via `update_memory_bank`
+    (Stage 1's anti-drift rule: an unaccepted/`target_lost` link never reaches this call at all).
+    """
+    from src.track.target import TargetLink, TargetState, update_memory_bank  # see module-level
+
+    # import-order comment: `src.track.target` cannot be imported at module scope here.
+
+    if selection.method == "target_lost":
+        state = TargetState.SEARCHING
+        evidence = dict(selection.evidence)
+    else:
+        state = TargetState.CONFIRMED
+        evidence = {
+            **selection.evidence,
+            **_last_position_evidence(selection.track_ids, take_tracks),
+        }
+
+    profile.links.append(
+        TargetLink(
+            take_id=take.id,
+            track_ids=list(selection.track_ids),
+            state=state,
+            confidence=selection.confidence,
+            evidence=evidence,
+            t_start=take.t_start,
+            t_end=take.t_end,
+        )
+    )
+
+    if selection.method == "target_lost" or selection.seed_track_id is None:
+        return
+    sample = kit_by_track.get(selection.seed_track_id)
+    if sample is None:
+        return
+    updated = update_memory_bank(profile, sample, selection.confidence, target_cfg)
+    profile.kit_bank = updated.kit_bank
+    profile.kit = updated.kit
+
+
+def _select_take_with_profile(
+    take: Take,
+    take_tracks: list[Track],
+    take_duration: float,
+    profile: TargetProfile,
+    target_cfg: dict,
+    kit_by_track: dict[int, KitColourSample],
+    jersey_by_track: dict[int, str],
+    override_track_id: int | None,
+    selection_cfg: dict,
+    motion,
+) -> TakeSelection:
+    """Resolve ONE take against the persistent `TargetProfile` -- `heuristic_fallback_seed` and
+    the arrow vote are never called from anywhere in this function. Mutates `profile` in place via
+    `_update_profile_after_take` before returning (see that function + `select_targets`'s own
+    docstring)."""
+    from src.track.target_verify import VerdictDecision, verify_candidate  # see module-level
+
+    # import-order comment: `src.track.target_verify` cannot be imported at module scope here.
+
+    by_id = {tr.id: tr for tr in take_tracks}
+
+    if override_track_id is not None:
+        candidate = by_id.get(override_track_id)
+        if candidate is None:
+            # Plan Stage 4's own fix for the pre-existing bug at (what was) selection.py:296-303:
+            # a manual override whose track isn't even IN this take's tracks used to silently fall
+            # through to automatic (heuristic/arrow) selection. With a profile in play that must
+            # become target_lost instead -- never a substitute player.
+            selection = _lost_selection(
+                take,
+                take_duration,
+                {
+                    "reason": "manual_override_track_not_found",
+                    "seed_track_id": override_track_id,
+                },
+            )
+        else:
+            verdict = verify_candidate(
+                profile, candidate, kit_by_track, jersey_by_track, target_cfg
+            )
+            if verdict.decision == VerdictDecision.ACCEPT:
+                track_ids, _stitch_conf = stitch_timeline(
+                    override_track_id, take_tracks, selection_cfg, motion
+                )
+                selection = TakeSelection(
+                    take_id=take.id,
+                    method="manual_override",
+                    seed_track_id=override_track_id,
+                    track_ids=track_ids,
+                    confidence=verdict.score,
+                    coverage_seconds=timeline_coverage_seconds(track_ids, take_tracks),
+                    take_duration_seconds=take_duration,
+                    evidence=verdict.evidence,
+                )
+            else:
+                # Stage 2's own rule: UNCERTAIN is never a weak accept, treated exactly like
+                # REJECT here -- the target stays LOST, never assigned to a contradicted click.
+                selection = _lost_selection(take, take_duration, verdict.evidence)
+    else:
+        candidates = _reasonable_candidates(take_tracks, selection_cfg)
+        accepts: list[tuple[int, TargetVerdict]] = []
+        all_evidence: dict[int, dict] = {}
+        for tr in candidates:
+            verdict = verify_candidate(profile, tr, kit_by_track, jersey_by_track, target_cfg)
+            all_evidence[tr.id] = verdict.evidence
+            if verdict.decision == VerdictDecision.ACCEPT:
+                accepts.append((tr.id, verdict))
+
+        if not accepts:
+            selection = _lost_selection(
+                take,
+                take_duration,
+                {
+                    "reason": "no_accept",
+                    "candidates_considered": [tr.id for tr in candidates],
+                    "verdicts": all_evidence,
+                },
+            )
+        else:
+            max_score = max(v.score for _, v in accepts)
+            winners = [(tid, v) for tid, v in accepts if v.score == max_score]
+            if len(winners) > 1:
+                # Plan Stage 4's own rule: "Ties/no ACCEPT -> LOST" -- an ambiguous best match is
+                # not evidence for either candidate, so neither is trusted over the other.
+                selection = _lost_selection(
+                    take,
+                    take_duration,
+                    {
+                        "reason": "tie",
+                        "tied_track_ids": [tid for tid, _ in winners],
+                        "verdicts": all_evidence,
+                    },
+                )
+            else:
+                winner_id, verdict = winners[0]
+                track_ids, _stitch_conf = stitch_timeline(
+                    winner_id, take_tracks, selection_cfg, motion
+                )
+                selection = TakeSelection(
+                    take_id=take.id,
+                    method="target_reidentified",
+                    seed_track_id=winner_id,
+                    track_ids=track_ids,
+                    confidence=verdict.score,
+                    coverage_seconds=timeline_coverage_seconds(track_ids, take_tracks),
+                    take_duration_seconds=take_duration,
+                    evidence=verdict.evidence,
+                )
+
+    _update_profile_after_take(profile, take, selection, take_tracks, kit_by_track, target_cfg)
+    return selection
+
+
+# ---------------------------------------------------------------------------
 # top-level orchestration
 # ---------------------------------------------------------------------------
 
@@ -268,6 +520,10 @@ def select_targets(
     selection_cfg: dict,
     manual_overrides: dict[int, int] | None = None,
     camera_motion_by_take: dict | None = None,
+    target_profile: TargetProfile | None = None,
+    target_cfg: dict | None = None,
+    kit_by_track_by_take: dict[int, dict[int, KitColourSample]] | None = None,
+    jersey_by_track_by_take: dict[int, dict[int, str]] | None = None,
 ) -> SelectionResult:
     """Run Stage 5 target selection for every take of one video.
 
@@ -275,7 +531,31 @@ def select_targets(
     `src/pipeline/run.py`'s `--track-id` CLI flag) — a human-supplied track always wins over both
     the arrow vote and the fallback heuristic for that take, and is the ONLY case whose
     `TakeSelection.method` is `"manual_override"`.
+
+    **"streamed-gathering-treehouse" plan Stage 4 — `target_profile`.** When `None` (every
+    pre-existing caller), this function is completely unchanged: arrow vote -> within-take
+    stitching -> `heuristic_fallback_seed`, exactly as before. When a `TargetProfile` IS supplied
+    (`target_cfg` becomes required in that case -- `configs/target.yaml` merged with
+    `configs["events"]["kit_colour"]` under its own `"kit_colour"` key, see
+    `src.track.target_verify.verify_candidate`'s own docstring for why the caller owns that
+    merge), every take is instead resolved by `_select_take_with_profile` below:
+    `heuristic_fallback_seed` (and the arrow vote) are NEVER consulted -- the single most
+    important line of this plan (owner's own words) -- and a manual override for that take is
+    itself VERIFIED against the profile rather than trusted blindly. A take with no `ACCEPT`
+    candidate (including a manual override that fails verification, or one whose track id isn't
+    even in that take at all -- the plan Stage 4 fix for the old silent-fallback bug at
+    `selection.py:296-303`) becomes `method="target_lost"`, `track_ids=[]`, `confidence=0.0`,
+    never a substitute player. `target_profile` is MUTATED in place (a new `TargetLink` appended
+    per take, and its memory bank updated via `update_memory_bank` for every accepted link) so its
+    caller can persist the evolved profile after this call returns -- kept a side effect
+    deliberately, rather than a second return value, so this function's return type stays
+    `SelectionResult` unconditionally regardless of whether a profile was supplied (a hard
+    requirement: the no-profile path must remain byte-for-byte unaffected, including its own
+    return type).
     """
+    if target_profile is not None and target_cfg is None:
+        raise ValueError("target_cfg is required when target_profile is given")
+
     manual_overrides = manual_overrides or {}
     tracks_by_take: dict[int, list[Track]] = defaultdict(list)
     for tr in tracks:
@@ -294,6 +574,26 @@ def select_targets(
     for take in takes:
         take_tracks = tracks_by_take.get(take.id, [])
         take_duration = take.t_end - take.t_start
+
+        if target_profile is not None:
+            # Plan Stage 4's own branch, fully separate from the no-profile code below it (never
+            # falls through into it) -- this is what structurally guarantees
+            # `heuristic_fallback_seed`/the arrow vote are never reached when a profile exists,
+            # not just an informal avoidance.
+            selection = _select_take_with_profile(
+                take,
+                take_tracks,
+                take_duration,
+                target_profile,
+                target_cfg,
+                (kit_by_track_by_take or {}).get(take.id, {}),
+                (jersey_by_track_by_take or {}).get(take.id, {}),
+                manual_overrides.get(take.id),
+                selection_cfg,
+                _motion_for(take),
+            )
+            take_selections.append(selection)
+            continue
 
         if take.id in manual_overrides:
             seed = manual_overrides[take.id]
@@ -398,7 +698,9 @@ def select_targets(
             )
         )
 
-    usable = [t for t in take_selections if t.method != "none"]
+    # "target_lost" (plan Stage 4) is the profile-driven equivalent of "none" -- no usable track
+    # at all for that take -- so it is excluded from the confidence average the same way.
+    usable = [t for t in take_selections if t.method not in ("none", "target_lost")]
     overall_confidence = sum(t.confidence for t in usable) / len(usable) if usable else 0.0
     needs_confirmation = any(t.method != "manual_override" for t in take_selections)
 

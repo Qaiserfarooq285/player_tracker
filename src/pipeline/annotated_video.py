@@ -67,6 +67,30 @@ _RED = (0, 0, 255)  # BGR
 _GREEN = (0, 200, 0)
 _RED_THICKNESS = 6
 _GREEN_THICKNESS = 2
+
+# "streamed-gathering-treehouse" plan Stage 5 -- the THIRD render tier (CLAUDE.md §13.1 revised):
+# a target box drawn from a NO-PROFILE arrow/heuristic pick (today's filename-jersey auto flow,
+# CLAUDE.md §14) is real evidence of LOCATION, never of a visually-confirmed jersey number -- it
+# must not render identically to a human-established/jersey-verified box (Golden Rule 5: never
+# display more certainty than the evidence supports). Amber/orange (distinct from both the red
+# target box and the cyan goal-region outline already in this module) at the SAME thickness as
+# red -- a deliberate choice: this is still drawn on the take's own single target track, just with
+# a different certainty claim, so thinning it (as green boxes are thinned) would wrongly read as
+# "less important" rather than "less certain".
+_AMBER = (0, 165, 255)  # BGR orange
+_AMBER_THICKNESS = _RED_THICKNESS
+
+# `TakeIdentityResult.location_method` values that back each render tier (plan Stage 5's own
+# table). `manual_override`/`target_reidentified` are backed by a real click or a passed
+# `verify_candidate` ACCEPT -- both count as "human-established or jersey-verified" per the plan's
+# own wording, regardless of whether a `TargetProfile` happened to be in play. `arrow_vote`/
+# `heuristic_fallback` are a pure geometry/heuristic pick with NO digit ever read -- the exact
+# case Golden Rule 7 already forbids treating as identity-confirmed. `target_lost` (plan Stage 4)
+# is its own, fourth state (LOST), handled separately by `render_tier` below, never grouped with
+# either box tier.
+_RED_ESTABLISHED_METHODS = frozenset({"manual_override", "target_reidentified"})
+_AMBER_METHODS = frozenset({"arrow_vote", "heuristic_fallback"})
+_LOST_METHOD = "target_lost"
 _LABEL_FONT = cv2.FONT_HERSHEY_SIMPLEX
 _LABEL_FONT_SCALE_TARGET = 1.6
 _LABEL_FONT_SCALE_OTHER = 0.9
@@ -273,12 +297,46 @@ def is_target_active_at(identity: TakeIdentityResult | None, track_id: int, t: f
     return any(start <= t <= end for start, end in windows)
 
 
+def render_tier(identity: TakeIdentityResult | None) -> str:
+    """The "streamed-gathering-treehouse" plan Stage 5 render-tier decision: `"red"`, `"amber"`,
+    `"lost"`, or `"none"` (no box, no LOST state either -- the pre-existing "no usable track at
+    all" case, `location_method == "none"`, unchanged from before this plan).
+
+    Driven by `identity.location_method` (plain `str`, so a brand-new `SelectionMethod` literal
+    like `target_reidentified`/`target_lost` never needs a change here beyond the two method-name
+    sets above) plus `identity.status` -- an `"unverified"` take is ALWAYS `"lost"` or `"none"`,
+    never red/amber, matching the pre-existing "no red box for an unverified take" rule. Pure, so
+    this decision is directly unit-testable without decoding a single frame.
+    """
+    if identity is None:
+        return "none"
+    if identity.status != "verified":
+        return "lost" if identity.location_method == _LOST_METHOD else "none"
+    if identity.location_method in _AMBER_METHODS:
+        return "amber"
+    # Every other "verified" location_method -- manual_override/target_reidentified (plan Stage 4)
+    # and every pre-existing ADR-15/ADR-19 provenance (ocr_verified, manual_annotation_colour_
+    # match, ...) -- is human-established or jersey-confirmed identity, i.e. the red tier. This
+    # preserves the exact pre-existing `red_box_track_ids` behaviour for every caller that never
+    # produces an amber-tier method (ADR-15's own extended pipeline, ADR-19's manual-events mode).
+    return "red"
+
+
 def red_box_track_ids(identity: TakeIdentityResult | None) -> set[int]:
-    """The verified-identity GATE (CLAUDE.md §13.1): which raw track ids get the thick RED "target"
-    box this take. Empty for `None`/an unverified take -- those takes get green boxes for every
-    detected player and nothing else, never a fallback guess. Pure, so the render-time gate itself
-    is unit-testable without decoding a single frame (see `tests/test_annotated_video.py`)."""
-    if identity is None or identity.status != "verified":
+    """Which raw track ids get the thick RED "target" box this take (plan Stage 5's own render
+    tier, see `render_tier`) -- empty unless `render_tier(identity) == "red"`. Pure, so the
+    render-time gate itself is unit-testable without decoding a single frame (see
+    `tests/test_annotated_video.py`)."""
+    if render_tier(identity) != "red":
+        return set()
+    return set(identity.location_track_ids)
+
+
+def amber_box_track_ids(identity: TakeIdentityResult | None) -> set[int]:
+    """Which raw track ids get the AMBER "unverified pick" box this take (plan Stage 5) -- empty
+    unless `render_tier(identity) == "amber"`. See `red_box_track_ids`'s own docstring; this is
+    its sibling for the new third tier."""
+    if render_tier(identity) != "amber":
         return set()
     return set(identity.location_track_ids)
 
@@ -430,6 +488,14 @@ def _target_panel_header(identity: TakeIdentityResult) -> str:
     frame/cv2 draw call -- see `TakeIdentityResult.association_confirmed_by_jersey`'s own docstring
     for the full story.
     """
+    if render_tier(identity) == "amber":
+        # Plan Stage 5's own amber-tier panel text (owner decision, this session): a no-profile
+        # arrow/heuristic pick is real location evidence, never a visually-confirmed jersey read
+        # -- CLAUDE.md §14's existing filename-jersey auto flow is exactly this case.
+        return (
+            f"TARGET #{identity.jersey_number} -- UNVERIFIED PICK "
+            "(number from filename, not visually confirmed)"
+        )
     if identity.association_confirmed_by_jersey:
         return f"TARGET #{identity.jersey_number} -- VERIFIED"
     return f"TARGET #{identity.jersey_number} -- COLOUR MATCH (jersey unconfirmed)"
@@ -442,12 +508,21 @@ def _draw_live_panel(
     counts: dict[str, int] | None,
 ) -> None:
     lines: list[tuple[str, tuple[int, int, int]]] = []
-    if identity is not None and identity.status == "verified":
+    tier = render_tier(identity)
+    if tier in ("red", "amber"):
         lines.append((_target_panel_header(identity), _PANEL_HEADER_COLOR))
         for etype in _PANEL_EVENT_TYPES:
             lines.append(
                 (f"{_PANEL_LABELS[etype]}: {(counts or {}).get(etype, 0)}", _PANEL_TEXT_COLOR)
             )
+    elif tier == "lost":
+        # Plan Stage 5/§9/§15's own LOST panel state -- the first "LOST"/"SEARCHING" text
+        # anywhere in this codebase (plan Context section: `grep -rn "LOST|SEARCHING"` over
+        # `src/ apps/` previously found nothing). No box is drawn on anyone this take (Golden Rule
+        # 5: never guess a substitute player), and the panel says so honestly instead of silently
+        # showing nothing while implying the target is still tracked.
+        lines.append((f"TARGET #{identity.jersey_number} -- LOST", _PANEL_HEADER_COLOR))
+        lines.append(("SEARCHING FOR ORIGINAL PLAYER...", _PANEL_TEXT_COLOR))
     else:
         lines.append(("IDENTITY: unverified in this segment", _PANEL_HEADER_COLOR))
         lines.append(("No target player statistics for this segment", _PANEL_TEXT_COLOR))
@@ -633,13 +708,21 @@ def _bbox_to_polygon(bbox: BBox) -> np.ndarray:
     return np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
 
 
-def _draw_cut_banner(frame: np.ndarray, take_id: int, verified: bool) -> None:
+def _draw_cut_banner(frame: np.ndarray, take_id: int, identity: TakeIdentityResult | None) -> None:
+    """CUT banner text, per plan Stage 5's own render tier (`render_tier`): red/amber takes get
+    just the plain "CUT -- take N"; a `"lost"` take names the LOST/SEARCHING state right at the
+    cut so a viewer immediately knows the target isn't there, not just eventually from the live
+    panel; the pre-existing `"none"` tier keeps its original "IDENTITY: unverified" suffix
+    unchanged."""
     width = frame.shape[1]
     sc = _overlay_scale(width)
     banner_h = _px(_BANNER_HEIGHT_PX, sc)
     cv2.rectangle(frame, (0, 0), (width, banner_h), _BANNER_BG_COLOR, -1)
+    tier = render_tier(identity)
     text = f"CUT -- take {take_id}"
-    if not verified:
+    if tier == "lost":
+        text += "   |   TARGET LOST -- SEARCHING FOR ORIGINAL PLAYER"
+    elif tier == "none":
         text += "   |   IDENTITY: unverified in this segment"
     cv2.putText(
         frame,
@@ -888,6 +971,7 @@ def render_full_annotated_video(
             identity = identity_by_take.get(take_id) if take_id is not None else None
             take_tracks = tracks_by_take.get(take_id, [])
             target_ids = red_box_track_ids(identity)
+            amber_ids = amber_box_track_ids(identity)
 
             for tr in take_tracks:
                 # Interpolated, not nearest-snapped: tracking is sampled well below the video's
@@ -917,6 +1001,23 @@ def render_full_annotated_video(
                         f" | TARGET | ID: {tr.id}",
                         _RED,
                         _px(_RED_THICKNESS, overlay_scale),
+                        _LABEL_FONT_SCALE_TARGET * overlay_scale,
+                        _px(_LABEL_THICKNESS_TARGET, overlay_scale),
+                    )
+                elif tr.id in amber_ids and is_target_active_at(identity, tr.id, t):
+                    # Plan Stage 5's amber tier: the SAME target track, but no digit was ever
+                    # read -- the label says so explicitly ("unverified pick") rather than reusing
+                    # the red tier's bare "TARGET" claim (Golden Rule 5).
+                    _draw_box_with_label(
+                        frame,
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        f"#{identity.jersey_by_track_id.get(tr.id, identity.jersey_number)}"
+                        f" | LIKELY TARGET (unverified pick) | ID: {tr.id}",
+                        _AMBER,
+                        _px(_AMBER_THICKNESS, overlay_scale),
                         _LABEL_FONT_SCALE_TARGET * overlay_scale,
                         _px(_LABEL_THICKNESS_TARGET, overlay_scale),
                     )
@@ -959,9 +1060,7 @@ def render_full_annotated_video(
             _draw_live_panel(frame, take_id, identity, counts)
 
             if take is not None and t < take.t_start + _BANNER_SECONDS:
-                _draw_cut_banner(
-                    frame, take.id, identity is not None and identity.status == "verified"
-                )
+                _draw_cut_banner(frame, take.id, identity)
 
             # ADR-19/20 (CLAUDE.md §13.1): event captions fire regardless of whether THIS frame's
             # take has a red box at all -- a manual-mode event whose track association couldn't be

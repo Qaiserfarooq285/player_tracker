@@ -839,6 +839,7 @@ def detect_goals_for_take(
     goal_structure_cfg: dict | None = None,
     hardware_cfg: dict | None = None,
     profile_cfg: dict | None = None,
+    kit_lab_by_track_id: dict[int, np.ndarray] | None = None,
 ) -> tuple[list[Event], dict]:
     """Full ADR-17 pipeline for ONE take: decode a low-fps frame series spanning it, run the
     scoreboard occurrence scan, and — ONLY when at least one occurrence event (scoreboard- OR
@@ -885,6 +886,12 @@ def detect_goals_for_take(
     `profile_cfg` are only needed alongside `goal_structure` (to query
     `src/goal/detect.goal_posts_at` at a handful of instants across the take) — any of them being
     `None` falls back to the manual-polygon-or-nothing behaviour, never a crash.
+
+    `kit_lab_by_track_id` ("streamed-gathering-treehouse" plan Stage 3, `src.track.kit_wiring.
+    build_take_kit_colour`): this take's own per-track grass-suppressed kit Lab, threaded straight
+    into the lazy `detect_passes` call below (assist attribution needs the SAME teammate test
+    ADR-20 gave `detect_passes` generally) — `None` (the default) reproduces the exact pre-existing
+    cluster-only teammate test for any caller that hasn't wired this up yet.
     """
     goal_cfg = events_cfg["goal"]
     assist_cfg = events_cfg["assist"]
@@ -1007,7 +1014,9 @@ def detect_goals_for_take(
     tracks_by_id = {tr.id: tr for tr in take_tracks}
     runs = possession_runs_for_take(take_balls, take_tracks, events_cfg, identity_of)
     possession_events = detect_possession(runs, take.id, events_cfg)
-    pass_events = detect_passes(runs, take_tracks, take.id, events_cfg)
+    pass_events = detect_passes(
+        runs, take_tracks, take.id, events_cfg, kit_lab_by_track_id=kit_lab_by_track_id
+    )
     debug["n_possession_runs"] = len(runs)
 
     events: list[Event] = []
@@ -1129,6 +1138,7 @@ def detect_goals_for_video(
     goal_structure_cfg: dict | None = None,
     hardware_cfg: dict | None = None,
     profile_cfg: dict | None = None,
+    kit_lab_by_track_id_by_take: dict[int, dict[int, np.ndarray]] | None = None,
 ) -> GoalDetectionResult:
     """ADR-17's real, per-video goal+assist detector (ADR-20 adds the human-marked goal-region
     source; Stage D of the "streamed-gathering-treehouse" plan adds Stage C's auto-tracked one
@@ -1145,6 +1155,12 @@ def detect_goals_for_video(
     `None` -- omitting any of them simply skips that source entirely (never a crash, never a
     fabricated region), which is exactly what every caller that doesn't yet pass them gets (safe,
     behaviour-preserving default for any pre-ADR-20/pre-Stage-D call site).
+
+    `kit_lab_by_track_id_by_take` ("streamed-gathering-treehouse" plan Stage 3): per-take kit-Lab
+    dicts from `src.track.kit_wiring.build_take_kit_colour`, looked up per take below and passed
+    to `detect_goals_for_take` for its own lazy assist attribution. `None` (the default) omits the
+    lookup entirely -- every take's own `detect_goals_for_take` call then gets `kit_lab_by_track_id
+    =None`, the exact pre-existing cluster-only teammate test.
     """
     goal_cfg = events_cfg["goal"]
     goal_region_configured = bool(slug and (goal_region_cfg or {}).get("regions", {}).get(slug))
@@ -1182,6 +1198,7 @@ def detect_goals_for_video(
                 goal_structure_cfg=goal_structure_cfg,
                 hardware_cfg=hardware_cfg,
                 profile_cfg=profile_cfg,
+                kit_lab_by_track_id=(kit_lab_by_track_id_by_take or {}).get(take.id),
             )
             if debug.get("activated_region") is not None:
                 activated_any = True

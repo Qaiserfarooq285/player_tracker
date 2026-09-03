@@ -24,6 +24,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
@@ -81,7 +82,9 @@ from src.track.click_reid import (
     extend_chain_with_profile,
     prune_chain_by_jersey,
 )
+from src.track.kit_wiring import build_take_kit_colour
 from src.track.run import run_track_stage
+from src.track.target import KitColourSample, TargetProfile, save_target_profile
 from src.track.tracker import assign_take_id
 
 logger = get_logger(__name__)
@@ -173,6 +176,24 @@ def _compute_events(
     return events
 
 
+def _track_active_windows(
+    track_ids: list[int], take_tracks: list[Track]
+) -> dict[int, list[tuple[float, float]]]:
+    """Each of `track_ids`' own real `[first_box.t, last_box.t]` span ("streamed-gathering-
+    treehouse" plan Stage 5, second half) -- the same population `src.pipeline.manual_events`
+    already does for its own multi-target-per-take case, generalised here for the single-target
+    Phase-1/ADR-15 flow's own stitched chain. A track id absent from `take_tracks`, or with no
+    boxes at all, is simply omitted (falls back to `is_target_active_at`'s own "no entry -> always
+    active" default for that one id, never a crash)."""
+    by_id = {tr.id: tr for tr in take_tracks}
+    windows: dict[int, list[tuple[float, float]]] = {}
+    for tid in track_ids:
+        tr = by_id.get(tid)
+        if tr is not None and tr.boxes:
+            windows[tid] = [(tr.boxes[0].t, tr.boxes[-1].t)]
+    return windows
+
+
 def _stitched_virtual_track(take_id: int, take_tracks: list[Track], ids: list[int]) -> Track:
     """Merge the boxes of several raw take-scoped fragments (one target's own location-selection
     `track_ids`) into ONE synthetic `Track`, time-sorted — mirrors
@@ -191,6 +212,52 @@ def _stitched_virtual_track(take_id: int, take_tracks: list[Track], ids: list[in
     return Track(id=-1, take_id=take_id, boxes=boxes)
 
 
+def _serialize_kit_colour_by_take(
+    kit_lab_by_track_id_by_take: dict[int, dict[int, np.ndarray]],
+    kit_sample_by_track_id_by_take: dict[int, dict[int, KitColourSample]],
+) -> dict:
+    """JSON-safe encoding for `work/<slug>/track/kit_colour.json` -- a `np.ndarray`/pydantic-model
+    caching format (not a `.parquet` file, despite the plan's own sketch naming one): the plan's
+    Stage 3 asks for two DIFFERENT per-track shapes side by side (a bare Lab triple, and a
+    torso/shorts/socks `KitColourSample`), and a `.parquet` file needs one flat row schema —
+    forcing both into one table would mean either duplicating the write into two separate parquet
+    files (two cache-invalidation surfaces instead of one) or flattening `KitColourSample` into
+    loose columns and losing its own type on read-back. JSON (the same convention `events.json`
+    already uses for exactly this "heterogeneous structure, not a flat table" reason, see this
+    module's own `events` caching comment) keeps both shapes exact and keeps this one cache file
+    the single source for both.
+    """
+    return {
+        "kit_lab": {
+            str(take_id): {str(tid): lab.tolist() for tid, lab in by_track.items()}
+            for take_id, by_track in kit_lab_by_track_id_by_take.items()
+        },
+        "kit_sample": {
+            str(take_id): {
+                str(tid): sample.model_dump(mode="json") for tid, sample in by_track.items()
+            }
+            for take_id, by_track in kit_sample_by_track_id_by_take.items()
+        },
+    }
+
+
+def _deserialize_kit_colour_by_take(
+    data: dict,
+) -> tuple[dict[int, dict[int, np.ndarray]], dict[int, dict[int, KitColourSample]]]:
+    """Inverse of `_serialize_kit_colour_by_take`."""
+    kit_lab_by_track_id_by_take = {
+        int(take_id): {int(tid): np.array(lab) for tid, lab in by_track.items()}
+        for take_id, by_track in data.get("kit_lab", {}).items()
+    }
+    kit_sample_by_track_id_by_take = {
+        int(take_id): {
+            int(tid): KitColourSample.model_validate(sample) for tid, sample in by_track.items()
+        }
+        for take_id, by_track in data.get("kit_sample", {}).items()
+    }
+    return kit_lab_by_track_id_by_take, kit_sample_by_track_id_by_take
+
+
 def _load_stage2_3_artifacts(
     work_dir: Path,
 ) -> tuple[list[Take], list[Track], list[BallDetection], list[ArrowHint]]:
@@ -204,6 +271,63 @@ def _load_stage2_3_artifacts(
     return takes, tracks, balls, arrow_hints
 
 
+def _collect_jersey_by_track_by_take(
+    video_path: Path,
+    takes: list[Take],
+    tracks: list[Track],
+    frame_width: float,
+    frame_height: float,
+    configs: dict[str, dict],
+    use_nvdec: bool,
+) -> dict[int, dict[int, str]]:
+    """Per-take `{track_id: confident_jersey_digit_string}` for EVERY track in EVERY take
+    ("streamed-gathering-treehouse" plan Stage 4/6) -- `src.track.click_reid.
+    collect_track_jersey_digits`, called once per take, reusing the SAME ADR-21 legibility-gate +
+    tight-number-region PARSeq chain the pre-existing click_reid corroboration block already uses
+    for a narrower (manual-override-only) case. Loads the legibility/PARSeq checkpoint stack ONCE
+    for the whole video (CLAUDE.md §11), frees it in `finally`. A take with no confident majority
+    for a track is simply absent from that take's dict (the existing, honest
+    `collect_track_jersey_digits` contract) -- `{}` everywhere when the checkpoint itself is
+    unavailable/disabled, never a guess, never a raise.
+    """
+    native_meta = probe(video_path)
+    native_w, native_h = native_meta["width"], native_meta["height"]
+    scale_x = native_w / frame_width if frame_width else 1.0
+    scale_y = native_h / frame_height if frame_height else 1.0
+
+    tracks_by_take: dict[int, list[Track]] = defaultdict(list)
+    for tr in tracks:
+        tracks_by_take[tr.take_id].append(tr)
+
+    legibility_model, parseq_model, parseq_transform = load_optional_jersey_stack(
+        configs["identity"]
+    )
+    max_samples = (
+        configs["highlights"].get("click_reid", {}).get("max_jersey_samples_per_track", 40)
+    )
+    try:
+        result: dict[int, dict[int, str]] = {}
+        for take in takes:
+            result[take.id] = collect_track_jersey_digits(
+                video_path,
+                tracks_by_take.get(take.id, []),
+                scale_x,
+                scale_y,
+                native_w,
+                native_h,
+                configs["identity"],
+                legibility_model,
+                parseq_model,
+                parseq_transform,
+                max_samples,
+                configs["identity"]["aggregation"],
+                use_nvdec=use_nvdec,
+            )
+        return result
+    finally:
+        free_optional_jersey_stack(legibility_model, parseq_model)
+
+
 def run_pipeline_for_video(
     video_path: str | Path,
     configs: dict[str, dict],
@@ -212,11 +336,23 @@ def run_pipeline_for_video(
     work_root: str | Path = "work",
     output_root: str | Path = "output",
     use_nvdec: bool = True,
+    target_profile: TargetProfile | None = None,
 ) -> RunReport:
     """Run Stages 4-6 for one already-detected/tracked video end to end (Stage 0.5-3 are invoked
     here too, via `run_track_stage`, but are no-ops on a cache hit — see module docstring).
     Writes `output/<slug>/{reel.mp4, stat_card.json, stat_card.md, run_report.json}` and returns
     the `RunReport`.
+
+    `target_profile` ("streamed-gathering-treehouse" plan Stage 4/6, `src.track.target.
+    TargetProfile`): `None` (every pre-existing caller) leaves Stage 5 target selection completely
+    unchanged (`select_targets` with no profile — arrow vote / heuristic fallback, CLAUDE.md §14's
+    auto flow). When supplied (only ever by `apps/api/main.py`'s click endpoint today), Stage 5
+    becomes strict target-driven re-identification instead — see `select_targets`'s own docstring.
+    `target_profile` is MUTATED in place by `select_targets` (new `TargetLink`s appended, memory
+    bank updated), and this function persists the evolved profile back to
+    `work/<slug>/target.json` itself before returning — the caller is only responsible for
+    building/loading the profile before calling in (`apps/api/main.py`'s click endpoint does
+    exactly that).
     """
     video_path = Path(video_path)
     work_dir = work_dir_for(video_path, root=work_root)
@@ -337,6 +473,76 @@ def run_pipeline_for_video(
     )
     goal_structures_by_take = {gs.take_id: gs for gs in goal_structure_report.takes}
 
+    # --- Stage 3 ("streamed-gathering-treehouse" plan): per-track kit colour, cached ------------
+    # Wires `src.track.kit_wiring.build_take_kit_colour` into production -- previously
+    # `detect_passes`'s own `kit_lab_by_track_id` parameter was dead code (nothing ever
+    # constructed it), and `src.track.target_verify.verify_candidate`'s `kit_by_track` argument
+    # had no producer either. Built ONCE per take here and reused for BOTH: (a) every take's own
+    # `detect_passes` call (Stage 4b goals below, and the Stage 6b per-take event loop further
+    # down) via `kit_lab_by_track_id`, and (b) Stage 4/6's `verify_candidate` calls (via
+    # `select_targets(..., kit_by_track_by_take=...)` below) via `kit_sample_by_track_id`. Runs
+    # UNCONDITIONALLY (not gated on `target_profile` being supplied) -- ADR-20's colour-aware
+    # pass/turnover attribution benefits every run, profile or not.
+    t0 = time.time()
+    kit_colour_path = work_dir / "track" / "kit_colour.json"
+    native_meta_for_kit = probe(video_path)
+    native_w_for_kit, native_h_for_kit = native_meta_for_kit["width"], native_meta_for_kit["height"]
+    scale_x_for_kit = native_w_for_kit / frame_width if frame_width else 1.0
+    scale_y_for_kit = native_h_for_kit / frame_height if frame_height else 1.0
+    kit_colour_cache_config = {
+        "identity_crop_cfg": configs["identity"]["crop"],
+        "number_crop_cfg": configs["identity"]["parseq_soccernet"]["number_crop"],
+        "target_bands_cfg": configs["target"]["bands"],
+        "target_kit_colour_cfg": configs["target"]["kit_colour"],
+        "target_band_weights": configs["target"]["band_confidence_weights"],
+        "events_kit_colour_cfg": configs["events"]["kit_colour"],
+        "n_tracks": len(tracks),
+        "n_takes": len(takes),
+    }
+    kit_colour_cache = StageCache(kit_colour_path, kit_colour_cache_config, stage="kit_colour")
+    if kit_colour_cache.hit():
+        kit_lab_by_track_id_by_take, kit_sample_by_track_id_by_take = (
+            _deserialize_kit_colour_by_take(load_json(kit_colour_path))
+        )
+    else:
+        tracks_by_take_for_kit_colour: dict[int, list[Track]] = defaultdict(list)
+        for tr in tracks:
+            tracks_by_take_for_kit_colour[tr.take_id].append(tr)
+        kit_lab_by_track_id_by_take = {}
+        kit_sample_by_track_id_by_take = {}
+        for take in takes:
+            lab_by_track, sample_by_track = build_take_kit_colour(
+                video_path,
+                take,
+                tracks_by_take_for_kit_colour.get(take.id, []),
+                scale_x_for_kit,
+                scale_y_for_kit,
+                native_w_for_kit,
+                native_h_for_kit,
+                configs["identity"],
+                configs["target"],
+                configs["events"]["kit_colour"],
+                configs["highlights"].get("click_reid", {}).get("max_jersey_samples_per_track", 40),
+                use_nvdec=use_nvdec,
+            )
+            kit_lab_by_track_id_by_take[take.id] = lab_by_track
+            kit_sample_by_track_id_by_take[take.id] = sample_by_track
+        save_json(
+            _serialize_kit_colour_by_take(
+                kit_lab_by_track_id_by_take, kit_sample_by_track_id_by_take
+            ),
+            kit_colour_path,
+        )
+        kit_colour_cache.write_meta()
+    timings.append(
+        StageTiming(
+            stage="kit_colour",
+            wall_seconds=round(time.time() - t0, 2),
+            vram_peak_mb=None,
+            notes=f"n_takes_with_lab={len(kit_lab_by_track_id_by_take)}",
+        )
+    )
+
     # --- Stage 4b: goals + assists (ADR-17, extended by ADR-20 + Stage D, cached) --------------
     # Real detection now (see src/events/goals.py) -- still correctly reports "not available" on
     # this footage (measured, CLAUDE.md §3.2(3)), just for a specific, auditable reason instead of
@@ -359,6 +565,9 @@ def run_pipeline_for_video(
         "n_tracks": len(tracks),
         "n_balls": len(balls),
         "n_takes": len(takes),
+        # Stage 3 kit colour feeds this stage's own assist attribution (detect_goals_for_take's
+        # lazy detect_passes call) -- a changed kit-colour cache must invalidate this one too.
+        "n_kit_lab_tracks": sum(len(v) for v in kit_lab_by_track_id_by_take.values()),
     }
     goals_cache = StageCache(goals_path, goals_cache_config, stage="goals")
     if goals_cache.hit():
@@ -390,6 +599,7 @@ def run_pipeline_for_video(
             goal_structure_cfg=configs["goal_structure"],
             hardware_cfg=configs["hardware"],
             profile_cfg=configs["profile"],
+            kit_lab_by_track_id_by_take=kit_lab_by_track_id_by_take,
         )
         save_json(goal_result.model_dump(mode="json"), goals_path)
         goals_cache.write_meta()
@@ -446,7 +656,27 @@ def run_pipeline_for_video(
         )
     )
 
-    # --- Stage 5: target selection (cached) ----------------------------------------------------
+    # --- Stage 4/6 ("streamed-gathering-treehouse" plan): target-profile jersey evidence --------
+    # Only ever built when a persistent `TargetProfile` is actually in play (apps/api/main.py's
+    # click endpoint) -- `verify_candidate`'s jersey hard-reject/scoring step needs a confident
+    # read per CANDIDATE track across EVERY take, not just a manual-override take's own chain
+    # (unlike the pre-existing click_reid corroboration block below, which is scoped to exactly
+    # that narrower case). `None` for every profile-less run -- zero extra cost.
+    target_cfg: dict | None = None
+    jersey_by_track_by_take_for_selection: dict[int, dict[int, str]] | None = None
+    if target_profile is not None:
+        target_cfg = {**configs["target"], "kit_colour": configs["events"]["kit_colour"]}
+        jersey_by_track_by_take_for_selection = _collect_jersey_by_track_by_take(
+            video_path,
+            takes,
+            tracks,
+            frame_width,
+            frame_height,
+            configs,
+            use_nvdec,
+        )
+
+    # --- Stage 5: target selection (cached, except when a TargetProfile drives it) -------------
     t0 = time.time()
     selection_path = work_dir / "selection.json"
     click_reid_cfg = configs["highlights"].get("click_reid", {})
@@ -461,7 +691,15 @@ def run_pipeline_for_video(
         "camera_motion_takes": len(camera_motion.takes),
     }
     selection_cache = StageCache(selection_path, selection_cache_config, stage="selection")
-    if selection_cache.hit():
+    # A persistent TargetProfile is MUTATED in place by `select_targets` (a new `TargetLink`
+    # appended per take, its memory bank updated on every accepted link) -- the caller re-saves it
+    # after this call expecting real forward progress each time. A cache hit would silently skip
+    # that mutation on every call after the first, which would break the whole click-driven
+    # re-identification flow (the profile would never actually learn/record anything past its
+    # first use). So a profile-driven run always recomputes Stage 5, never reads/writes this
+    # cache -- profile-less runs are completely unaffected (this only ever triggers when
+    # `target_profile is not None`, i.e. never for CLAUDE.md §14's own auto flow).
+    if target_profile is None and selection_cache.hit():
         selection = SelectionResult.model_validate(load_json(selection_path))
     else:
         selection = select_targets(
@@ -475,17 +713,29 @@ def run_pipeline_for_video(
             configs["highlights"]["selection"],
             manual_overrides=manual_overrides,
             camera_motion_by_take=camera_motion_by_take,
+            target_profile=target_profile,
+            target_cfg=target_cfg,
+            kit_by_track_by_take=kit_sample_by_track_id_by_take if target_profile else None,
+            jersey_by_track_by_take=jersey_by_track_by_take_for_selection,
         )
         # Click-anchored re-identification (owner request 2026-09-01, `src/track/click_reid.py`):
         # extend a MANUAL-OVERRIDE take's own stitched chain across a break `stitch_timeline`
         # itself didn't bridge, using the clicked player's own team-cluster + height as
         # corroborating evidence. Deliberately scoped to `manual_override` selections only -- the
         # click is the strongest identity evidence this pipeline has (Golden Rule 4); auto-selected
-        # takes (arrow_vote/heuristic_fallback) are untouched.
+        # takes (arrow_vote/heuristic_fallback) are untouched. Also skipped entirely once a
+        # `TargetProfile` is in play: Stage 2's `verify_candidate` (already run for every
+        # profile-driven `manual_override`/`target_reidentified` take above) supersedes this
+        # additive mechanism (plan's own "Out of scope" note) -- running both would mean a second,
+        # uncoordinated chain-extension pass over a selection Stage 4 already resolved.
         if (
-            click_reid_cfg.get("enabled", False)
-            or click_reid_cfg.get("prune_jersey_disagreement", False)
-        ) and manual_overrides:
+            (
+                click_reid_cfg.get("enabled", False)
+                or click_reid_cfg.get("prune_jersey_disagreement", False)
+            )
+            and manual_overrides
+            and target_profile is None
+        ):
             tracks_by_take: dict[int, list] = defaultdict(list)
             for tr in tracks:
                 tracks_by_take[tr.take_id].append(tr)
@@ -595,6 +845,14 @@ def run_pipeline_for_video(
         )
     )
 
+    if target_profile is not None:
+        # Persist the profile `select_targets` just mutated in place (new `TargetLink`s appended,
+        # memory bank updated) -- `work/<slug>/target.json` is this profile's own canonical home
+        # (the same `work_dir` every other Stage 0.5-6 cache in this function already lives
+        # under), so THIS function owns writing it back rather than pushing that responsibility
+        # out to every caller that happens to supply a profile.
+        save_target_profile(target_profile, work_dir / "target.json")
+
     # --- Stage 6: ranking + cutting + reel + stats ---------------------------------------------
     t0 = time.time()
     timeline_tracks_by_take: dict[int, list[Track]] = defaultdict(list)
@@ -689,9 +947,26 @@ def run_pipeline_for_video(
         )
 
     t0 = time.time()
+    full_tracks_by_take: dict[int, list[Track]] = defaultdict(list)
+    for tr in tracks:
+        full_tracks_by_take[tr.take_id].append(tr)
+    full_balls_by_take = _bucket_by_take(balls, takes)
+
     identity_by_take: dict[int, TakeIdentityResult] = {}
     for sel in selection.takes:
+        # `is_located` and therefore `status` are UNCHANGED by the "streamed-gathering-treehouse"
+        # plan's Stage 5 render-tier work: `method != "none"` already covers the new
+        # `target_lost` literal too (its own `track_ids` is always `[]`, so `is_located` is
+        # already False for it), and a profile-less `arrow_vote`/`heuristic_fallback` pick is
+        # DELIBERATELY still `status="verified"` here -- CLAUDE.md §13.2's stat-card/live-panel
+        # machinery already gates on `status == "verified"`, and the plan's own owner decision
+        # ("keep tracking the pick, but stop calling it verified") is about the RENDERED CLAIM,
+        # not about silently zeroing out today's stats for the unclicked filename-jersey flow.
+        # `src.pipeline.annotated_video.render_tier` is what actually downgrades that claim (amber
+        # box + "UNVERIFIED PICK" panel) by reading `location_method` below, never `status` itself
+        # -- see that module's own docstring for the full three-tier rule.
         is_located = sel.method != "none" and bool(sel.track_ids)
+        take_tracks_for_windows = full_tracks_by_take.get(sel.take_id, [])
         identity_by_take[sel.take_id] = TakeIdentityResult(
             take_id=sel.take_id,
             jersey_number=target_jersey,
@@ -705,12 +980,14 @@ def run_pipeline_for_video(
             # evidence behind the same label).
             location_method=str(sel.method),
             location_track_ids=sel.track_ids,
+            # Plan Stage 5 (second half): each stitched fragment's OWN real box-time-span, not the
+            # pre-existing default "always active for the whole take" ({} -- see
+            # `is_target_active_at`'s own docstring). Mirrors `src.pipeline.manual_events`'s own
+            # population of this same field. A gap between two stitched fragments (an occlusion,
+            # a break `stitch_timeline` didn't bridge) now genuinely renders as "not active" rather
+            # than silently inheriting whatever the LAST fragment's box happened to be nearby.
+            track_active_windows=_track_active_windows(sel.track_ids, take_tracks_for_windows),
         )
-
-    full_tracks_by_take: dict[int, list[Track]] = defaultdict(list)
-    for tr in tracks:
-        full_tracks_by_take[tr.take_id].append(tr)
-    full_balls_by_take = _bucket_by_take(balls, takes)
 
     goal_assist_by_take: dict[int, list[Event]] = defaultdict(list)
     for ev in goal_result.events:
@@ -744,6 +1021,7 @@ def run_pipeline_for_video(
             full_selection_cfg,
             fps_sample,
             drops=full_drops,
+            kit_lab_by_track_id=kit_lab_by_track_id_by_take.get(take.id),
         )
         all_events = all_events + goal_assist_by_take.get(take.id, [])
         target_events = attribute_events_to_target(
@@ -932,6 +1210,13 @@ def _load_all_configs() -> dict[str, dict]:
         # harmless when unused" reasoning as the other stage-optional configs above; only actually
         # exercised when GEMINI_API_KEY is set (src/goal/detect.py's own honest no-op otherwise).
         "goal_structure": load_yaml("configs/goal_structure.yaml"),
+        # Stages 1-4/6 ("streamed-gathering-treehouse" plan) -- the persistent `TargetProfile`
+        # object (`src/track/target.py`) + its `verify_candidate` thresholds
+        # (`src/track/target_verify.py`). Loaded unconditionally (cheap, tiny file, same "harmless
+        # when unused" reasoning as the other stage-optional configs above); only actually
+        # consulted when `target_profile is not None` is threaded into
+        # `run_pipeline_for_video`/`select_targets` (apps/api/main.py's click endpoint today).
+        "target": load_yaml("configs/target.yaml"),
     }
 
 

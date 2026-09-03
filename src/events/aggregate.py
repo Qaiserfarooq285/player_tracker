@@ -11,6 +11,8 @@ then filters the result down to one verified target's own events.
 
 from __future__ import annotations
 
+import numpy as np
+
 from src.common.logging import DropCounter
 from src.common.types import BallDetection, Event, EventType, Take, Track
 from src.events.ball_track import build_ball_state_series, reference_player_height
@@ -41,6 +43,7 @@ def compute_take_all_events(
     ball_fps: float = DEFAULT_BALL_FPS,
     drops: DropCounter | None = None,
     camera_motion=None,
+    kit_lab_by_track_id: dict[int, np.ndarray] | None = None,
 ) -> tuple[list[Event], dict[int, int], dict[int, float]]:
     """Every best-effort event category for ONE take, across ALL of that take's own tracks.
 
@@ -60,6 +63,13 @@ def compute_take_all_events(
     tackle) key on would silently fall back to the raw, pan-inflated image-space distance during a
     fast camera pan, the same failure mode `src/track/camera_motion.py`'s module docstring
     measures for `stitch_timeline`.
+
+    `kit_lab_by_track_id` ("streamed-gathering-treehouse" plan Stage 3, `src.track.kit_wiring.
+    build_take_kit_colour`): per-track grass-suppressed kit Lab for THIS take, passed straight
+    through to `detect_passes`'s own `teammates_test` (ADR-20) so pass/turnover attribution
+    actually uses real measured colour instead of the ADR-12 team-cluster fallback alone. `None`
+    (the default) reproduces the exact pre-existing cluster-only behaviour for any caller that
+    hasn't wired this up yet.
     """
     identity_of, identity_confidence = build_take_identities(
         take_tracks, selection_cfg, motion=camera_motion
@@ -87,7 +97,16 @@ def compute_take_all_events(
         detect_possession(runs, take.id, events_cfg, ball_fps, identity_confidence, drops)
     )
     events.extend(
-        detect_passes(runs, take_tracks, take.id, events_cfg, ball_fps, identity_confidence, drops)
+        detect_passes(
+            runs,
+            take_tracks,
+            take.id,
+            events_cfg,
+            ball_fps,
+            identity_confidence,
+            drops,
+            kit_lab_by_track_id=kit_lab_by_track_id,
+        )
     )
     events.extend(
         detect_dribbles(
