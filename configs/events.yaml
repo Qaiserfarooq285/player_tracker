@@ -24,6 +24,38 @@ ball:
   # a hole Stage 2 itself found too large to trust (owner: "do NOT immediately create a
   # touch/pass/shot/goal because the ball disappeared").
 
+kit_colour:
+  # Stage 5b of the evidence-based event redesign (owner request 2026-09-02: "also add the
+  # player jersy color for passes and assist") -- src/events/kit_colour.py. A grass-suppressed
+  # measurement of a player's OWN kit colour, compared against
+  # configs/annotations.yaml: colour_reference_lab (the same reference table manual-mode
+  # association already uses), used as the PRIMARY teammate-vs-opponent signal for pass/assist
+  # attribution -- ahead of jersey-number agreement and team-cluster quality.
+  min_kept_pixels: 20 # a crop where fewer than this many pixels survive grass suppression has
+  # essentially no shirt visible (heavy occlusion/motion blur) -- treated as no sample, never a
+  # guess from what's left.
+  min_kept_pixel_frac: 0.15 # MEASURED 2026-09-02 on chelsea_burnley_target10: real kept-kit
+  # fractions across 6 visually-confirmed tracks ranged 31%-74% depending on pose/occlusion, with
+  # a genuine sample as low as 31% still usable (verified against ground truth). Below 15% the
+  # remaining pixels are almost certainly background bleed at the crop edges, not shirt.
+  same_team_max_dist: 8.0 # ⚠️ REASONED FROM A SMALL REAL SAMPLE (15 pairs, 6 visually-confirmed
+  # tracks), not exhaustively validated -- same epistemic status as several other thresholds in
+  # this file. Measured 2026-09-02, direct pairwise CIELAB distance (src/events/kit_colour.py::
+  # kit_colour_same_team -- NOT compared against colour_reference_lab, see that function's own
+  # docstring for why): same-team pairs ranged 3.4-23.4 apart, cross-team pairs ranged 9.8-42.4
+  # apart -- the ranges OVERLAP, so this and diff_team_min_dist below form a two-sided gate with
+  # an honest gap between them rather than one threshold. At (8.0, 24.0) every one of the 15
+  # measured pairs that clears either gate is classified correctly (0 wrong verdicts), INCLUDING
+  # the real click-to-track validation pair from earlier the same day (Chelsea blue #10 vs
+  # Burnley claret #21, dE=24.5 -- this is why the gate sits at 24.0, not a rounder 25.0: the
+  # highest observed SAME-team distance is 23.4, so 24.0 is the tightest gate that both stays
+  # above every same-team pair AND still resolves that specific real pair confidently). 7 of 15
+  # pairs still fall into the undecided gap, matching the owner's own stated preference for pass
+  # counting ("strict -- fewer, high-confidence"): a genuinely ambiguous read falls through to
+  # jersey number / team-cluster quality rather than risk crediting the wrong team.
+  diff_team_min_dist: 24.0 # see same_team_max_dist immediately above -- the other side of the
+  # same measured gate.
+
 sprint:
   # unit = "bbox-heights per second": a track's smoothed centroid displacement (px) / dt, divided
   # by the mean bbox height of the two boxes being diffed. This self-scales with the player's own
