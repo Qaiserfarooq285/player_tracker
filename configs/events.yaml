@@ -370,6 +370,16 @@ pass:
   # possession change at p90+ distance reads more like an unrelated separate event (or a
   # long-ball/clearance `shot` candidate) than one continuous passing sequence.
   pass_max_dist: 750
+  pass_min_gap_s: 1.0 # ⚠️ REASONED, not measured against hand-labeled real pass sequences --
+  # same epistemic status as several other thresholds in this file. Real bug this closes,
+  # measured 2026-09-02 on clip1_43: adjacent possession-run pairs fired 9 PASS events in an 11s
+  # clip, 0.1-0.4s apart, all at IDENTICAL confidence (0.35) -- runs fragment easily
+  # (possession.possession_min_duration_s=0.3s) with nothing stopping the SAME passer being
+  # credited twice a fraction of a second apart. Compared in real SECONDS against run end
+  # timestamps (FPS-independent by construction, same as touch.touch_min_gap_s). 1.0s is a
+  # deliberately strict floor -- the shortest plausible real gap between two GENUINELY separate
+  # passes by the same player (ball leaves, reaches a teammate, comes back around) -- per the
+  # owner's own stated preference for pass counting ("strict -- fewer, high-confidence").
   pass_max_gap_s: 2.0 # generous enough for the ball to travel `pass_max_dist` in flight without
   # anyone else registering as "in possession" in between, informally calibrated the same way
   # `shot.ball_speed_threshold` is (no direct ball-flight-time measurement on this footage,

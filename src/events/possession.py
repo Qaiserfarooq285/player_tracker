@@ -39,6 +39,8 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from src.common.types import BallDetection, DetectionClass, Event, EventType, Track, TrackBox
 from src.events.sprints import track_speed_series
 from src.events.touches import POSSESSOR_CLASSES, nearest_box_in_time, nearest_player_edge_distance
@@ -226,6 +228,37 @@ def teammates_gate(
     return team_a == team_b
 
 
+def teammates_test(
+    raw_a: int,
+    raw_b: int,
+    tracks_by_id: dict[int, Track],
+    team_threshold: float,
+    kit_colour_cfg: dict,
+    kit_lab_by_track_id: dict[int, np.ndarray] | None = None,
+) -> bool | None:
+    """Cascading "are these two players teammates" test (Stage 5, owner request 2026-09-02: kit
+    colour as the PRIMARY signal for pass/assist attribution).
+
+    Order: (1) kit colour, DIRECTLY measured and compared (`src.events.kit_colour.
+    kit_colour_same_team` -- see that function's own docstring for why it is a two-sided
+    real-data-measured gate, not a single threshold, and why it is never compared against a fixed
+    reference palette); (2) if colour is undecided (or `kit_lab_by_track_id` wasn't supplied at
+    all -- e.g. a caller that hasn't run the per-take colour-sampling pass yet), fall back to the
+    pre-existing ADR-12 team-CLUSTER gate (`teammates_gate`, unchanged). Backward compatible: a
+    caller passing `kit_lab_by_track_id=None` (the default) gets EXACTLY the old cluster-only
+    behaviour.
+    """
+    from src.events.kit_colour import kit_colour_same_team
+
+    if kit_lab_by_track_id is not None:
+        lab_a = kit_lab_by_track_id.get(raw_a)
+        lab_b = kit_lab_by_track_id.get(raw_b)
+        colour_verdict, _dist = kit_colour_same_team(lab_a, lab_b, kit_colour_cfg)
+        if colour_verdict is not None:
+            return colour_verdict
+    return teammates_gate(raw_a, raw_b, tracks_by_id, team_threshold)
+
+
 # ---------------------------------------------------------------------------
 # 2. possession events
 # ---------------------------------------------------------------------------
@@ -327,6 +360,7 @@ def detect_passes(
     ball_fps: float = DEFAULT_BALL_FPS,
     identity_confidence: dict[int, float] | None = None,
     drops=None,
+    kit_lab_by_track_id: dict[int, np.ndarray] | None = None,
 ) -> list[Event]:
     """`PASS` events between adjacent runs (in `runs`' own time order — i.e. no other identity's
     run sits between them, see `_merge_possession_runs`) by DIFFERENT, confidently-SAME-team
@@ -353,8 +387,16 @@ def detect_passes(
 
     pass_cfg = events_cfg["pass"]
     possession_cfg = events_cfg["possession"]
+    kit_colour_cfg = events_cfg["kit_colour"]
     min_emit = events_cfg["confidence"]["min_emit_confidence"]
     tracks_by_id = {tr.id: tr for tr in tracks}
+    # Owner spec ("Implement event cooldown/state logic... FPS-aware") + measured real bug: on
+    # clip1_43, adjacent possession-run pairs fired 9 PASS events in an 11s clip, 0.1-0.4s apart --
+    # runs fragment easily (possession.possession_min_duration_s=0.3s), and nothing previously
+    # stopped the SAME passer identity being credited with a second "pass" a fraction of a second
+    # after the first. Compared in real SECONDS against run timestamps, so this is FPS-independent
+    # by construction, identical reasoning to touch.touch_min_gap_s.
+    last_pass_t: dict[int, float] = {}
 
     events: list[Event] = []
     for run_a, run_b in zip(runs, runs[1:], strict=False):
@@ -367,6 +409,12 @@ def detect_passes(
                 drops.drop("pass_gap_too_large")
             continue
 
+        last_t = last_pass_t.get(run_a.identity)
+        if last_t is not None and (run_a.t_end - last_t) < pass_cfg["pass_min_gap_s"]:
+            if drops is not None:
+                drops.drop("pass_debounced")
+            continue
+
         travel = _ball_travel(run_a, run_b)
         if travel > pass_cfg["pass_max_dist"]:
             if drops is not None:
@@ -376,7 +424,9 @@ def detect_passes(
         raw_a = run_a.samples[-1][1]
         raw_b = run_b.samples[0][1]
         team_threshold = pass_cfg["team_confidence_threshold"]
-        teammates = teammates_gate(raw_a, raw_b, tracks_by_id, team_threshold)
+        teammates = teammates_test(
+            raw_a, raw_b, tracks_by_id, team_threshold, kit_colour_cfg, kit_lab_by_track_id
+        )
         if teammates is None:
             if drops is not None:
                 drops.drop("pass_team_confidence_too_low")
@@ -403,6 +453,7 @@ def detect_passes(
                 if drops is not None:
                     drops.drop("pass_below_min_emit_confidence")
                 continue
+            last_pass_t[run_a.identity] = run_a.t_end
             events.append(
                 Event(
                     id=str(uuid.uuid4()),

@@ -387,3 +387,159 @@ def test_compute_distance_covered_unknown_track_id_contributes_nothing():
     result = possession.compute_distance_covered([999], [track], cfg)
     assert result["distance"] == 0.0
     assert result["n_speed_samples"] == 0
+
+
+# ---------------------------------------------------------------------------
+# pass_min_gap_s debounce -- real bug fix, measured 2026-09-02 on clip1_43: 9 PASS events fired
+# in an 11s clip, 0.1-0.4s apart, for the same passer identity.
+# ---------------------------------------------------------------------------
+
+
+def test_detect_passes_debounces_rapid_repeats_for_the_same_passer():
+    """Player 1 passes to 2 at t=0.2 (passer=1), then immediately regains the ball and 'passes'
+    again to 3 at t=0.4 (would-be passer=1 again, gap=0.1s -- well under pass_min_gap_s=1.0). Real
+    bug this closes, measured 2026-09-02 on clip1_43: exactly this pattern fired 9 PASS events in
+    an 11s clip. Only the FIRST pass by player 1 may count."""
+    cfg = _events_config()
+    p1 = _player(
+        1,
+        take_id=0,
+        boxes=[_box(0.0, 100.0, 100.0), _box(0.3, 100.0, 100.0)],
+        team=0,
+        team_confidence=0.9,
+    )
+    p2 = _player(2, take_id=0, boxes=[_box(0.2, 200.0, 100.0)], team=0, team_confidence=0.9)
+    p3 = _player(3, take_id=0, boxes=[_box(0.4, 300.0, 100.0)], team=0, team_confidence=0.9)
+    balls = [
+        _ball(0.0, 100.0, 100.0),
+        _ball(0.2, 200.0, 100.0),
+        _ball(0.3, 100.0, 100.0),
+        _ball(0.4, 300.0, 100.0),
+    ]
+    runs = possession.possession_runs_for_take(balls, [p1, p2, p3], cfg)
+    events = possession.detect_passes(runs, [p1, p2, p3], take_id=0, events_cfg=cfg)
+    passes_by_1 = [e for e in events if e.type == EventType.PASS and e.player_track_id == 1]
+    assert len(passes_by_1) == 1, "the second rapid-fire pass by the same player must be debounced"
+    assert passes_by_1[0].t_end == pytest.approx(0.2)
+
+
+def test_detect_passes_allows_a_second_pass_after_the_debounce_window():
+    """The SAME fixture, but the second sequence happens well after pass_min_gap_s -- both of
+    player 1's passes must count as genuinely separate."""
+    cfg = _events_config()
+    p1 = _player(
+        1,
+        take_id=0,
+        boxes=[_box(0.0, 100.0, 100.0), _box(5.0, 100.0, 100.0)],
+        team=0,
+        team_confidence=0.9,
+    )
+    p2 = _player(2, take_id=0, boxes=[_box(0.2, 200.0, 100.0)], team=0, team_confidence=0.9)
+    p3 = _player(3, take_id=0, boxes=[_box(5.2, 300.0, 100.0)], team=0, team_confidence=0.9)
+    balls = [
+        _ball(0.0, 100.0, 100.0),
+        _ball(0.2, 200.0, 100.0),
+        _ball(5.0, 100.0, 100.0),
+        _ball(5.2, 300.0, 100.0),
+    ]
+    runs = possession.possession_runs_for_take(balls, [p1, p2, p3], cfg)
+    events = possession.detect_passes(runs, [p1, p2, p3], take_id=0, events_cfg=cfg)
+    passes_by_1 = [e for e in events if e.type == EventType.PASS and e.player_track_id == 1]
+    assert len(passes_by_1) == 2
+
+
+def test_detect_passes_debounce_is_per_passer_not_global():
+    """A debounced passer must not suppress an UNRELATED passer's own genuine pass at a nearby
+    time -- the gap is tracked per identity, never globally."""
+    cfg = _events_config()
+    p1 = _player(
+        1,
+        take_id=0,
+        boxes=[_box(0.0, 100.0, 100.0), _box(0.3, 100.0, 100.0)],
+        team=0,
+        team_confidence=0.9,
+    )
+    p2 = _player(2, take_id=0, boxes=[_box(0.2, 200.0, 100.0)], team=0, team_confidence=0.9)
+    p3 = _player(3, take_id=0, boxes=[_box(0.4, 300.0, 100.0)], team=0, team_confidence=0.9)
+    # A second, entirely independent passer/receiver pair, well OUTSIDE the first sequence's own
+    # time range -- detect_passes pairs run ADJACENCY across the take's full merged timeline
+    # (unaffected by this fix), so an overlapping-time pair would interleave with player 1's own
+    # runs rather than forming its own independent adjacent pair; separating them in time isolates
+    # exactly the property under test (debounce state is keyed per identity, never shared).
+    p4 = _player(4, take_id=0, boxes=[_box(10.0, 900.0, 900.0)], team=0, team_confidence=0.9)
+    p5 = _player(5, take_id=0, boxes=[_box(10.2, 1000.0, 900.0)], team=0, team_confidence=0.9)
+    balls = [
+        _ball(0.0, 100.0, 100.0),
+        _ball(0.2, 200.0, 100.0),
+        _ball(0.3, 100.0, 100.0),
+        _ball(0.4, 300.0, 100.0),
+        _ball(10.0, 900.0, 900.0),
+        _ball(10.2, 1000.0, 900.0),
+    ]
+    runs = possession.possession_runs_for_take(balls, [p1, p2, p3, p4, p5], cfg)
+    events = possession.detect_passes(runs, [p1, p2, p3, p4, p5], take_id=0, events_cfg=cfg)
+    passers = {e.player_track_id for e in events if e.type == EventType.PASS}
+    assert (
+        4 in passers
+    ), "player 4's own independent pass must not be suppressed by player 1's debounce"
+
+
+# ---------------------------------------------------------------------------
+# teammates_test -- kit-colour-first cascade (Stage 5, owner request: "also add the player jersy
+# color for passes and assist")
+# ---------------------------------------------------------------------------
+
+
+def test_teammates_test_kit_colour_overrides_a_degenerate_team_cluster():
+    """The exact real failure this fixes: team_confidence reads as a useless constant (measured
+    0.30 on 229/231 real tracks), so the cluster gate alone always returns None. Kit colour must
+    be able to resolve the pass anyway when it's confidently measured."""
+    import numpy as np
+
+    cfg = _events_config()
+    tracks_by_id = {
+        1: _player(1, 0, [_box(0.0, 0, 0)], team=1, team_confidence=0.30),
+        2: _player(2, 0, [_box(0.0, 0, 0)], team=1, team_confidence=0.30),
+    }
+    kit_lab = {
+        1: np.array([44.9, 7.5, -24.0]),
+        2: np.array([47.2, 6.0, -22.0]),
+    }  # both blue, dE=3.4
+    result = possession.teammates_test(
+        1, 2, tracks_by_id, cfg["pass"]["team_confidence_threshold"], cfg["kit_colour"], kit_lab
+    )
+    assert result is True
+
+
+def test_teammates_test_falls_back_to_cluster_when_colour_undecided():
+    """When kit colour itself lands in the undecided gray zone, fall through to the existing
+    cluster gate rather than guessing."""
+    import numpy as np
+
+    cfg = _events_config()
+    tracks_by_id = {
+        1: _player(1, 0, [_box(0.0, 0, 0)], team=0, team_confidence=0.9),
+        2: _player(2, 0, [_box(0.0, 0, 0)], team=0, team_confidence=0.9),
+    }
+    # dE=13.0, inside the measured undecided gap (8.0-24.0)
+    kit_lab = {1: np.array([47.2, 6.0, -22.0]), 2: np.array([47.5, 6.5, -9.0])}
+    result = possession.teammates_test(
+        1, 2, tracks_by_id, cfg["pass"]["team_confidence_threshold"], cfg["kit_colour"], kit_lab
+    )
+    assert result is True  # resolved by the (confident) cluster gate instead
+
+
+def test_teammates_test_none_kit_lab_dict_is_exactly_the_old_cluster_only_behaviour():
+    """Backward compatibility: a caller passing kit_lab_by_track_id=None (the default -- no
+    per-take colour sampling done yet) must get precisely the pre-existing cluster-only gate."""
+    cfg = _events_config()
+    tracks_by_id = {
+        1: _player(1, 0, [_box(0.0, 0, 0)], team=1, team_confidence=0.30),
+        2: _player(2, 0, [_box(0.0, 0, 0)], team=1, team_confidence=0.30),
+    }
+    result = possession.teammates_test(
+        1, 2, tracks_by_id, cfg["pass"]["team_confidence_threshold"], cfg["kit_colour"], None
+    )
+    assert (
+        result is None
+    )  # low team_confidence, no colour data supplied -> can't tell, same as before
