@@ -7,6 +7,23 @@
 # calibration ADR-3 describes). Every speed figure below is therefore in a NORMALISED PIXEL unit
 # we define ourselves, never m/s (Golden Rule 5) — see `sprint.unit`/`shot.unit` comments.
 
+ball:
+  # Stage 1 of the evidence-based event redesign (owner spec, 2026-09-02): the ball trajectory
+  # state series every detector below consumes (src/events/ball_track.py). Not a new detector --
+  # smooths/compensates the SAME Stage 2 ball_detections.parquet already produced.
+  min_conf_for_state: 0.3 # identical value/reasoning to touch.min_ball_conf/possession.min_ball_conf
+  # below (kept independently named per-consumer, same pattern as those two) -- a sample below this
+  # is dropped from the state series entirely (a hole, never a low-confidence BallState object).
+  smoothing_window_frames: 3 # identical value/reasoning to shot.smoothing_window_frames -- same
+  # "ball moves faster/more erratically than a player, shorter window than sprint's 5" logic,
+  # applied here to the full 2D position series rather than just a 1D speed scalar.
+  max_gap_bridge_s: 0.5 # a gap between two CONFIDENT ball samples wider than this breaks velocity
+  # computation across it (emits known=False right after) -- Stage 2's own
+  # configs/detect.yaml: ball_interpolation.max_gap_frames already declined to bridge a gap this
+  # wide with a real interpolated position, so this module must not manufacture a velocity across
+  # a hole Stage 2 itself found too large to trust (owner: "do NOT immediately create a
+  # touch/pass/shot/goal because the ball disappeared").
+
 sprint:
   # unit = "bbox-heights per second": a track's smoothed centroid displacement (px) / dt, divided
   # by the mean bbox height of the two boxes being diffed. This self-scales with the player's own
