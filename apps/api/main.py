@@ -112,6 +112,7 @@ def get_health():
     gpu_name = "CPU Only"
     try:
         import torch
+
         cuda_available = torch.cuda.is_available()
         if cuda_available:
             gpu_name = torch.cuda.get_device_name(0)
@@ -135,19 +136,23 @@ def list_videos():
     if INPUT_DIR.exists():
         for p in INPUT_DIR.glob("*"):
             if p.is_file() and p.suffix.lower() in video_extensions:
-                input_videos.append({
-                    "name": p.name,
-                    "size_mb": round(p.stat().st_size / (1024 * 1024), 2),
-                    "modified": time.ctime(p.stat().st_mtime),
-                })
+                input_videos.append(
+                    {
+                        "name": p.name,
+                        "size_mb": round(p.stat().st_size / (1024 * 1024), 2),
+                        "modified": time.ctime(p.stat().st_mtime),
+                    }
+                )
             elif p.is_dir():
                 for sub in p.glob("*"):
                     if sub.is_file() and sub.suffix.lower() in video_extensions:
-                        input_videos.append({
-                            "name": f"{p.name}/{sub.name}",
-                            "size_mb": round(sub.stat().st_size / (1024 * 1024), 2),
-                            "modified": time.ctime(sub.stat().st_mtime),
-                        })
+                        input_videos.append(
+                            {
+                                "name": f"{p.name}/{sub.name}",
+                                "size_mb": round(sub.stat().st_size / (1024 * 1024), 2),
+                                "modified": time.ctime(sub.stat().st_mtime),
+                            }
+                        )
 
     outputs = []
     if OUTPUT_DIR.exists():
@@ -157,11 +162,13 @@ def list_videos():
                 has_annotated = annotated_video.exists()
                 players_glob = (p / "players").glob("player_*")
                 players = [d.name for d in players_glob] if (p / "players").exists() else []
-                outputs.append({
-                    "slug": p.name,
-                    "has_annotated_video": has_annotated,
-                    "players": players,
-                })
+                outputs.append(
+                    {
+                        "slug": p.name,
+                        "has_annotated_video": has_annotated,
+                        "players": players,
+                    }
+                )
 
     return {
         "input_videos": input_videos,
@@ -276,6 +283,15 @@ def get_frame_players(video: str, t: float = 0.0, read_jersey: bool = False):
     all_tracks = load_models_parquet(work_dir / "track" / "tracks.parquet", Track)
     take_tracks = [tr for tr in all_tracks if tr.take_id == take_id]
 
+    # `motion` left at its default `None` (2026-09-03): this endpoint only runs Stage 3 tracking
+    # (`run_track_stage` above) -- it has no `TakeCameraMotion` to pass, and estimating one just
+    # for this request would mean a fresh per-take decode + optical-flow pass
+    # (`src.track.camera_motion.estimate_take_camera_motion`) inside what is otherwise a cheap,
+    # cache-backed read endpoint the picker UI calls interactively. That is exactly the "expensive
+    # new motion estimation at a call site that doesn't have it" this fix was told not to add, so
+    # this stays an honest, documented gap: the chain ids this endpoint hands the click-picker UI
+    # can still mis-stitch during a fast pan, the same failure this fix closes everywhere motion
+    # IS already available.
     identity_of, identity_conf = build_take_identities(
         take_tracks, configs["highlights"]["selection"]
     )
@@ -506,8 +522,10 @@ def _run_pipeline_job(
         has_explicit_selection = bool(track_id) or (click_x is not None and click_y is not None)
 
         if has_explicit_selection:
-            job["logs"].append("Explicit player selection given -- routing to the auto-detect "
-                                "pipeline for that player (sidecar, if any, is not used).")
+            job["logs"].append(
+                "Explicit player selection given -- routing to the auto-detect "
+                "pipeline for that player (sidecar, if any, is not used)."
+            )
             overrides: dict[int, int] = {}
             if track_id:
                 overrides.update(parse_track_id_overrides(track_id))
@@ -549,7 +567,7 @@ def _run_pipeline_job(
                     job["error"] = (
                         "Your click did not land on a detected player near that moment (or the "
                         "video was paused before any player was visible). Refusing to silently "
-                        "fall back to an unrelated auto-selected target. Use \"Load Players\" to "
+                        'fall back to an unrelated auto-selected target. Use "Load Players" to '
                         "see real detected boxes and click one directly, or pick a moment where "
                         "the target player is clearly on screen."
                     )
@@ -576,6 +594,7 @@ def _run_pipeline_job(
             )
         else:
             import re
+
             pattern = re.compile(configs["run"]["filename_convention_regex"])
             _, parsed_jersey = parse_filename(video_path.stem, pattern)
             effective_jersey = target_jersey if target_jersey is not None else parsed_jersey
@@ -626,7 +645,9 @@ def process_video(req: ProcessRequest, background_tasks: BackgroundTasks):
         "progress": 0,
         "logs": [],
         "created_at": time.time(),
-        "slug": req.video_name.replace(".mp4", "").replace(".avi", "").replace(".mov", "")
+        "slug": req.video_name.replace(".mp4", "")
+        .replace(".avi", "")
+        .replace(".mov", "")
         .replace(" ", "_"),
     }
 
@@ -792,11 +813,13 @@ def parse_statcard_markdown(md_text: str, jersey_num: int | None) -> dict[str, A
         elif line.startswith("|") and not line.startswith("| Time") and not line.startswith("|---"):
             parts = [p.strip() for p in line.split("|") if p.strip()]
             if len(parts) >= 3:
-                res["events"].append({
-                    "time": parts[0],
-                    "event": parts[1],
-                    "confidence": float(parts[2]) if _is_float(parts[2]) else 0.90,
-                })
+                res["events"].append(
+                    {
+                        "time": parts[0],
+                        "event": parts[1],
+                        "confidence": float(parts[2]) if _is_float(parts[2]) else 0.90,
+                    }
+                )
     return res
 
 
@@ -814,8 +837,6 @@ def _is_float(val: str) -> bool:
         return True
     except ValueError:
         return False
-
-
 
 
 def _safe_resolve_under(root: Path, path: str) -> Path | None:
@@ -857,4 +878,5 @@ if WEB_DIR.exists():
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("apps.api.main:app", host="0.0.0.0", port=8000, reload=True)

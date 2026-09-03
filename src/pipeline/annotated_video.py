@@ -804,6 +804,17 @@ def render_full_annotated_video(
     # NOT a full fix on its own: 80 chains is still ~5x the real head-count, so a label can still
     # change when the stitcher itself loses a player -- honest partial improvement, not a claim of
     # perfect identity (Golden Rule 5).
+    # `motion` left at its default `None` here (2026-09-03): `render_full_annotated_video` has no
+    # `TakeCameraMotion` parameter of its own, and none of its three callers (`src.pipeline.run`,
+    # `extended_output`, `manual_events`) currently pass one down to it either -- even though
+    # `run.py` DOES compute a `camera_motion_by_take` earlier in the same function (for its own
+    # `select_targets` call), threading it all the way through this render function's signature is
+    # new plumbing beyond this fix's scope ("only pass motion where a model genuinely exists at
+    # THIS call site"), not a case of an already-available model sitting unused right here. Left
+    # for a follow-up: without it, a fast pan can still relabel this DISPLAY-only stitching (every
+    # non-target player's green-box id) the same way it used to affect the target's own chain,
+    # though a wrong display label here never touches the red target box or any stat (those are
+    # driven by `identity_by_take`/`events_by_number`, computed elsewhere).
     display_identity_by_take: dict[int, dict[int, int]] = {}
     if selection_cfg is not None:
         for take_id_key, take_track_list in tracks_by_take.items():

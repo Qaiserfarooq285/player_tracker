@@ -1,0 +1,142 @@
+# Stage 1/2 of the "streamed-gathering-treehouse" plan (strict persistent target identity, see
+# /home/qaiserfarooq/.claude/plans/streamed-gathering-treehouse.md) -- the persistent `TargetProfile`
+# object (`src/track/target.py`) + its verification thresholds (`src/track/target_verify.py`).
+#
+# ⚠️ Read this whole file before trusting any number in it. Several thresholds below are lifted
+# DIRECTLY from the owner's own spec as WORKED EXAMPLES, not measured on this project's own
+# footage -- they are marked "⚠️ REASONED-BUT-UNMEASURED" or "⚠️ FROM THE OWNER'S SPEC AS AN
+# EXAMPLE", same epistemic-honesty discipline as `configs/highlights.yaml:
+# click_reid.min_height_ratio`. The plan's own Stage 10 is what validates these against real
+# accept/reject pairs; do not read a comment here as claiming a measurement that hasn't happened.
+
+bands:
+  # Vertical sub-regions of a player's full-body bbox, used by `src.track.target.sample_kit_bands`
+  # to sample kit colour per body part (torso/shorts/socks) rather than the single upper-torso
+  # region `src.identity.jersey_parseq.number_region`/`src.events.kit_colour.kit_lab_sample`
+  # already use for jersey-number reading. `torso`'s own insets are lifted VERBATIM from
+  # `configs/identity.yaml: parseq_soccernet.number_crop` (left/right/top_inset_frac, bottom_frac)
+  # -- not re-measured, since ADR-21 already proved that exact rectangle isolates the shirt from
+  # limbs/background on real footage, and there is no reason a torso-colour sample needs a
+  # different rectangle than a torso-number sample. `shorts`/`socks` extend downward from where
+  # `torso` ends; all of their own fractions are ⚠️ REASONED-BUT-UNMEASURED -- a plain
+  # anatomically-reasoned split of a standing player's own silhouette, not fit against real crops
+  # on this project's footage yet. Revisit once real band samples exist to check the split by eye.
+  torso:
+    left_inset_frac: 0.15
+    right_inset_frac: 0.15
+    top_frac: 0.12
+    bottom_frac: 0.45
+  shorts:
+    left_inset_frac: 0.12 # slightly less trim than torso -- shorts read wider across the frame
+    # than the narrow printed-number column a shirt crop is centred on. ⚠️ REASONED-BUT-UNMEASURED.
+    right_inset_frac: 0.12
+    top_frac: 0.45 # picks up exactly where the torso band's own bottom_frac ends
+    bottom_frac: 0.68
+  socks:
+    left_inset_frac: 0.10
+    right_inset_frac: 0.10
+    top_frac: 0.82 # deliberately skips the 0.68-0.82 band (bare shin/knee -- no fabric colour to
+    # read there at all) rather than sampling skin as if it were kit.
+    bottom_frac: 0.98 # stop just short of the box's own bottom edge (boots/ground shadow/turf).
+
+kit_colour:
+  # Grass-suppression floors for `sample_kit_bands`'s three region reads -- the SAME underlying
+  # pixel classification (`src.events.kit_colour._grass_mask`) `kit_lab_sample` already uses,
+  # applied to a different vertical slice of the same player box, not a new measurement. Values
+  # copied VERBATIM from `configs/events.yaml: kit_colour.min_kept_pixels`/`min_kept_pixel_frac`
+  # (measured 2026-09-02, see that file's own comment) and duplicated here rather than
+  # cross-imported, per this project's established per-config-file-independence convention (see
+  # e.g. `configs/events.yaml: touch.match_tolerance_s`'s own comment for the precedent).
+  #
+  # NOTE, deliberately NOT duplicated here: `same_team_max_dist`/`diff_team_min_dist`.
+  # `src/track/target_verify.py::verify_candidate` reads those two directly from
+  # `configs/events.yaml: kit_colour` at call time (the caller is expected to pass that dict in as
+  # `cfg["kit_colour"]`) rather than this file carrying a second, driftable copy of a live,
+  # re-measurable team/opponent calibration -- see that module's own docstring.
+  min_kept_pixels: 20
+  min_kept_pixel_frac: 0.15
+
+band_confidence_weights:
+  # How much each band contributes to a `KitColourSample`'s own `confidence`
+  # (`src.track.target.sample_kit_bands`: sum of the weights of every band that actually cleared
+  # the grass-suppression floor above). Torso dominates -- it is the least occluded/least
+  # foreshortened band on a standing or running player, it is the one band ADR-21 already proved
+  # reads cleanly on real footage, and it is the band `target_verify.py`'s own hard-reject step
+  # treats as decisive (see that module's docstring for why "torso dominates" there too).
+  # ⚠️ REASONED-BUT-UNMEASURED split, not fit against real accept/reject data.
+  torso: 0.5
+  shorts: 0.25
+  socks: 0.25
+
+memory_update_min_confidence: 0.75 # ⚠️ FROM THE OWNER'S SPEC AS A WORKED EXAMPLE, NOT YET
+# MEASURED on this project's own footage (same epistemic status as strong_match/uncertain_low
+# below). The anti-drift floor (plan §4): `update_memory_bank` only appends a new kit sample to the
+# profile's memory bank when the link that produced it was itself accepted at >= this confidence --
+# an UNCERTAIN or low-confidence link must NEVER be allowed to teach the profile a new colour,
+# which is the exact mechanism that let "occlusion -> follows #7 -> learns #7 -> permanently
+# believes #7 is #11" happen before this plan. Set equal to `uncertain_low` below on purpose: in
+# practice only an ACCEPT verdict (>= strong_match) or a manual click-confirmed link should ever
+# clear this bar, since `uncertain_low` is `verify_candidate`'s own accept/uncertain boundary and
+# an UNCERTAIN verdict must never write to the bank either (plan §5, "UNCERTAIN keeps the target
+# LOST"). Kept as an independently-named key rather than a cross-reference so this floor stays
+# separately tunable. Plan Stage 10 validates this against real accepted/rejected links.
+max_bank_samples: 20 # ⚠️ REASONED-BUT-UNMEASURED. Bounds the memory bank to a fixed, small number
+# of the most recent accepted samples (median-aggregated by `_aggregate_kit`) so a profile's kit
+# colour can slowly track real changes (different lighting/venue across a multi-take compilation,
+# CLAUDE.md §3.2's clip4) without growing unbounded over a 90-minute match. 20 is a round,
+# conservative starting cap; revisit once real bank-growth-vs-drift behaviour has been observed on
+# an actual run.
+
+min_height_ratio: 0.60 # SAME value as `configs/highlights.yaml: click_reid.min_height_ratio` --
+# identical reasoning (a scale-invariant min/max box-height ratio floor: tolerate normal
+# camera-distance/depth change between two sightings of the SAME player while still rejecting an
+# obviously differently-sized person), duplicated here rather than cross-imported per this
+# project's own per-config-file-independence convention. Still ⚠️ REASONED-BUT-UNMEASURED on a
+# real labeled slice -- see that config's own comment for the full reasoning and revisit trigger.
+
+scoring:
+  # Stage 2 (`verify_candidate`) scoring weights -- consulted ONLY after all three hard-reject
+  # checks (kit colour / jersey / height) have already passed. This ordering is the whole point of
+  # the plan's Stage 2 (spec §5): a high blended score must never be allowed to override a
+  # contradictory hard signal, so these weights never even get evaluated against a candidate that
+  # already failed a hard reject. ⚠️ EXAMPLE WEIGHTS, NOT YET MEASURED against real accept/reject
+  # outcomes on this project's own footage -- plan Stage 10 validates/re-tunes these.
+  weights:
+    kit_colour: 0.40 # dominant soft signal -- mirrors the same "colour is the PRIMARY
+    # teammate/opponent signal" choice already made for pass/assist attribution
+    # (configs/events.yaml: kit_colour's own module-level docstring).
+    jersey: 0.30 # strong corroboration when available, but frequently MISSING on real footage
+    # (absence of a read is not evidence of a different player -- see verify_candidate's own
+    # docstring) -- weighted below colour so a take with no legible numbers doesn't structurally
+    # cap every candidate's score at a lower ceiling.
+    height: 0.15
+    trajectory: 0.15 # continuity of the candidate's own first-seen position relative to wherever
+    # the profile was last confidently located -- the weakest signal (a camera cut/pan can
+    # legitimately move "the same player" a long way in pixel space, ADR-11), kept as a minor
+    # tiebreaker only.
+
+strong_match: 0.90 # ⚠️ FROM THE OWNER'S SPEC AS A WORKED EXAMPLE VALUE -- NOT measured on this
+# project's own footage yet. Plan Stage 10 validates this against real accept/reject pairs (e.g.
+# `chelsea_burnley_target10`'s blue #10 vs claret #21) and this comment must be updated with the
+# actual result at that point. Do not read this as a calibrated threshold until that has happened.
+uncertain_low: 0.75 # same caveat as `strong_match` immediately above -- an EXAMPLE value from the
+# owner's spec, not measured. A verdict scoring in [uncertain_low, strong_match) is UNCERTAIN,
+# which per plan §5/Stage 2 means the target STAYS LOST -- an UNCERTAIN verdict is never a weak
+# ACCEPT -- until Stage 10's real validation either confirms or replaces these two numbers.
+
+trajectory:
+  # Continuity scoring for the `trajectory` weight above. `verify_candidate` looks at the LAST
+  # entry in `profile.links` for a `last_cx`/`last_cy`/`last_bbox_height` triple in that link's own
+  # `evidence` dict (a future pipeline-wiring stage, out of this plan's Stage 1/2 scope, is
+  # responsible for actually populating those keys when it appends a link) and, when present,
+  # converts the pixel distance to the candidate's own first box into a smooth [0,1] score via
+  # `max(0, 1 - dist_bbox_heights / max_plausible_bbox_heights)` -- same scale-invariant
+  # bbox-heights unit as `configs/highlights.yaml: selection.stitch_max_dist`. No evidence at all
+  # (first link, or a link that never recorded a position) scores a neutral 0.5, same "absence is
+  # not evidence" treatment as the jersey/height fallbacks. ⚠️ REASONED-BUT-UNMEASURED --
+  # `max_plausible_bbox_heights` is set at DOUBLE `configs/highlights.yaml:
+  # selection.stitch_max_dist`=3.0, deliberately more permissive than that within-take-only join
+  # bound, since Stage 2 candidates can legitimately come from ACROSS a take boundary / camera cut
+  # (unlike `stitch_timeline`'s own within-take-only join), where a much bigger apparent pixel jump
+  # is expected and should not by itself crater the score.
+  max_plausible_bbox_heights: 6.0

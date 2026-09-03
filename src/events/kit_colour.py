@@ -58,23 +58,25 @@ def _grass_mask(crop_bgr: np.ndarray) -> np.ndarray:
     return (hsv[:, 0] >= _GRASS_H_LO) & (hsv[:, 0] <= _GRASS_H_HI) & (hsv[:, 1] >= _GRASS_S_MIN)
 
 
-def kit_lab_sample(
-    frame_bgr: np.ndarray, bbox: BBox, number_crop_cfg: dict, kit_colour_cfg: dict
+def lab_median_from_region(
+    frame_bgr: np.ndarray, x1: int, y1: int, x2: int, y2: int, kit_colour_cfg: dict
 ) -> tuple[np.ndarray, float] | None:
-    """`(true_cielab, kept_fraction)` for ONE player box in ONE frame, or `None` when too few
-    non-grass pixels survive to trust the sample at all (`kit_colour_cfg['min_kept_pixel_frac']`)
-    -- an honest "no colour evidence this frame", never a guess from mostly-background pixels.
+    """`(true_cielab, kept_fraction)` for one already-computed pixel rectangle in `frame_bgr`, or
+    `None` when the rectangle is degenerate or too few non-grass pixels survive to trust the
+    sample at all (`kit_colour_cfg['min_kept_pixel_frac']`) -- an honest "no colour evidence this
+    frame", never a guess from mostly-background pixels.
 
-    Reuses the ADR-21 `number_region` geometry (upper-torso, already proven to isolate the shirt
-    from limbs/background for jersey-number reading) rather than the wider ADR-12 torso band --
-    the tighter crop starts with less grass to suppress in the first place.
+    Factored out of `kit_lab_sample` (streamed-gathering-treehouse plan, Stage 1:
+    `src.track.target.sample_kit_bands` needs the SAME grass-suppression + CIELAB-median
+    arithmetic applied to three different vertical bands of a player box -- torso/shorts/socks --
+    not just the single ADR-21 number-region band `kit_lab_sample` itself uses) so both call sites
+    share one implementation instead of two copies of the grass-mask/median logic drifting apart.
+    `kit_lab_sample`'s own behaviour is unchanged by this refactor -- it now just computes its
+    region rectangle first and delegates the pixel arithmetic here.
     """
     from src.annotations.associate import opencv_lab_to_cielab
 
     h, w = frame_bgr.shape[:2]
-    x1, y1, x2, y2 = number_region(
-        int(bbox.x1), int(bbox.y1), int(bbox.x2), int(bbox.y2), number_crop_cfg
-    )
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
     if x2 - x1 < 3 or y2 - y1 < 3:
@@ -94,6 +96,23 @@ def kit_lab_sample(
     kept_pixels = pixels[keep].reshape(-1, 1, 3)
     lab = cv2.cvtColor(kept_pixels, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float64)
     return opencv_lab_to_cielab(np.median(lab, axis=0)), kept_frac
+
+
+def kit_lab_sample(
+    frame_bgr: np.ndarray, bbox: BBox, number_crop_cfg: dict, kit_colour_cfg: dict
+) -> tuple[np.ndarray, float] | None:
+    """`(true_cielab, kept_fraction)` for ONE player box in ONE frame, or `None` when too few
+    non-grass pixels survive to trust the sample at all (`kit_colour_cfg['min_kept_pixel_frac']`)
+    -- an honest "no colour evidence this frame", never a guess from mostly-background pixels.
+
+    Reuses the ADR-21 `number_region` geometry (upper-torso, already proven to isolate the shirt
+    from limbs/background for jersey-number reading) rather than the wider ADR-12 torso band --
+    the tighter crop starts with less grass to suppress in the first place.
+    """
+    x1, y1, x2, y2 = number_region(
+        int(bbox.x1), int(bbox.y1), int(bbox.x2), int(bbox.y2), number_crop_cfg
+    )
+    return lab_median_from_region(frame_bgr, x1, y1, x2, y2, kit_colour_cfg)
 
 
 def median_kit_lab(samples: list[np.ndarray]) -> np.ndarray | None:

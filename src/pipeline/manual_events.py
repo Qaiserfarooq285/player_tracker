@@ -215,6 +215,14 @@ def build_manual_identity_by_take(
             # `identity_of` is `{}` whenever `selection_cfg` is unavailable -- see docstring -- and
             # the lock logic below is a no-op in that case (falls through to independent search
             # always).
+            # `motion` left at its default `None` (2026-09-03): manual-mode's own pipeline
+            # (`src.pipeline.manual_events`) never estimates a `TakeCameraMotion` -- only
+            # `src.pipeline.run`'s auto flow does, for its own `select_targets` call. Adding a
+            # fresh estimate here for this call alone would be new per-take decode + optical-flow
+            # work this entrypoint doesn't already do, which the fix this comment documents
+            # explicitly avoids ("do not add expensive new motion estimation to a call site that
+            # doesn't have it"). A real camera pan during manual-mode association therefore still
+            # measures in raw image space -- an honest, documented gap, not a silent one.
             identity_of: dict[int, int] = {}
             if selection_cfg:
                 identity_of, _identity_confidence = build_take_identities(

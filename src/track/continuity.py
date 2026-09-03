@@ -97,10 +97,16 @@ def extend_chain_forward(
 
     Join rule, identical to the original `src.highlights.selection.stitch_timeline`: a candidate
     is eligible when (a) the time gap between the chain's current last box and the candidate's
-    first box is under `stitch_max_gap_s`, AND (b) the spatial jump between those two boxes
-    (bbox-heights, `_spatial_jump`) is under `stitch_max_dist`. Among all eligible candidates the
-    one with the SMALLEST spatial jump wins; team agreement (`_team_agrees`) only breaks an exact
-    tie -- never a hard filter (ADR-12).
+    first box is under `stitch_max_gap_s` and STRICTLY POSITIVE (a zero gap is rejected outright,
+    never treated as "instantaneous reappearance" -- see the `gap == 0` comment in the loop below),
+    (b) the spatial jump between those two boxes (bbox-heights, `_spatial_jump`) is under
+    `stitch_max_dist`, AND (c) that jump does not imply a physically-implausible speed
+    (`stitch_max_speed_bbox_heights_per_s`, gap-normalised). Among all eligible candidates the one
+    with the SMALLEST spatial jump wins; team agreement (`_team_agrees`) only breaks an exact tie
+    -- never a hard filter (ADR-12). A candidate whose own lifespan overlaps in TIME with any
+    fragment already accepted into this chain is never eligible either, regardless of gap/distance
+    -- two different fragments cannot both be the one physical player on screen at once (same
+    guard as `src.track.click_reid.extend_chain_with_profile`, reused rather than reinvented).
 
     Returns `[]` when `seed_track_id` isn't in `pool` or is already `used` (nothing to extend);
     otherwise returns the ordered chain (seed first) as `Track` objects, not bare ids, so callers
@@ -118,6 +124,11 @@ def extend_chain_forward(
 
     chain: list[Track] = [pool[seed_track_id]]
     used.add(seed_track_id)
+    # Every accepted fragment's OWN [t_start, t_end] span, so a later candidate can be checked
+    # against the chain's FULL history, not just its most-recently-appended member -- mirrors
+    # `src.track.click_reid.extend_chain_with_profile`'s own `accepted_spans` (see the overlap
+    # guard below).
+    accepted_spans: list[tuple[float, float]] = [(chain[0].t_start, chain[0].t_end)]
 
     while True:
         current = chain[-1]
@@ -133,8 +144,37 @@ def extend_chain_forward(
             gap = cand.boxes[0].t - current_end_t
             if gap < 0 or gap >= max_gap_s:
                 continue
+            # Span-overlap guard (2026-09-03), reusing `click_reid.extend_chain_with_profile`'s own
+            # rule (`src/track/click_reid.py:328-338`) rather than inventing a second one: a
+            # fragment whose OWN [t_start, t_end] span overlaps ANY already-accepted chain member
+            # -- not just `current`, the most recently appended one -- can never be a valid
+            # continuation. Two fragments alive at the same instant are two different physical
+            # people, however small the candidate's gap/distance to `current` looks; picking one
+            # would be a silent, unjustified merge (Golden Rule 5). In the ordinary case (each
+            # track's own boxes chronologically sorted, which is how the tracker builds them) this
+            # is already implied by the `gap >= 0` check above against a monotonically-advancing
+            # `current`, but it is cheap to assert directly rather than lean on that invariant
+            # holding for every fragment upstream.
+            if any(cand.t_start < end and start < cand.t_end for start, end in accepted_spans):
+                continue
             dist = _spatial_jump(current, cand.boxes[0], motion)
             if dist >= max_dist:
+                continue
+            # Zero-gap rejection (2026-09-03). `cand` is, by construction, a DIFFERENT raw track
+            # from `current` (the loop only ever considers `cand_id not in used`, and `current` is
+            # already claimed). A candidate whose FIRST box lands at the exact same timestamp as
+            # `current`'s LAST box is therefore two independent tracker fragments both reporting a
+            # detection at the SAME sampled instant -- not "the same player reappearing after a
+            # gap" at all, since there was no gap for anyone to disappear into. Joining them would
+            # assert one physical player occupied two simultaneous detections up to `max_dist`
+            # (3.0) bbox-heights apart, which is impossible regardless of distance -- and dividing
+            # by a zero gap to run the speed gate below would be a ZeroDivisionError, not a
+            # near-miss. Detection runs on a fixed grid (`configs/track.yaml: frame_rate: 25`,
+            # matching `configs/hardware.yaml: stages.detect.fps_sample`), so an exact-timestamp
+            # collision between two distinct fragments is a real, reachable case here, not a
+            # measure-zero edge case -- reject it outright rather than let it fall through to only
+            # the gap-blind `max_dist` check above.
+            if gap == 0:
                 continue
             # Physical-plausibility gate (2026-09-01). `max_dist` alone is gap-BLIND: it allows the
             # same 3.0-bbox-height jump whether the fragment reappears 0.04s or 1.4s later, so a
@@ -146,6 +186,8 @@ def extend_chain_forward(
             # two clips) puts p95 at 2.10-2.31 and the observed MAXIMUM at 3.70, so 3.08 is
             # faster than 95% of all real player movement ever measured here -- implausible for
             # one continuous player, and exactly the signature of a jump to a different person.
+            # (`gap > 0` is now redundant with the `gap == 0` rejection above, but kept explicit
+            # rather than relying on that ordering for correctness.)
             if max_speed is not None and gap > 0 and (dist / gap) >= max_speed:
                 continue
             agrees = _team_agrees(current, cand, team_threshold)
@@ -159,6 +201,7 @@ def extend_chain_forward(
             break
         chain.append(best)
         used.add(best.id)
+        accepted_spans.append((best.t_start, best.t_end))
 
     return chain
 
@@ -227,7 +270,7 @@ def stitch_timeline(
 
 
 def build_take_identities(
-    take_tracks: list[Track], selection_cfg: dict
+    take_tracks: list[Track], selection_cfg: dict, motion=None
 ) -> tuple[dict[int, int], dict[int, float]]:
     """Partition an ENTIRE take's track fragments into stitched "identity" chains, using exactly
     the same greedy forward-extension rule as `stitch_timeline` (`extend_chain_forward`) instead of
@@ -256,6 +299,20 @@ def build_take_identities(
     Never crosses a take boundary: `take_tracks` must all share one `take_id` (asserted, same
     invariant as `stitch_timeline`) -- see `tests/test_continuity.py::
     test_build_take_identities_rejects_mixed_take_ids` and the dedicated cross-take rejection test.
+
+    `motion` (`src.track.camera_motion.TakeCameraMotion`, optional, default `None`): when supplied,
+    every spatial jump this function's stitching decisions are based on is measured in the take's
+    own reference frame rather than raw image space -- the same camera-motion compensation
+    `stitch_timeline` already applies to its one externally-chosen seed (`src/track/
+    camera_motion.py`'s module docstring has the measured numbers: on `chelsea_burnley_target10`
+    take 0's 12.84 px/frame pan, the CORRECT continuation reads 3.45 bbox-h/s raw -- rejected -- vs
+    0.24 compensated -- accepted -- while the WRONG one goes 3.07 raw -- also (barely) rejected --
+    to 6.41 compensated -- correctly rejected by a wide margin). Without this, `build_take_
+    identities`' whole-take partition (the source of every OTHER player's stable on-screen label,
+    plus the touch/possession/pass/tackle identity space in `src.events.aggregate`) makes exactly
+    this same class of mistake during a fast pan. `None` degrades to the original raw, uncompensated
+    comparison -- never a hard requirement, since not every caller has a motion model available
+    (see each call site's own comment for why).
     """
     if not take_tracks:
         return {}, {}
@@ -279,7 +336,7 @@ def build_take_identities(
             identity_confidence[tr.id] = 0.0
             used.add(tr.id)
             continue
-        chain = extend_chain_forward(tr.id, pool, used, selection_cfg)
+        chain = extend_chain_forward(tr.id, pool, used, selection_cfg, motion)
         if not chain:
             continue
         identity_id = chain[0].id

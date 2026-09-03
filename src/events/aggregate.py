@@ -53,9 +53,17 @@ def compute_take_all_events(
     frame rather than raw image space (2026-09-02 -- a fast pan otherwise inflates the ball's
     apparent velocity the same way it inflated fragment-stitching jumps, measured earlier the same
     day). `None` degrades to the raw, uncompensated series -- never a hard requirement, since not
-    every caller has a camera-motion model available yet.
+    every caller has a camera-motion model available yet. **Also threaded into
+    `build_take_identities` (2026-09-03)** -- the exact same argument already reaches
+    `build_ball_state_series` above, so passing it on costs nothing new here; without it the
+    whole-take identity partition this function's own event heuristics (touch/possession/pass/
+    tackle) key on would silently fall back to the raw, pan-inflated image-space distance during a
+    fast camera pan, the same failure mode `src/track/camera_motion.py`'s module docstring
+    measures for `stitch_timeline`.
     """
-    identity_of, identity_confidence = build_take_identities(take_tracks, selection_cfg)
+    identity_of, identity_confidence = build_take_identities(
+        take_tracks, selection_cfg, motion=camera_motion
+    )
 
     ball_states = build_ball_state_series(
         take_balls,

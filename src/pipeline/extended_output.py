@@ -231,6 +231,13 @@ def run_extended_pipeline_for_video(
     # `compute_take_all_events` computes per-take below (cheap, pure arithmetic on tracks -- no
     # OCR/decode) so goal/assist attribution lands in the identical identity id-space every other
     # extended-pipeline event already uses, rather than raw track ids.
+    # `motion` left at its default `None` (2026-09-03): this pipeline (filename-less input, ADR-15)
+    # never estimates a `TakeCameraMotion` anywhere -- only `src.pipeline.run`'s own flow does
+    # (`camera_motion_by_take`, computed for `select_targets`). Adding a fresh
+    # `estimate_camera_motion_for_video` call here purely to feed this partition would be new,
+    # non-trivial per-take decode + optical-flow work this call site doesn't already pay for, which
+    # the plan this fix comes from explicitly rules out ("do not add expensive new motion
+    # estimation to a call site that doesn't have it") -- an honest gap, not a fabricated fix.
     t0 = time.time()
     identity_of_by_take: dict[int, dict[int, int]] = {
         take.id: build_take_identities(tracks_by_take.get(take.id, []), selection_cfg)[0]

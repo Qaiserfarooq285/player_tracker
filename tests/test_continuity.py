@@ -13,6 +13,7 @@ import pytest
 from src.common.io import load_yaml
 from src.common.types import BBox, DetectionClass, Track, TrackBox
 from src.track import continuity
+from src.track.camera_motion import TakeCameraMotion
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -173,3 +174,103 @@ def test_build_take_identities_confidence_penalised_per_join():
     assert identity_of_short == {1: 1, 2: 1}
     assert identity_of_long == {1: 1, 2: 1, 3: 1}
     assert conf_long[1] < conf_short[1]  # each extra join costs confidence, same as stitch_timeline
+
+
+# ---------------------------------------------------------------------------
+# Stage 7 ("streamed-gathering-treehouse" plan) -- three measured continuity gaps:
+# (a) a zero-gap join bypassed the speed gate entirely; (b) build_take_identities never received
+# camera motion; (c) no span-overlap rejection (click_reid.py has one, this module didn't).
+# ---------------------------------------------------------------------------
+
+
+def test_extend_chain_forward_rejects_zero_gap_join_even_when_close_in_space():
+    """A candidate whose FIRST box lands at the exact same timestamp as the chain's own LAST box
+    (`gap == 0`) is two DIFFERENT tracker fragments (a candidate is only ever considered when its
+    id isn't already claimed) both reporting a detection at the SAME sampled instant -- not a
+    reappearance, since nothing disappeared for anyone to reappear from. Before 2026-09-03 the old
+    `gap > 0` conjunct let this bypass the speed gate entirely, falling through to only the
+    gap-blind `stitch_max_dist` check -- so a same-instant pair comfortably under `stitch_max_dist`
+    (one player supposedly occupying two simultaneous detections) was silently joined. Detection
+    runs on a fixed grid (`configs/track.yaml: frame_rate`), so this is a reachable case, not a
+    contrived one.
+    """
+    cfg = _selection_cfg()
+    seed = Track(id=1, take_id=0, boxes=[_box(2.0, 100.0, 100.0, height=100.0)])
+    # 2.0 bbox-heights away -- comfortably under the default stitch_max_dist (3.0) -- but at the
+    # EXACT SAME timestamp as the seed's only box.
+    same_instant = Track(id=2, take_id=0, boxes=[_box(2.0, 300.0, 100.0, height=100.0)])
+    track_ids, _confidence = continuity.stitch_timeline(1, [seed, same_instant], cfg)
+    assert track_ids == [1]  # never joined -- two simultaneous detections can't be one player
+
+
+def test_extend_chain_forward_rejects_candidate_overlapping_an_earlier_chain_member():
+    """Defensive parity with `src.track.click_reid.extend_chain_with_profile`'s own span-overlap
+    guard (`click_reid.py:328-338`). Under NORMAL (per-track time-ordered) box lists this guard is
+    provably redundant with the pre-existing `gap >= 0` check here -- each newly-accepted member's
+    own `t_end` is a running maximum, so a candidate eligible on `gap` alone can never fall inside
+    an EARLIER member's span. That argument depends on every individual track's own boxes being
+    time-ordered, though -- this test constructs the one case where it breaks: an already-accepted
+    fragment (id=2) whose own box list is NOT time-ordered (its LAST list entry precedes its FIRST)
+    makes `current_end_t` (`current.boxes[-1].t` -- the only thing the `gap` check compares
+    against) go BACKWARDS, letting a later candidate (id=3) whose real timestamp sits inside the
+    FIRST fragment's (id=1) span slip past the `gap` check. The explicit overlap guard -- checked
+    against every accepted span, not just `current`'s -- is what actually stops it.
+    """
+    cfg = dict(_selection_cfg())
+    cfg["stitch_max_gap_s"] = 5.0  # generous enough that only the overlap guard is under test
+    seed = Track(
+        id=1, take_id=0, boxes=[_box(0.0, 100.0, 100.0), _box(10.0, 100.0, 100.0)]
+    )  # occupies [0.0, 10.0]
+    unsorted_fragment = Track(
+        id=2, take_id=0, boxes=[_box(10.5, 105.0, 100.0), _box(2.0, 105.0, 100.0)]
+    )  # its own boxes are OUT OF TIME ORDER: boxes[-1].t (2.0) precedes boxes[0].t (10.5)
+    overlapping_candidate = Track(
+        id=3, take_id=0, boxes=[_box(5.0, 100.0, 100.0)]
+    )  # genuinely falls inside the SEED's [0.0, 10.0] span
+
+    pool = {1: seed, 2: unsorted_fragment, 3: overlapping_candidate}
+    used: set[int] = set()
+    chain = continuity.extend_chain_forward(1, pool, used, cfg)
+
+    assert [tr.id for tr in chain] == [1, 2]
+    assert 3 not in used
+
+
+def test_build_take_identities_uses_motion_to_compensate_camera_pan_when_supplied():
+    """`build_take_identities` used to never receive a `TakeCameraMotion` at all
+    (`continuity.py:282`, before 2026-09-03), so its whole-take partition ran in the raw,
+    camera-motion-contaminated regime even when a real motion model was available for that take --
+    exactly the failure `src/track/camera_motion.py`'s own module docstring measures for
+    `stitch_timeline` (a fast pan makes a stationary player look like a sprinter). Synthetic
+    version of that same measured case: a player who is REALLY stationary between t=0 and t=1
+    while the camera pans 400px -- 4.0 bbox-heights at height=100, over the default
+    `stitch_max_dist` of 3.0 -- so raw image positions make the two fragments look too far apart
+    to join, while the camera-compensated position is unchanged and joins cleanly. Also proves
+    `motion=None` (the default) keeps the original, uncompensated behaviour -- no existing caller
+    is affected by this addition.
+    """
+    cfg = _selection_cfg()
+    seed = Track(id=1, take_id=0, boxes=[_box(0.0, 100.0, 100.0, height=100.0)])
+    # The SAME physical (stationary) player, recorded 400px further right purely because the
+    # camera itself panned 400px rightward between t=0.0 and t=1.0 -- see `motion` below.
+    panned_fragment = Track(id=2, take_id=0, boxes=[_box(1.0, 500.0, 100.0, height=100.0)])
+
+    motion = TakeCameraMotion(
+        take_id=0,
+        times=[0.0, 1.0],
+        # `cumulative[i]` maps the take's FIRST sampled frame into the frame at `times[i]`; a pure
+        # +400px-in-x translation models "the camera panned 400px right by t=1.0" (see
+        # `TakeCameraMotion`'s own docstring).
+        cumulative=[[1.0, 0.0, 0.0, 0.0, 1.0, 0.0], [1.0, 0.0, 400.0, 0.0, 1.0, 0.0]],
+    )
+
+    identity_of_raw, _ = continuity.build_take_identities([seed, panned_fragment], cfg)
+    identity_of_compensated, _ = continuity.build_take_identities(
+        [seed, panned_fragment], cfg, motion=motion
+    )
+
+    assert identity_of_raw == {
+        1: 1,
+        2: 2,
+    }  # raw 4.0 bbox-h jump exceeds stitch_max_dist -- kept separate
+    assert identity_of_compensated == {1: 1, 2: 1}  # compensated jump (~0) -- correctly joined
