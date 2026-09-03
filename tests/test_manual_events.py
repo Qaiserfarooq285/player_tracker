@@ -419,15 +419,17 @@ def test_run_manual_events_pipeline_smoke(tmp_path, monkeypatch):
     monkeypatch.setattr(me_mod, "render_full_annotated_video", lambda *a, **k: None)
     monkeypatch.setattr(me_mod, "write_player_output", fake_write_player_output)
 
+    real_highlights = load_yaml("configs/highlights.yaml")
     configs = {
         "annotations": load_yaml("configs/annotations.yaml"),
-        "hardware": {"decode": {"scale_width": None}},
+        "events": load_yaml("configs/events.yaml"),
+        "hardware": load_yaml("configs/hardware.yaml"),
         "profile": {},
         "shots": {},
         "detect": {},
         "track": {},
         "team": {},
-        "highlights": {"clip": _clip_cfg()},
+        "highlights": real_highlights,
     }
 
     result = me_mod.run_manual_events_pipeline_for_video(
@@ -451,16 +453,23 @@ def test_run_manual_events_pipeline_smoke(tmp_path, monkeypatch):
     assert len(written_players) == 1
     written = written_players[0]
     assert written["jersey_number"] == 10
-    assert written["n_events"] == 1  # #10 touch; #2's pass is a non-target event caption
-    assert written["possession_seconds"] is None
-    assert written["distance_result"] is None
+    # Owner decision 2026-09-02: the stat card now reports AUTO-DETECTED events, not the sidecar's
+    # own lines directly. This fixture's fake track has no ball data at all (load_models_parquet
+    # is mocked to return only a takes/tracks fixture, no ball_detections.parquet entry), so an
+    # honest 0 auto-detected touches is the CORRECT result here (Golden Rule 5: no ball evidence
+    # means no event, never a guess) -- this is a real behaviour change from the old
+    # sidecar-echoing assertion, not a regression. possession_seconds/distance_result are now
+    # genuinely computed (real 0.0/dict) rather than the old hardcoded None.
+    assert written["n_events"] == 0
+    assert written["possession_seconds"] == 0.0
+    assert written["distance_result"]["distance"] == 0.0
     assert written["identity_status"] == "Human-provided (manual annotation)"
-    # Bug fix 2026-08-31: manual mode's sidecar is the authoritative event source, so a player
-    # with no GOAL annotation has a real "0" goals, not an "uncertain"/"not available" placeholder
-    # -- `goal_reason=None` unconditionally is what tells render_statcard_markdown to show that
-    # real zero (see src/pipeline/player_output.py's own docstring). This is an intentional
-    # behaviour change from the old pinned "not available" assertion.
-    assert written["goal_reason"] is None
+    # Revised 2026-09-02: since events are now auto-detected (not read off the sidecar), a real
+    # goal-reason STRING must be supplied -- `None` would wrongly claim "this zero is a confirmed
+    # count", when in fact auto goal-line detection doesn't exist yet (Stage 6) and can't confirm
+    # or deny a goal even when the sidecar itself records one.
+    assert written["goal_reason"] is not None
+    assert "not available" in written["goal_reason"]
 
 
 # ---------------------------------------------------------------------------

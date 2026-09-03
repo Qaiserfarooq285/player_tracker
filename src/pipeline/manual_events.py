@@ -3,16 +3,24 @@
 Dispatched from `src.pipeline.run.main()` whenever a `<video_basename>.annotations.txt` sidecar
 exists next to the input -- checked BEFORE the filename-jersey and ADR-15 branches (§14.1: "the
 client's file winning is the trigger, not a quality score"). Detection/tracking still run via the
-SAME shared, cached `run_track_stage` machinery every other flow uses -- only EVENT GENERATION
-changes: the parsed sidecar is the SOLE, authoritative event source. None of
-`src.events.aggregate`'s auto heuristics (touch/pass/possession/tackle/...) or `src.events.goals`'s
-scoreboard/goal-region detectors ever run in this mode -- the client already told us what happened.
+SAME shared, cached `run_track_stage` machinery every other flow uses.
 
-Identity (jersey number + team colour) comes straight from the annotations too -- there is no
-OCR/VLM verification step in this mode at all (a human directly watching the footage IS the
-verification, Golden Rule 4). This also means the ADR-15 "skip unverified takes" gate does not
-apply here: EVERY take containing at least one annotation gets processed, never silently skipped
-for lack of a verified identity (there is nothing to verify in the first place).
+Identity (jersey number + team colour) comes straight from the annotations -- there is no OCR/VLM
+verification step in this mode at all (a human directly watching the footage IS the verification,
+Golden Rule 4). This also means the ADR-15 "skip unverified takes" gate does not apply here: EVERY
+take containing at least one annotation gets processed, never silently skipped for lack of a
+verified identity (there is nothing to verify in the first place). `src.events.goals`'s
+scoreboard/goal-region detectors still never run in this mode -- a goal is either in the sidecar or
+`not available` here, same as before.
+
+**EVENT COUNTING, revised 2026-09-02 (owner decision).** The parsed sidecar's own annotation lines
+are preserved verbatim in `annotation_report.json` as ground truth and drive IDENTITY (which raw
+tracks belong to which jersey number, via `build_manual_identity_by_take`) -- but the STAT CARD's
+touches/passes/turnovers/sprints/shots/dribbles/tackles/saves are now genuinely AUTO-DETECTED,
+using the exact same `src.events.aggregate.compute_take_all_events` heuristics `run.py`'s own auto
+branch uses, attributed per jersey via `identity_by_take`'s own `jersey_by_track_id`. Before this,
+manual mode ran zero auto detection at all, so every touch/pass accuracy fix elsewhere in this
+project never reached a sidecar-driven video -- exactly the videos the owner has been checking.
 """
 
 from __future__ import annotations
@@ -28,12 +36,14 @@ from src.annotations.associate import (
     candidate_tracks_near_time,
     read_jersey_number_for_candidates,
 )
-from src.annotations.parse import annotation_to_event, parse_annotations
+from src.annotations.parse import parse_annotations
 from src.common.io import load_models_parquet, save_json, work_dir_for
 from src.common.logging import get_logger
-from src.common.types import Annotation, BallDetection, Event, Take, Track
+from src.common.types import Annotation, BallDetection, Event, EventType, Take, Track
 from src.common.video import probe
 from src.detect.overlay_mask import ArrowHint
+from src.events.aggregate import attribute_events_to_target, compute_take_all_events
+from src.events.possession import compute_distance_covered
 from src.identity.jersey_models import free_optional_jersey_stack, load_optional_jersey_stack
 from src.identity.jersey_ocr import free_easyocr_reader, load_easyocr_reader
 from src.identity.verify import TakeIdentityResult
@@ -575,14 +585,50 @@ def run_manual_events_pipeline_for_video(
     }
     save_json(annotation_report, output_dir / "annotation_report.json")
 
-    events_by_number: dict[int, list[Event]] = defaultdict(list)
-    for take_id, anns in annotations_by_take.items():
-        for ann in anns:
-            events_by_number[ann.jersey_number].append(
-                annotation_to_event(ann, configs["annotations"], take_id)
-            )
-
+    # Owner decision, 2026-09-02: for a video with a sidecar, the STAT CARD reports
+    # AUTO-DETECTED events only -- the sidecar stays the AUTHORITATIVE source for IDENTITY (who is
+    # #10/#2, already resolved above into `identity_by_take`) and is preserved verbatim in
+    # `annotation_report.json` as ground truth, but touches/passes/turnovers/sprints/shots/
+    # dribbles/tackles/saves are now genuinely measured by the SAME Stage 4/4.9 heuristics
+    # `run.py`'s own auto branch uses (`compute_take_all_events`), not re-derived from the
+    # sidecar's own coarse phrase-mapped lines. Before this, manual mode ran ZERO auto detection
+    # at all -- every touch/pass/sprint fix landed elsewhere this session never applied to a
+    # sidecar-driven video, which is exactly the video the owner has been checking.
     frame_width, frame_height = _effective_frame_size(video_path, configs["hardware"]["decode"])
+    events_cfg = configs["events"]
+    selection_cfg = (configs.get("highlights") or {}).get("selection", {})
+    attribution_cfg = (configs.get("highlights") or {}).get("attribution", {})
+    fps_sample = configs["hardware"]["stages"]["track"]["fps_sample"]
+
+    balls_by_take: dict[int, list[BallDetection]] = defaultdict(list)
+    for b in balls:
+        b_take_id = assign_take_id(b.t, takes)
+        if b_take_id is not None:
+            balls_by_take[b_take_id].append(b)
+
+    events_by_number: dict[int, list[Event]] = defaultdict(list)
+    takes_used_by_number: dict[int, list[tuple[int, list[int]]]] = defaultdict(list)
+    for take in takes:
+        identity = identity_by_take.get(take.id)
+        if identity is None or not identity.jersey_by_track_id:
+            continue  # no confidently-associated jersey in this take -- nothing to attribute to
+        take_tracks = tracks_by_take.get(take.id, [])
+        take_balls = balls_by_take.get(take.id, [])
+        all_events, auto_identity_of, _identity_conf = compute_take_all_events(
+            take, take_tracks, take_balls, frame_width, events_cfg, selection_cfg, fps_sample
+        )
+        # this take can name more than one jersey (an assist/goal pair) -- attribute its own
+        # auto-detected events to EACH jersey separately, using that jersey's own associated
+        # raw track ids from `jersey_by_track_id` (never the take-wide union).
+        raw_ids_by_jersey: dict[int, list[int]] = defaultdict(list)
+        for raw_id, jersey in identity.jersey_by_track_id.items():
+            raw_ids_by_jersey[jersey].append(raw_id)
+        for jersey, raw_ids in raw_ids_by_jersey.items():
+            attributed = attribute_events_to_target(
+                all_events, take_tracks, take_balls, raw_ids, auto_identity_of, attribution_cfg
+            )
+            events_by_number[jersey].extend(attributed)
+            takes_used_by_number[jersey].append((take.id, raw_ids))
 
     final_video_path = output_dir / "original_annotated_video.mp4"
     render_full_annotated_video(
@@ -612,24 +658,56 @@ def run_manual_events_pipeline_for_video(
     logger.info("manual-mode annotated video render -> %s", final_video_path)
 
     takes_by_id = {t.id: t for t in takes}
-    jersey_numbers = [target_jersey] if target_jersey is not None else sorted(events_by_number.keys())
+    jersey_numbers = (
+        [target_jersey] if target_jersey is not None else sorted(events_by_number.keys())
+    )
     for number in jersey_numbers:
         events = events_by_number.get(number, [])
+        # Owner decision 2026-09-02: possession/distance are now genuinely measured the same way
+        # run.py's own auto branch computes them, since events are auto-detected (see above) --
+        # no longer a hardcoded None/"uncertain" now that there is a real heuristic behind them.
+        possession_seconds = sum(
+            ev.t_end - ev.t_start for ev in events if ev.type == EventType.POSSESSION
+        )
+        total_distance = total_samples = total_fragments = 0.0
+        for take_id, raw_ids in takes_used_by_number.get(number, []):
+            result = compute_distance_covered(raw_ids, tracks_by_take.get(take_id, []), events_cfg)
+            total_distance += result["distance"]
+            total_samples += result["n_speed_samples"]
+            total_fragments += result["n_track_fragments"]
+        distance_result = {
+            "distance": total_distance,
+            "unit": "bbox_heights",
+            "calibrated": False,
+            "n_track_fragments": total_fragments,
+            "n_speed_samples": total_samples,
+        }
         player_dir = output_dir / "players" / f"player_{number}"
         write_player_output(
             player_dir,
             number,
             events,
-            possession_seconds=None,  # ADR-19: no possession heuristic runs over annotation-only
-            distance_result=None,  # events -- CLAUDE.md §13.2's own "uncertain" rule, not a guess
+            possession_seconds=possession_seconds,
+            distance_result=distance_result,
             takes_by_id=takes_by_id,
             video_path=final_video_path,
             highlights_cfg=configs["highlights"],
-            # Bug fix 2026-08-31: `goal_reason=None` unconditionally in manual mode -- the sidecar
-            # is the sole, authoritative event source (Golden Rule 4), so a player with zero GOAL
-            # annotations genuinely has zero goals, not an "uncertain"/"not available" zero. See
-            # `render_statcard_markdown`'s own docstring for how `None` is now interpreted.
-            goal_reason=None,
+            # Revised 2026-09-02 (owner decision, see the module docstring's own "EVENT COUNTING"
+            # section): events are now AUTO-DETECTED, not read off the sidecar, so a `None` here
+            # would be WRONG -- it would claim "the event source is authoritative, this zero is
+            # certain" when in fact goal-line geometry (Stage 6) doesn't exist yet and auto
+            # detection genuinely cannot see a goal even when the sidecar itself records one (the
+            # owner's own stated expectation when choosing this mode: "your assist/goal would only
+            # appear if the auto detectors independently find them -- they currently cannot").
+            # A non-None reason here means `render_statcard_markdown` shows "not available"
+            # instead of a confident 0, honestly matching goals/assists everywhere else in this
+            # project (no scoreboard, no marked goal region -- see `src/events/goals.py`).
+            goal_reason=(
+                "not available (auto goal-line detection is not yet implemented; this video's "
+                "own annotations may record a goal, but manual-mode stats are now auto-detected "
+                "per the owner's own choice, so an unconfirmed auto-goal reads as uncertain, "
+                "never a guessed 0 or a silently-adopted sidecar count)"
+            ),
             identity_status="Human-provided (manual annotation)",
         )
         logger.info(
