@@ -192,6 +192,18 @@ goal:
   # itself already sits under this, kept as an explicit ceiling for consistency with every other
   # category in this file.
   min_confidence: 0.1
+  min_ball_confidence_for_goal: 0.5 # ⚠️ REASONED, not measured against a real goal-line crossing
+  # (none of this project's own footage has one yet -- see src/events/goal_line.py's own module
+  # docstring). A GOAL is the single highest-stakes call this pipeline makes, so it deliberately
+  # requires a HIGHER ball-confidence floor than an ordinary touch/pass (touch.min_ball_conf=0.3,
+  # possession.min_ball_conf=0.3) -- a low-confidence/likely-interpolated ball position must never
+  # be what decides a goal.
+  max_crossing_gap_s: 0.3 # the two ball samples straddling the goal-line segment must be this
+  # close in time, or the "crossing" is really two unrelated sightings either side of a real gap
+  # in ball tracking, not one continuous shot -- deliberately tighter than
+  # ball.max_gap_bridge_s=0.5 (Stage 1's own gap-bridging tolerance for ordinary trajectory
+  # continuity) since a goal-line crossing specifically must be measured from genuinely
+  # consecutive evidence, not evidence bridged across a tracking gap.
 
 assist:
   # ADR-17 step 4 -- owner's own rule, verbatim: "if the target pass the ball and the other score

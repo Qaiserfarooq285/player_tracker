@@ -638,6 +638,52 @@ def _grab_frame_at(
     return best[1] if best is not None else None
 
 
+def goal_posts_at(
+    structure: GoalStructure,
+    video_path: str | Path,
+    t_query: float,
+    take: Take,
+    motion_score: float,
+    tracking_cfg: dict,
+    motion_cfg: dict,
+    use_nvdec: bool = True,
+) -> list[tuple[float, float, float, float]]:
+    """The tracked goal POSTS at `t_query` -- the same anchor-frame-to-query-frame single affine
+    hop as `goal_bbox_at` (reused verbatim: same threshold/fallback/honest-approximation
+    contract), applied to `structure.posts` individually rather than the outer `bbox`.
+
+    Added 2026-09-02 (owner spec: "DO NOT detect the penalty box or generic goal box as the
+    primary goal detector... the critical event is BALL CROSSES GOAL LINE... between the two goal
+    posts"). `goal_bbox_at`'s own OUTER bounding box was, until now, the only thing propagated
+    across a take -- fine for drawing a box on screen, but a bounding box has no notion of "the
+    line between the posts" a real goal-line-crossing test needs. This gives
+    `src.events.goal_line` the actual post geometry at any queried instant.
+    """
+    if (
+        abs(t_query - structure.t_anchor) < 1e-6
+        or motion_score <= tracking_cfg["reestimate_motion_score_threshold"]
+    ):
+        return structure.posts
+
+    window_s = tracking_cfg["frame_grab_window_s"]
+    anchor_frame = _grab_frame_at(video_path, structure.t_anchor, take, window_s, use_nvdec)
+    query_frame = _grab_frame_at(video_path, t_query, take, window_s, use_nvdec)
+    if anchor_frame is None or query_frame is None:
+        return structure.posts
+
+    anchor_gray = cv2.cvtColor(anchor_frame, cv2.COLOR_BGR2GRAY)
+    query_gray = cv2.cvtColor(query_frame, cv2.COLOR_BGR2GRAY)
+    matrix = _fit_affine_transform(anchor_gray, query_gray, motion_cfg)
+    if matrix is None:
+        return structure.posts
+
+    warped = []
+    for x1, y1, x2, y2 in structure.posts:
+        wb = _warp_bbox(BBox(x1=x1, y1=y1, x2=x2, y2=y2), matrix)
+        warped.append((wb.x1, wb.y1, wb.x2, wb.y2))
+    return warped
+
+
 def goal_bbox_at(
     structure: GoalStructure,
     video_path: str | Path,

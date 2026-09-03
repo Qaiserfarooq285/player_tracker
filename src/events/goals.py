@@ -57,6 +57,8 @@ from pydantic import BaseModel
 from src.common.logging import get_logger
 from src.common.types import BallDetection, Event, EventType, Take, Track
 from src.common.video import decode_frames, probe
+from src.events.ball_track import BallState
+from src.events.goal_line import ball_crosses_goal_line, goal_line_from_posts
 from src.events.possession import (
     detect_passes,
     detect_possession,
@@ -65,7 +67,7 @@ from src.events.possession import (
 )
 from src.events.segments import find_threshold_segments
 from src.events.shots import ball_speed_series
-from src.goal.detect import GoalStructure, goal_bbox_at, take_motion_score
+from src.goal.detect import GoalStructure, goal_bbox_at, goal_posts_at, take_motion_score
 from src.identity.jersey_ocr import free_easyocr_reader, load_easyocr_reader
 
 logger = get_logger(__name__)
@@ -676,6 +678,145 @@ def _tracked_polygons_for_take(
     return polygons
 
 
+def _tracked_goal_lines_for_take(
+    goal_structure: GoalStructure,
+    video_path: str | Path,
+    take: Take,
+    hardware_cfg: dict,
+    profile_cfg: dict,
+    goal_structure_cfg: dict,
+    frame_width: float,
+    frame_height: float,
+    use_nvdec: bool = True,
+) -> list[tuple[float, tuple[tuple[float, float], tuple[float, float]]]]:
+    """Stage 6 (owner spec, 2026-09-02): the SAME anchor-instant propagation
+    `_tracked_polygons_for_take` uses (mirrored, not shared, since that one returns rectangle
+    POLYGONS for the unchanged manual/legacy containment path -- this returns goal-line SEGMENTS
+    for the new crossing test), but built from `goal_posts_at` instead of `goal_bbox_at` so the
+    result is the actual line between the two posts, never a bounding box.
+
+    Returns `[(anchor_t, (left_base, right_base))]` in detect-stage-pixel space (same scaling as
+    `_tracked_polygons_for_take`) -- a take whose structure has fewer than 2 tracked posts at every
+    anchor contributes no lines at all (honest -- `goal_line_from_posts` already refuses to guess
+    a line from one post).
+    """
+    tracking_cfg = goal_structure_cfg["tracking"]
+    motion_cfg = profile_cfg["motion"]
+    motion_score = take_motion_score(video_path, take, hardware_cfg, profile_cfg, use_nvdec)
+
+    interval = (
+        tracking_cfg["min_reestimate_interval_s"]
+        if motion_score > tracking_cfg["reestimate_motion_score_threshold"]
+        else tracking_cfg["max_reestimate_interval_s"]
+    )
+    duration = max(take.t_end - take.t_start, 1e-3)
+    n_anchors = max(1, min(10, math.ceil(duration / interval)))
+    anchor_ts = [take.t_start + duration * (i + 0.5) / n_anchors for i in range(n_anchors)]
+
+    native_meta = probe(video_path)
+    native_w, native_h = native_meta["width"], native_meta["height"]
+
+    lines: list[tuple[float, tuple[tuple[float, float], tuple[float, float]]]] = []
+    for t in anchor_ts:
+        native_posts = goal_posts_at(
+            goal_structure, video_path, t, take, motion_score, tracking_cfg, motion_cfg, use_nvdec
+        )
+        line = goal_line_from_posts(native_posts)
+        if line is None:
+            continue
+        (lx, ly), (rx, ry) = line
+        scaled = (
+            (lx / native_w * frame_width, ly / native_h * frame_height),
+            (rx / native_w * frame_width, ry / native_h * frame_height),
+        )
+        lines.append((t, scaled))
+    return lines
+
+
+def detect_goals_line_crossing(
+    take_balls: list[BallDetection],
+    tracked_lines: list[tuple[float, tuple[tuple[float, float], tuple[float, float]]]],
+    take_id: int | None,
+    goal_cfg: dict,
+) -> list[Event]:
+    """Stage 6 (owner spec, 2026-09-02): a GOAL from the auto-tracked `GoalStructure`, decided by
+    genuine goal-LINE crossing (`src.events.goal_line.ball_crosses_goal_line`) -- never a
+    bounding-box/polygon containment test (the anti-pattern `detect_goals_goal_region` still uses
+    for the DIFFERENT, human-marked-polygon path, which stays as-is: a person drawing a box is an
+    accepted, explicit design, not an algorithm inventing one).
+
+    `tracked_lines` is `_tracked_goal_lines_for_take`'s own output -- an empty list (no confident
+    goal structure for this take, or fewer than 2 posts tracked at every anchor) means this
+    function honestly finds nothing, never falls back to a guessed line.
+
+    Walks CONSECUTIVE, sorted-by-time raw ball detections (not the Stage 1 `BallState` series --
+    each tracked line is already anchored to its own nearby frame's coordinate space via
+    `goal_posts_at`'s own affine propagation, so comparing camera-COMPENSATED ball positions here
+    would double-correct for the same camera motion) and tests each consecutive pair against
+    whichever tracked line is nearest in time to that pair's own midpoint.
+    """
+    if not tracked_lines:
+        return []
+    sorted_balls = sorted(take_balls, key=lambda b: b.t)
+    events: list[Event] = []
+    for prev_b, curr_b in zip(sorted_balls, sorted_balls[1:], strict=False):
+        mid_t = (prev_b.t + curr_b.t) / 2.0
+        _anchor_t, line = min(tracked_lines, key=lambda item: abs(item[0] - mid_t))
+        prev_state = BallState(
+            t=prev_b.t,
+            x=prev_b.bbox.cx,
+            y=prev_b.bbox.cy,
+            vx=0.0,
+            vy=0.0,
+            speed=0.0,
+            direction_deg=None,
+            confidence=prev_b.conf,
+            is_interpolated=prev_b.interpolated,
+            is_camera_compensated=False,
+            known=True,
+        )
+        curr_state = BallState(
+            t=curr_b.t,
+            x=curr_b.bbox.cx,
+            y=curr_b.bbox.cy,
+            vx=0.0,
+            vy=0.0,
+            speed=0.0,
+            direction_deg=None,
+            confidence=curr_b.conf,
+            is_interpolated=curr_b.interpolated,
+            is_camera_compensated=False,
+            known=True,
+        )
+        crossing = ball_crosses_goal_line(prev_state, curr_state, line, goal_cfg)
+        if crossing is None:
+            continue
+        events.append(
+            Event(
+                id=str(uuid.uuid4()),
+                type=EventType.GOAL,
+                t_start=prev_b.t,
+                t_end=curr_b.t,
+                player_track_id=None,
+                take_id=take_id,
+                confidence=goal_cfg["min_ball_confidence_for_goal"],
+                source="goal_line_crossing",
+                evidence={
+                    "goal_region_source": "detected_line_crossing",
+                    "crossing_point": crossing,
+                    "goal_line": line,
+                    "prev_ball_t": prev_b.t,
+                    "curr_ball_t": curr_b.t,
+                    "prev_ball_conf": prev_b.conf,
+                    "curr_ball_conf": curr_b.conf,
+                    "calibrated": False,
+                    "unit": "pixels_at_detect_stage_resolution",
+                },
+            )
+        )
+    return events
+
+
 # ---------------------------------------------------------------------------
 # per-take orchestration (does its own decode; lazily computes possession/pass only if needed)
 # ---------------------------------------------------------------------------
@@ -728,15 +869,21 @@ def detect_goals_for_take(
     uses for this take (`None` for the original Phase-1 flow, which has no identity-stitching
     step at all and uses raw `Track.id`s directly, exactly like `detect_sprints` already does).
 
-    **Stage D ("streamed-gathering-treehouse" plan)**: `goal_structure` (Stage C's own
+    **Stage D geometry source, revised to LINE CROSSING 2026-09-02 (owner spec: "DO NOT detect
+    the penalty box or generic goal box as the primary goal detector... the critical event is BALL
+    CROSSES GOAL LINE... between the two goal posts").** `goal_structure` (Stage C's own
     `src/goal/detect.GoalStructure` for THIS take, or `None`) supplies a THIRD, auto-tracked
-    geometry source. Priority, per take: a confident `goal_structure` wins over the manual
-    `configs/goal_region.yaml` polygon (`raw_polygons`) when both exist; the manual polygon is kept
-    as an explicit fallback for a camera angle Stage C couldn't confidently localize (ADR-20's own
-    human-in-the-loop escape hatch, still valuable); neither present -> the region source is
-    skipped entirely, exactly as before this plan. `goal_structure_cfg`/`hardware_cfg`/
+    geometry source -- decided by `detect_goals_line_crossing` (genuine post-to-post line
+    intersection, `src.events.goal_line`), NOT the bounding-box/polygon containment test this used
+    before. Priority, per take: a confident `goal_structure` (>= 2 tracked posts at every queried
+    anchor) wins over the manual `configs/goal_region.yaml` polygon (`raw_polygons`) when both
+    exist; the manual polygon is kept UNCHANGED as an explicit fallback for a camera angle Stage C
+    couldn't confidently localize (ADR-20's own human-in-the-loop escape hatch -- a person's own
+    drawn box is an accepted, explicit design, not the "box as goal proxy" anti-pattern the owner
+    is asking to stop for the AUTO-DETECTED case specifically); neither present -> the region
+    source is skipped entirely, exactly as before this plan. `goal_structure_cfg`/`hardware_cfg`/
     `profile_cfg` are only needed alongside `goal_structure` (to query
-    `src/goal/detect.goal_bbox_at` at a handful of instants across the take) — any of them being
+    `src/goal/detect.goal_posts_at` at a handful of instants across the take) — any of them being
     `None` falls back to the manual-polygon-or-nothing behaviour, never a crash.
     """
     goal_cfg = events_cfg["goal"]
@@ -769,11 +916,19 @@ def detect_goals_for_take(
     region_behavior_cfg = events_cfg.get("goal_region", {})
     raw_polygons = (goal_region_cfg or {}).get("regions", {}).get(slug) if slug else None
 
-    # Stage D: a confident Stage C goal_structure supplies DETECTED polygons, tracked across the
-    # take; configs/goal_region.yaml's own hand-drawn polygon is kept as an explicit fallback for
-    # a camera angle Stage C couldn't confidently localize (ADR-20's human-in-the-loop escape
-    # hatch). Detected wins over manual when both are available for this take.
-    detected_polygons: list[list[tuple[float, float]]] | None = None
+    # Stage 6 (owner spec, 2026-09-02): a confident Stage C goal_structure now decides a goal by
+    # actual LINE CROSSING (`detect_goals_line_crossing`), never a bounding-box/polygon
+    # containment test -- the anti-pattern this replaces for the AUTO-TRACKED case specifically.
+    # `configs/goal_region.yaml`'s own hand-drawn polygon is UNCHANGED and kept as an explicit
+    # fallback for a camera angle Stage C couldn't confidently localize (ADR-20's human-in-the-loop
+    # escape hatch, still valuable, still a person's own explicit box -- not the same thing as an
+    # algorithm inventing one). Detected wins over manual when both are available for this take.
+    detected_lines: list[tuple[float, tuple[tuple[float, float], tuple[float, float]]]] = []
+    # initialized here (not just in the elif/else below) so the trailing polygon-containment
+    # block's own `if polygons_to_use and ...` guard is well-defined even when the `detected_lines`
+    # branch below already fully handled this take and never needs a polygon at all.
+    polygons_to_use: list[list[tuple[float, float]]] | None = None
+    source_label = "manual"
     if (
         goal_structure is not None
         and goal_structure_cfg is not None
@@ -782,7 +937,7 @@ def detect_goals_for_take(
         and frame_width is not None
         and frame_height is not None
     ):
-        detected_polygons = _tracked_polygons_for_take(
+        detected_lines = _tracked_goal_lines_for_take(
             goal_structure,
             video_path,
             take,
@@ -794,9 +949,10 @@ def detect_goals_for_take(
             use_nvdec,
         )
 
-    if detected_polygons:
-        polygons_to_use: list[list[tuple[float, float]]] | None = detected_polygons
-        source_label = "detected"
+    if detected_lines:
+        region_attempted = True
+        source_label = "detected_line_crossing"
+        region_events = detect_goals_line_crossing(take_balls, detected_lines, take.id, goal_cfg)
     elif raw_polygons:
         # configs/goal_region.yaml polygons are authored as [0,1] FRACTIONS of the frame (so one
         # polygon travels correctly across a re-run at a different decode scale_width) --

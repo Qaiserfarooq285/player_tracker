@@ -756,34 +756,35 @@ def test_tracked_polygons_for_take_uses_more_anchors_under_high_motion(monkeypat
     assert len(polygons) == 2
 
 
-def test_detect_goals_for_take_prefers_detected_polygon_over_manual(monkeypatch):
-    """When Stage C found a confident goal_structure for this take, its tracked polygon must be
-    used INSTEAD of the manual configs/goal_region.yaml one, even when both exist -- proven here by
-    placing the ball crossing where ONLY the detected polygon (not the manual one) covers it."""
+def test_detect_goals_for_take_prefers_detected_line_crossing_over_manual(monkeypatch):
+    """Stage 6 (owner spec 2026-09-02): when Stage C found a confident goal_structure for this
+    take, a GOAL is decided by LINE CROSSING (never a bounding-box/polygon containment test), and
+    this wins over the manual configs/goal_region.yaml polygon even when both exist -- proven here
+    by placing the ball's crossing where ONLY the detected line (not the manual polygon) covers
+    it. Supersedes the pre-2026-09-02 version of this test, which asserted the OLD polygon-
+    containment behaviour for the auto-tracked case -- exactly the "box as goal proxy" anti-
+    pattern the owner asked to stop using for the auto-detected source."""
     monkeypatch.setattr(goals_mod, "decode_frames", _no_scoreboard_decode)
-    # Detected polygon covers the LEFT 15% of frame; manual polygon covers the RIGHT 15% (disjoint)
-    # -- a ball crossing on the left can only fire via the DETECTED polygon.
-    # NOTE: `_tracked_polygons_for_take` returns polygons already in DETECT-PIXEL coordinates (the
-    # real implementation scales native bbox -> fraction -> detect pixels itself), unlike
-    # `configs/goal_region.yaml`'s own [0,1]-fraction polygons that `detect_goals_for_take` scales
-    # itself -- so this mock returns PIXEL coordinates directly (frame is 1000x1000 below).
-    detected_polygon = [[(0.0, 0.0), (150.0, 0.0), (150.0, 1000.0), (0.0, 1000.0)]]
-    monkeypatch.setattr(goals_mod, "_tracked_polygons_for_take", lambda *a, **k: detected_polygon)
+    # Detected line spans x=[0,150] at y=500 (left side of a 1000x1000 frame, in DETECT-PIXEL
+    # coordinates -- `_tracked_goal_lines_for_take`'s own real implementation already does the
+    # native->detect-pixel scaling itself, so this mock returns pixel coordinates directly, same
+    # convention the old test used for `_tracked_polygons_for_take`).
+    detected_line = [(0.5, ((0.0, 500.0), (150.0, 500.0)))]
+    monkeypatch.setattr(goals_mod, "_tracked_goal_lines_for_take", lambda *a, **k: detected_line)
 
     events_cfg = _events_config()
     take = Take(id=0, t_start=0.0, t_end=1.0, frame_start=0, frame_end=10, kind="main")
     frame_width, frame_height = 1000.0, 1000.0
 
+    # Ball crosses y=500 between x=0 and x=150 (inside the detected line's own span) at t=0.5.
     balls = [
         BallDetection(
-            bbox=BBox(x1=910.0 - i * 90.0 - 5, y1=45.0, x2=910.0 - i * 90.0 + 5, y2=55.0),
-            conf=0.9,
-            frame_index=i,
-            t=i * 0.1,
-        )
-        for i in range(10)
-    ]  # a sustained LEFTWARD run (same speed magnitude as the reference rightward-run test, just
-    # mirrored) ending inside the left 15% of frame (x~100 -> x~10)
+            bbox=BBox(x1=70.0, y1=445.0, x2=80.0, y2=455.0), conf=0.9, frame_index=0, t=0.45
+        ),
+        BallDetection(
+            bbox=BBox(x1=70.0, y1=545.0, x2=80.0, y2=555.0), conf=0.9, frame_index=1, t=0.55
+        ),
+    ]
 
     manual_polygon = [(0.85, 0.0), (1.0, 0.0), (1.0, 1.0), (0.85, 1.0)]  # right 15% -- disjoint
     goal_region_cfg = {"regions": {"testslug": [manual_polygon]}}
@@ -813,8 +814,9 @@ def test_detect_goals_for_take_prefers_detected_polygon_over_manual(monkeypatch)
 
     goal_events = [e for e in events if e.type == EventType.GOAL]
     assert len(goal_events) == 1
-    assert goal_events[0].evidence["goal_region_source"] == "detected"
-    assert debug["goal_region_source"] == "detected"
+    assert goal_events[0].source == "goal_line_crossing"
+    assert goal_events[0].evidence["goal_region_source"] == "detected_line_crossing"
+    assert debug["goal_region_source"] == "detected_line_crossing"
 
 
 def test_detect_goals_for_take_falls_back_to_manual_when_no_goal_structure(monkeypatch):
