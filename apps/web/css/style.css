@@ -1,21 +1,39 @@
 /* Custom Modern Glassmorphism CSS Design System */
 :root {
-  --bg-dark: #0b0f19;
-  --bg-card: rgba(18, 26, 43, 0.75);
-  --bg-card-hover: rgba(26, 37, 61, 0.85);
-  --border-color: rgba(255, 255, 255, 0.08);
-  --border-glow: rgba(16, 185, 129, 0.3);
-  
-  --primary: #10b981;
-  --primary-glow: rgba(16, 185, 129, 0.4);
-  --accent-gold: #f59e0b;
-  --accent-cyan: #06b6d4;
+  /* Palette, retuned 2026-09-03: deep plum-black base with an electric violet -> cyan accent
+     ramp. Deliberately NOT green-primary any more -- the annotated video overlays draw GREEN
+     boxes on non-target players and a RED box on the target (CLAUDE.md §13.1), so a green UI
+     accent competed visually with the very thing the user is meant to read on the video. Violet
+     and cyan sit far from both overlay colours in hue, so the chrome never reads as data. */
+  --bg-dark: #070512;
+  --bg-deep: #0b0820;
+  --bg-card: rgba(24, 18, 46, 0.72);
+  --bg-card-hover: rgba(36, 26, 66, 0.85);
+  --bg-elevated: rgba(44, 32, 80, 0.55);
+  --border-color: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --border-glow: rgba(168, 85, 247, 0.38);
+
+  --primary: #a855f7;
+  --primary-deep: #7c3aed;
+  --primary-soft: rgba(168, 85, 247, 0.14);
+  --primary-glow: rgba(168, 85, 247, 0.45);
+
+  --accent-cyan: #22d3ee;
+  --accent-pink: #ec4899;
+  --accent-gold: #fbbf24;
   --accent-blue: #3b82f6;
   --accent-purple: #8b5cf6;
+  --accent-green: #34d399;
+  --danger: #f43f5e;
 
-  --text-main: #f3f4f6;
-  --text-muted: #9ca3af;
-  --text-dim: #6b7280;
+  --gradient-primary: linear-gradient(135deg, #a855f7 0%, #22d3ee 100%);
+  --gradient-warm: linear-gradient(135deg, #ec4899 0%, #fbbf24 100%);
+  --gradient-sheen: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.22), transparent);
+
+  --text-main: #f5f3ff;
+  --text-muted: #a5a0c0;
+  --text-dim: #6f6a8d;
 
   --font-heading: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
   --font-body: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
@@ -25,8 +43,10 @@
   --radius-md: 14px;
   --radius-lg: 20px;
 
-  --shadow-lg: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 10px 30px -10px rgba(0, 0, 0, 0.6);
+  --shadow-glow: 0 0 0 1px var(--border-glow), 0 12px 40px -12px var(--primary-glow);
   --backdrop-blur: blur(16px);
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 * {
@@ -37,10 +57,12 @@
 
 body.dark-theme {
   background-color: var(--bg-dark);
-  background-image: 
-    radial-gradient(at 0% 0%, rgba(16, 185, 129, 0.08) 0px, transparent 50%),
-    radial-gradient(at 100% 100%, rgba(59, 130, 246, 0.08) 0px, transparent 50%),
-    radial-gradient(at 50% 50%, rgba(15, 23, 42, 0.5) 0px, transparent 100%);
+  background-image:
+    radial-gradient(at 0% 0%, rgba(168, 85, 247, 0.13) 0px, transparent 55%),
+    radial-gradient(at 100% 0%, rgba(34, 211, 238, 0.10) 0px, transparent 50%),
+    radial-gradient(at 85% 100%, rgba(236, 72, 153, 0.09) 0px, transparent 50%),
+    radial-gradient(at 50% 60%, rgba(11, 8, 32, 0.6) 0px, transparent 100%);
+  background-attachment: fixed;
   color: var(--text-main);
   font-family: var(--font-body);
   min-height: 100vh;
@@ -840,4 +862,262 @@ body.dark-theme {
 
 .player-box.selected .player-box-label {
   background: var(--accent-gold);
+}
+
+/* ==========================================================================
+   Interactive polish layer (added 2026-09-03)
+   Appended rather than merged into the rules above so the base layout stays
+   readable and every enhancement here is opt-out by deleting this one block.
+   Everything is transform/opacity/filter-based (compositor-friendly) and every
+   motion rule is disabled under prefers-reduced-motion at the end of the file.
+   ========================================================================== */
+
+/* --- entrance animation, staggered down the page --- */
+@keyframes rise-in {
+  from { opacity: 0; transform: translateY(18px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.pipeline-visualizer-card,
+.setup-section > *,
+.click-track-section > * {
+  animation: rise-in 0.55s var(--ease-out) both;
+}
+.setup-section > *:nth-child(2) { animation-delay: 0.08s; }
+.click-track-section > *      { animation-delay: 0.16s; }
+
+/* --- cards: lift + violet glow on hover, animated gradient hairline on top --- */
+.glass-card {
+  position: relative;
+  transition: transform 0.35s var(--ease-out), border-color 0.3s ease,
+              box-shadow 0.35s ease, background 0.3s ease;
+}
+
+.glass-card::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: var(--gradient-primary);
+  opacity: 0;
+  transition: opacity 0.35s ease;
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+}
+
+.glass-card:hover {
+  transform: translateY(-3px);
+  background: var(--bg-card-hover);
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-glow);
+}
+
+.glass-card:hover::before { opacity: 1; }
+
+/* --- buttons: gradient primary + a sheen that sweeps across on hover --- */
+.btn {
+  position: relative;
+  overflow: hidden;
+  transition: transform 0.2s var(--ease-out), box-shadow 0.25s ease,
+              filter 0.25s ease, border-color 0.25s ease;
+}
+
+.btn::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--gradient-sheen);
+  transform: translateX(-120%);
+  transition: transform 0.65s var(--ease-out);
+  pointer-events: none;
+}
+
+.btn:hover::after { transform: translateX(120%); }
+.btn:hover  { transform: translateY(-2px); }
+.btn:active { transform: translateY(0) scale(0.985); }
+
+.btn-primary {
+  background: var(--gradient-primary);
+  border: none;
+  color: #0b0820;
+  font-weight: 800;
+  letter-spacing: 0.2px;
+}
+
+.btn-primary:hover {
+  filter: brightness(1.08) saturate(1.05);
+  box-shadow: 0 10px 32px -8px var(--primary-glow);
+}
+
+.btn-secondary:hover {
+  border-color: var(--border-glow);
+  box-shadow: 0 6px 22px -10px var(--primary-glow);
+}
+
+/* --- form controls: violet focus ring --- */
+.form-control {
+  transition: border-color 0.22s ease, box-shadow 0.22s ease, background 0.22s ease;
+}
+
+.form-control:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+
+/* --- jersey quick-select chips --- */
+.chip {
+  transition: transform 0.2s var(--ease-out), background 0.25s ease,
+              color 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
+}
+.chip:hover { transform: translateY(-2px); border-color: var(--border-glow); }
+.chip.active {
+  background: var(--gradient-primary);
+  color: #0b0820;
+  border-color: transparent;
+  font-weight: 800;
+  box-shadow: 0 6px 18px -8px var(--primary-glow);
+}
+
+/* --- pipeline flow steps: hover raise, active pulse --- */
+.flow-step {
+  transition: transform 0.3s var(--ease-out), border-color 0.3s ease,
+              box-shadow 0.3s ease, background 0.3s ease;
+}
+.flow-step:hover {
+  transform: translateY(-4px) scale(1.02);
+  border-color: var(--border-glow);
+  box-shadow: 0 12px 30px -14px var(--primary-glow);
+}
+.flow-step .step-icon { transition: transform 0.3s var(--ease-out); }
+.flow-step:hover .step-icon { transform: scale(1.12) rotate(-4deg); }
+
+@keyframes step-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(168, 85, 247, 0.35); }
+  50%      { box-shadow: 0 0 0 10px rgba(168, 85, 247, 0); }
+}
+.flow-step.active {
+  border-color: var(--primary);
+  animation: step-pulse 2.4s ease-out infinite;
+}
+
+.flow-arrow { color: var(--text-dim); transition: color 0.3s ease; }
+.pipeline-flow-diagram:hover .flow-arrow { color: var(--primary); }
+
+/* --- progress bar: gradient fill + travelling shimmer while running --- */
+.progress-bar-fill {
+  background: var(--gradient-primary);
+  position: relative;
+  overflow: hidden;
+  transition: width 0.5s var(--ease-out);
+}
+
+@keyframes shimmer { to { transform: translateX(220%); } }
+
+.progress-bar-fill::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  width: 45%;
+  background: var(--gradient-sheen);
+  transform: translateX(-120%);
+  animation: shimmer 1.6s linear infinite;
+}
+
+/* --- stat cards --- */
+.stat-card,
+.stat-box {
+  transition: transform 0.28s var(--ease-out), border-color 0.28s ease,
+              box-shadow 0.28s ease, background 0.28s ease;
+}
+.stat-card:hover,
+.stat-box:hover {
+  transform: translateY(-4px);
+  border-color: var(--border-glow);
+  box-shadow: 0 14px 34px -16px var(--primary-glow);
+}
+
+/* --- click-to-track video: it is the primary interaction, so make the target
+       area obvious and give it a focus glow while the pointer is over it --- */
+.click-track-section .click-preview-wrapper {
+  transition: box-shadow 0.3s ease, border-color 0.3s ease;
+}
+.click-track-section .click-preview-wrapper:hover {
+  border-color: var(--primary) !important;
+  box-shadow: 0 0 0 1px var(--primary), 0 18px 50px -18px var(--primary-glow);
+}
+
+/* --- detected-player boxes in the "Load Players" picker --- */
+.player-box {
+  transition: border-color 0.15s ease, background 0.15s ease,
+              transform 0.15s var(--ease-out), box-shadow 0.15s ease;
+}
+.player-box:hover {
+  transform: scale(1.03);
+  box-shadow: 0 0 0 2px var(--accent-cyan), 0 8px 20px -8px rgba(34, 211, 238, 0.5);
+  z-index: 5;
+}
+
+/* --- upload dropzone --- */
+.upload-dropzone {
+  transition: border-color 0.28s ease, background 0.28s ease, transform 0.28s var(--ease-out);
+}
+.upload-dropzone:hover,
+.upload-dropzone.dragover {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  transform: translateY(-2px);
+}
+.upload-dropzone .upload-icon { transition: transform 0.3s var(--ease-out), color 0.3s ease; }
+.upload-dropzone:hover .upload-icon { transform: translateY(-3px) scale(1.08); color: var(--primary); }
+
+/* --- brand mark: spin the ball on header hover --- */
+@keyframes ball-roll { to { transform: rotate(360deg); } }
+.brand:hover .fa-spin-hover { animation: ball-roll 1.1s linear infinite; }
+
+.accent-text {
+  background: var(--gradient-primary);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* --- "Pipeline Active" pulse dot --- */
+@keyframes badge-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.badge-pulse i { animation: badge-blink 1.8s ease-in-out infinite; color: var(--accent-green); }
+
+/* --- table rows --- */
+tbody tr { transition: background 0.18s ease; }
+tbody tr:hover { background: var(--primary-soft); }
+
+/* --- custom scrollbars, themed to match --- */
+* { scrollbar-width: thin; scrollbar-color: var(--primary-deep) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, var(--primary), var(--primary-deep));
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background-clip: border-box; }
+
+/* --- respect the OS "reduce motion" setting: keep every hover CUE (colour,
+       glow, border) but drop the movement and the infinite loops --- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001s !important;
+  }
+  .glass-card:hover,
+  .btn:hover,
+  .chip:hover,
+  .flow-step:hover,
+  .stat-card:hover,
+  .stat-box:hover,
+  .player-box:hover,
+  .upload-dropzone:hover { transform: none; }
+  .progress-bar-fill::after { display: none; }
 }

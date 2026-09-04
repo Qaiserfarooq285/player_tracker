@@ -121,9 +121,8 @@
             <select id="video-select" class="form-control">
               <option value="clip1 43.mp4">clip1 43.mp4 (Target #43 - 4K Veo Camera)</option>
               <option value="clip2 77.mp4" selected>clip2 77.mp4 (Target #77 - 4K Veo Camera)</option>
-              <option value="video1/clip1.mp4">video1/clip1.mp4 (Match Clip 1)</option>
-              <option value="video2/clip2.mp4">video2/clip2.mp4 (Match Clip 2)</option>
-              <option value="Jordan Thomas Highlight Video.mp4">Jordan Thomas Highlight Video.mp4 (Compilation)</option>
+              <option value="video2/chelsea_burnley_target10.mp4">video2/chelsea_burnley_target10.mp4 (Manual annotation, target #10)</option>
+              <option value="video3/chelsea_burnley_target2.mp4">video3/chelsea_burnley_target2.mp4 (Manual annotation, target #2)</option>
             </select>
           </div>
         </div>
@@ -137,15 +136,22 @@
         </div>
 
         <!-- Target Jersey Input & Quick Select Chips -->
+        <!-- "streamed-gathering-treehouse" plan Stage E, 2026-09-04: this field used to default
+             to value="10" (and chip #10 pre-selected "active"), which real-run evidence
+             (work/chelsea_burnley_target2/selection.json carrying target_jersey: 10 for a clip
+             whose own filename says target2) confirmed was silently sent to the API whenever a
+             user left it untouched. It is now blank/optional by default -- a jersey number is
+             metadata only (CLAUDE.md §3.1); the actual target identity comes from a verified
+             click/profile (Stage E), not from this field. -->
         <div class="form-group margin-top-md">
-          <label><i class="fa-solid fa-shirt"></i> Target Jersey Number</label>
+          <label><i class="fa-solid fa-shirt"></i> Target Jersey Number <span class="form-hint">(optional -- metadata only; click a player below to set identity)</span></label>
           <div class="jersey-input-row">
             <div class="jersey-number-badge">#</div>
-            <input type="number" id="target-jersey-input" class="form-control jersey-input" value="10" min="1" max="99">
+            <input type="number" id="target-jersey-input" class="form-control jersey-input" placeholder="e.g. 10 (optional)" min="1" max="99">
           </div>
           <div class="jersey-chips">
             <span class="chip-label">Quick Select:</span>
-            <button class="chip active" onclick="setJersey(10)">#10</button>
+            <button class="chip" onclick="setJersey(10)">#10</button>
             <button class="chip" onclick="setJersey(11)">#11</button>
             <button class="chip" onclick="setJersey(7)">#7</button>
             <button class="chip" onclick="setJersey(77)">#77</button>
@@ -172,31 +178,6 @@
               <span class="form-hint">Format: <code>Min MM:SS player #10 in [colour] [action]</code> (guarantees tracking lock on #10).</span>
             </div>
           </div>
-        </div>
-
-        <!-- Interactive Click-to-Track Player Box -->
-        <div class="form-group margin-top-md">
-          <label><i class="fa-solid fa-hand-pointer"></i> Interactive Click-to-Track Player (Click directly on player #10)</label>
-          <div class="click-preview-wrapper" id="click-preview-wrapper" style="position: relative; cursor: crosshair; background: #000; border-radius: 8px; overflow: hidden; border: 1px solid rgba(255,255,255,0.15);">
-            <video id="preview-video" style="width: 100%; display: block; max-height: 240px; object-fit: contain;" controls preload="metadata">
-              <source id="preview-video-src" src="/media/clip1 43.mp4" type="video/mp4">
-            </video>
-            <div id="click-marker" class="hidden" style="position: absolute; width: 44px; height: 80px; border: 3px solid #ef4444; background: rgba(239, 68, 68, 0.2); transform: translate(-50%, -50%); pointer-events: none; box-shadow: 0 0 12px #ef4444; border-radius: 4px; box-sizing: border-box;">
-              <div id="click-marker-label" style="position: absolute; top: -22px; left: -3px; background: #ef4444; color: #fff; font-size: 11px; font-weight: 800; padding: 2px 6px; border-radius: 3px; white-space: nowrap; font-family: 'JetBrains Mono', monospace;">#10 | TARGET</div>
-            </div>
-          </div>
-          <span class="form-hint" id="click-hint"><i class="fa-solid fa-info-circle"></i> Pause video at any frame and click directly on player #10 to pin tracking target.</span>
-
-          <button id="btn-load-players" type="button" class="btn btn-secondary btn-block margin-top-sm">
-            <i class="fa-solid fa-users-viewfinder"></i> Load Players at This Moment
-          </button>
-          <span class="form-hint">Detects every visible player at the video's current paused time and shows a clickable box on each -- click the exact player you want, no jersey number needed.</span>
-
-          <div id="frame-players-wrapper" class="frame-players-wrapper hidden">
-            <img id="frame-players-image" alt="Detected players at this moment" />
-            <div id="frame-players-boxes"></div>
-          </div>
-          <span class="form-hint hidden" id="frame-players-hint"></span>
         </div>
 
         <!-- Action Button -->
@@ -230,19 +211,48 @@
       </div>
     </section>
 
+    <!-- Interactive Click-to-Track Player Section (full-width for precise clicking) -->
+    <section class="click-track-section">
+      <div class="glass-card">
+        <div class="card-header">
+          <h3><i class="fa-solid fa-hand-pointer"></i> Interactive Click-to-Track Player</h3>
+        </div>
+        <span class="form-hint" id="click-hint"><i class="fa-solid fa-info-circle"></i> Pause the video at any frame and click directly on the target player to pin the tracking target -- shown at full size for precise clicking.</span>
+        <div class="click-preview-wrapper margin-top-sm" id="click-preview-wrapper" style="position: relative; cursor: crosshair; background: #000; border-radius: 8px; overflow: hidden; border: 1px solid rgba(255,255,255,0.15);">
+          <video id="preview-video" style="width: 100%; display: block;" controls preload="metadata">
+            <source id="preview-video-src" src="/media/clip1 43.mp4" type="video/mp4">
+          </video>
+          <div id="click-marker" class="hidden" style="position: absolute; width: 44px; height: 80px; border: 3px solid #ef4444; background: rgba(239, 68, 68, 0.2); transform: translate(-50%, -50%); pointer-events: none; box-shadow: 0 0 12px #ef4444; border-radius: 4px; box-sizing: border-box;">
+            <div id="click-marker-label" style="position: absolute; top: -22px; left: -3px; background: #ef4444; color: #fff; font-size: 11px; font-weight: 800; padding: 2px 6px; border-radius: 3px; white-space: nowrap; font-family: 'JetBrains Mono', monospace;">CANDIDATE</div>
+          </div>
+        </div>
+
+        <button id="btn-load-players" type="button" class="btn btn-secondary btn-block margin-top-sm">
+          <i class="fa-solid fa-users-viewfinder"></i> Load Players at This Moment
+        </button>
+        <span class="form-hint">Detects every visible player at the video's current paused time and shows a clickable box on each -- click the exact player you want, no jersey number needed.</span>
+
+        <div id="frame-players-wrapper" class="frame-players-wrapper hidden">
+          <img id="frame-players-image" alt="Detected players at this moment" />
+          <div id="frame-players-boxes"></div>
+        </div>
+        <span class="form-hint hidden" id="frame-players-hint"></span>
+      </div>
+    </section>
+
     <!-- Main Results & Analytics Dashboard Section (Revealed when results ready) -->
-    <section class="dashboard-section" id="results-dashboard">
+    <section class="dashboard-section hidden" id="results-dashboard">
       
       <!-- Dashboard Top Header Bar -->
       <div class="dashboard-header-bar glass-card">
         <div class="player-profile-summary">
           <div class="jersey-avatar">
-            <span id="dash-jersey-num">11</span>
+            <span id="dash-jersey-num">--</span>
           </div>
           <div class="player-details">
-            <h2 id="dash-player-title">TARGET PLAYER #11</h2>
+            <h2 id="dash-player-title">TARGET PLAYER</h2>
             <div class="player-meta-tags">
-              <span class="meta-tag" id="dash-identity-status"><i class="fa-solid fa-shield-check"></i> Identity: Verified (PARSeq OCR)</span>
+              <span class="meta-tag" id="dash-identity-status"><i class="fa-solid fa-shield-check"></i> Identity: --</span>
               <span class="meta-tag"><i class="fa-solid fa-video"></i> Source: <span id="dash-video-name">clip2 77.mp4</span></span>
               <span class="meta-tag"><i class="fa-solid fa-crosshair"></i> Tracker: ByteTrack</span>
             </div>
@@ -278,7 +288,7 @@
 
           <div class="video-player-wrapper">
             <video id="annotated-video-player" controls preload="metadata" poster="">
-              <source src="/media/output/clip2_77/original_annotated_video.mp4" type="video/mp4">
+              <source id="annotated-video-src" src="" type="video/mp4">
               Your browser does not support the video tag.
             </video>
           </div>

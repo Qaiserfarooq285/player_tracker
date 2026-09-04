@@ -1,0 +1,294 @@
+"""Stage E of the "streamed-gathering-treehouse" plan (`apps/api/main.py`): "the click is a
+candidate, not a command." Pure function-level unit tests with everything I/O-heavy (video decode,
+jersey OCR/PARSeq model loading, parquet reads) mocked out -- no GPU, no real video, no network,
+mirroring `tests/test_target_verify.py`'s own real-measured-fixture style for the one REJECT case
+that exercises the genuine `verify_candidate` scoring path end to end.
+
+Covers:
+- `ProcessRequest.target_jersey` now defaults to `None`, not `10` (the confirmed real
+  `chelsea_burnley_target2` contamination bug).
+- `_find_output_dir` is EXACT match only, never a substring fallback.
+- `_resolve_target_click`: no stored profile establishes TARGET_001 (persisted); a stored profile
+  treats the click as a candidate -- ACCEPT reconnects (same `target_id`, no redundant
+  save/rebuild here -- that is `run_pipeline_for_video`'s own job, see that function's docstring),
+  REJECT/UNCERTAIN raises `ClickRejected` and never touches the stored profile.
+"""
+
+from __future__ import annotations
+
+import importlib
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+from src.common.io import load_yaml
+from src.common.types import BBox, Track, TrackBox
+from src.track.target import KitColourSample, TargetProfile
+from src.track.target_verify import TargetVerdict, VerdictDecision
+
+main = importlib.import_module("apps.api.main")
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# Same real, measured CIELAB values as tests/test_target_verify.py (chelsea_burnley_target10,
+# 2026-09-02) -- reused here, not re-derived, so the one real (non-mocked) REJECT test below
+# exercises `verify_candidate`'s actual scoring against the exact real failure this whole plan
+# exists to catch, not a synthetic pair.
+BLUE_10 = (44.9, 7.5, -24.0)  # Chelsea #10, visually confirmed
+CLARET_21 = (52.9, 5.0, -1.0)  # Burnley #21, visually confirmed -- dE from BLUE_10 is 24.5
+
+
+def _cfg() -> dict:
+    """The two config sections `_resolve_target_click` actually reads -- `configs["target"]` (for
+    `build_target_profile`) and `configs["events"]["kit_colour"]` (merged into `target_cfg` for
+    `verify_candidate`, exactly as that module's own docstring requires). `_click_evidence_for_
+    candidate` is mocked out in every test below, so it never needs the other config sections a
+    real `_run_pipeline_job` call would supply."""
+    return {
+        "target": load_yaml(REPO_ROOT / "configs" / "target.yaml"),
+        "events": load_yaml(REPO_ROOT / "configs" / "events.yaml"),
+    }
+
+
+def _box(t: float, height: float = 100.0) -> TrackBox:
+    return TrackBox(frame_index=int(t * 10), t=t, bbox=BBox(x1=0, y1=0, x2=50, y2=height), conf=0.9)
+
+
+def _track(tid: int, boxes: list[TrackBox], team: int | None = None) -> Track:
+    return Track(id=tid, take_id=0, boxes=boxes, team=team)
+
+
+def _kit(torso=None, shorts=None, socks=None) -> KitColourSample:
+    return KitColourSample(
+        torso_lab=torso, shorts_lab=shorts, socks_lab=socks, take_id=0, t=1.0, confidence=1.0
+    )
+
+
+def _profile(
+    kit: KitColourSample | None = None,
+    jersey_number: int | None = None,
+    median_height: float = 100.0,
+) -> TargetProfile:
+    return TargetProfile(
+        jersey_number=jersey_number,
+        jersey_source="click" if jersey_number is not None else None,
+        kit=kit,
+        kit_bank=[kit] if kit is not None else [],
+        median_height=median_height,
+        team_cluster=0,
+        established_take_id=0,
+        established_track_id=1,
+        established_t=0.0,
+        links=[],
+    )
+
+
+# ---------------------------------------------------------------------------
+# ProcessRequest.target_jersey default
+# ---------------------------------------------------------------------------
+
+
+def test_process_request_target_jersey_defaults_to_none():
+    """The confirmed real bug: a request that omits `target_jersey` entirely (a pure click/
+    track-id selection with no jersey field filled in) must NOT silently become jersey #10 --
+    `work/chelsea_burnley_target2/selection.json` carrying `target_jersey: 10` for a video whose
+    own filename says `target2` is exactly this default leaking through."""
+    req = main.ProcessRequest(video_name="video3/chelsea_burnley_target2.mp4")
+    assert req.target_jersey is None
+
+
+def test_process_request_target_jersey_still_honours_an_explicit_value():
+    req = main.ProcessRequest(video_name="clip2 77.mp4", target_jersey=77)
+    assert req.target_jersey == 77
+
+
+# ---------------------------------------------------------------------------
+# /api/results slug matching -- exact only
+# ---------------------------------------------------------------------------
+
+
+def test_find_output_dir_exact_match(tmp_path):
+    (tmp_path / "chelsea_burnley_target10").mkdir()
+    found = main._find_output_dir(tmp_path, "chelsea_burnley_target10")
+    assert found == tmp_path / "chelsea_burnley_target10"
+
+
+def test_find_output_dir_rejects_substring_match(tmp_path):
+    """Real bug fixed here: the old `slug in d.name or d.name in slug` fallback would have
+    matched `chelsea_burnley_target1` against the on-disk `chelsea_burnley_target10` (the shorter
+    string is a substring of the longer one) -- serving a DIFFERENT run's results. Exact match
+    only means this must now come back `None`, not the wrong directory."""
+    (tmp_path / "chelsea_burnley_target10").mkdir()
+    assert main._find_output_dir(tmp_path, "chelsea_burnley_target1") is None
+    assert main._find_output_dir(tmp_path, "chelsea_burnley_target100") is None
+
+
+def test_find_output_dir_no_match_returns_none(tmp_path):
+    assert main._find_output_dir(tmp_path, "nothing_here") is None
+
+
+# ---------------------------------------------------------------------------
+# _resolve_target_click
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_target_click_first_click_establishes_and_persists(tmp_path, monkeypatch):
+    """No stored profile -> this selection ESTABLISHES `TARGET_001`, authoritative, and is
+    persisted immediately (`save_target_profile`) -- plan Stage E's first bullet."""
+    monkeypatch.setattr(main, "WORK_DIR", tmp_path)  # never touch the real repo work/ tree
+
+    candidate = _track(16, [_box(0.0, 100), _box(1.0, 100)], team=0)
+    kit_sample = _kit(torso=BLUE_10)
+    monkeypatch.setattr(
+        main, "_click_evidence_for_candidate", lambda *a, **k: (candidate, kit_sample, "10")
+    )
+
+    saved: dict = {}
+
+    def _fake_save(profile, path):
+        saved["profile"] = profile
+        saved["path"] = path
+
+    monkeypatch.setattr("src.track.target.save_target_profile", _fake_save)
+
+    result = main._resolve_target_click(
+        Path("input/fake_video.mp4"), _cfg(), None, 0, 16, click_t=12.5
+    )
+
+    assert isinstance(result, TargetProfile)
+    assert result.target_id == "TARGET_001"
+    assert result.jersey_source == "click"
+    assert result.jersey_number == 10
+    assert result.established_take_id == 0
+    assert result.established_track_id == 16
+    assert result.established_t == 12.5
+    assert result.kit is not None  # the one supplied kit sample aggregated in
+    # persisted immediately, not deferred to the (out-of-scope) pipeline run:
+    assert saved["profile"] is result
+    assert saved["path"] == tmp_path / "fake_video" / "target.json"
+
+
+def test_resolve_target_click_missing_candidate_is_a_loud_failure(monkeypatch):
+    """Defensive branch: `_click_evidence_for_candidate` returning `(None, None, None)` (the
+    track could not even be re-located) must raise, never silently proceed."""
+    monkeypatch.setattr(main, "_click_evidence_for_candidate", lambda *a, **k: (None, None, None))
+    with pytest.raises(main.ClickRejected):
+        main._resolve_target_click(Path("input/fake_video.mp4"), _cfg(), None, 0, 99, None)
+
+
+def test_resolve_target_click_second_click_accept_reconnects_same_target(monkeypatch):
+    """A stored profile exists -> ACCEPT reconnects: the SAME profile object/`target_id` comes
+    back, and -- per `_resolve_target_click`'s own docstring -- neither `build_target_profile` nor
+    `save_target_profile` is called here at all: the actual reconnect + memory-bank update +
+    persistence is `run_pipeline_for_video`'s own already-wired job when it re-verifies this same
+    override a moment later, so doing it twice here would double-insert the same evidence."""
+    profile = _profile(kit=_kit(torso=BLUE_10), jersey_number=10)
+    candidate = _track(52, [_box(30.0, 100)], team=0)
+    monkeypatch.setattr(
+        main,
+        "_click_evidence_for_candidate",
+        lambda *a, **k: (candidate, _kit(torso=BLUE_10), "10"),
+    )
+
+    fake_verdict = TargetVerdict(decision=VerdictDecision.ACCEPT, score=0.95, evidence={})
+    verify_mock = MagicMock(return_value=fake_verdict)
+    monkeypatch.setattr("src.track.target_verify.verify_candidate", verify_mock)
+
+    build_mock = MagicMock()
+    save_mock = MagicMock()
+    monkeypatch.setattr("src.track.target.build_target_profile", build_mock)
+    monkeypatch.setattr("src.track.target.save_target_profile", save_mock)
+
+    result = main._resolve_target_click(
+        Path("input/fake_video.mp4"), _cfg(), profile, 1, 52, click_t=None
+    )
+
+    assert result is profile  # identically the SAME TargetProfile / target_id, a true reconnect
+    verify_mock.assert_called_once()
+    build_mock.assert_not_called()
+    save_mock.assert_not_called()
+
+
+def test_resolve_target_click_second_click_reject_keeps_target_lost(monkeypatch):
+    """The real measured failure this whole plan exists to catch, run through `_resolve_target_
+    click` end to end with the REAL `verify_candidate` (not mocked): a profile built on Chelsea's
+    blue #10 must REJECT a claret Burnley #21 candidate on kit colour alone. The stored profile
+    must never be touched (`build_target_profile`/`save_target_profile` both unused) and the
+    raised message must name the reason in plain language."""
+    profile = _profile(kit=_kit(torso=BLUE_10, shorts=BLUE_10, socks=BLUE_10), jersey_number=10)
+    candidate = _track(47, [_box(40.0, 100)], team=0)
+    claret_kit = _kit(torso=CLARET_21, shorts=CLARET_21, socks=CLARET_21)
+    monkeypatch.setattr(
+        main, "_click_evidence_for_candidate", lambda *a, **k: (candidate, claret_kit, None)
+    )
+
+    build_mock = MagicMock()
+    save_mock = MagicMock()
+    monkeypatch.setattr("src.track.target.build_target_profile", build_mock)
+    monkeypatch.setattr("src.track.target.save_target_profile", save_mock)
+
+    with pytest.raises(main.ClickRejected) as excinfo:
+        main._resolve_target_click(Path("input/fake_video.mp4"), _cfg(), profile, 0, 47, None)
+
+    message = str(excinfo.value)
+    assert "CLICK REJECTED" in message
+    assert "TARGET_001" in message
+    assert "different kit colour" in message
+    assert "Target remains lost" in message
+    build_mock.assert_not_called()
+    save_mock.assert_not_called()
+
+
+def test_resolve_target_click_uncertain_is_treated_as_rejection(monkeypatch):
+    """`target_verify.py`'s own rule: UNCERTAIN must never be a weak ACCEPT. `_resolve_target_
+    click` must raise exactly like a REJECT (`ClickRejected`), with a score-based reason since
+    `rejected_reason` is deliberately absent from an UNCERTAIN verdict's evidence."""
+    profile = _profile(kit=_kit(torso=BLUE_10), jersey_number=10)
+    candidate = _track(9, [_box(5.0, 100)], team=0)
+    monkeypatch.setattr(
+        main,
+        "_click_evidence_for_candidate",
+        lambda *a, **k: (candidate, _kit(torso=BLUE_10), "10"),
+    )
+
+    fake_verdict = TargetVerdict(decision=VerdictDecision.UNCERTAIN, score=0.81, evidence={})
+    monkeypatch.setattr(
+        "src.track.target_verify.verify_candidate", MagicMock(return_value=fake_verdict)
+    )
+    save_mock = MagicMock()
+    monkeypatch.setattr("src.track.target.save_target_profile", save_mock)
+
+    with pytest.raises(main.ClickRejected) as excinfo:
+        main._resolve_target_click(Path("input/fake_video.mp4"), _cfg(), profile, 0, 9, None)
+
+    message = str(excinfo.value)
+    assert "CLICK REJECTED" in message
+    assert "0.81" in message
+    assert "Target remains lost" in message
+    save_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _click_rejection_message
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "reason_code,expected_label",
+    [
+        ("wrong_kit_colour", "different kit colour"),
+        ("wrong_jersey_number", "different jersey number"),
+        ("height_mismatch", "different player height"),
+        ("score_below_uncertain_low", "overall match score too low"),
+    ],
+)
+def test_click_rejection_message_labels_every_hard_reject_reason(reason_code, expected_label):
+    profile = _profile(jersey_number=11)
+    verdict = TargetVerdict(
+        decision=VerdictDecision.REJECT, score=0.0, evidence={"rejected_reason": reason_code}
+    )
+    message = main._click_rejection_message(profile, verdict)
+    assert expected_label in message
+    assert "#11" in message
+    assert "TARGET_001" in message

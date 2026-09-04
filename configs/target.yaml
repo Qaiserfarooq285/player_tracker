@@ -140,3 +140,44 @@ trajectory:
   # (unlike `stitch_timeline`'s own within-take-only join), where a much bigger apparent pixel jump
   # is expected and should not by itself crater the score.
   max_plausible_bbox_heights: 6.0
+
+frame_state:
+  # Stage A of the "streamed-gathering-treehouse" plan (`src/track/target_state.py`,
+  # `build_target_timeline`) -- the per-TRACKING-SAMPLE state machine that decides, for every real
+  # tracking instant across a take, whether the target's red/amber box may draw at all. Only ever
+  # consulted when a `TargetProfile` is in play (Stage B, `src/pipeline/run.py`); every pre-existing
+  # profile-less flow (CLAUDE.md §14's filename-jersey auto flow, ADR-15, ADR-19) never reads this
+  # block at all.
+  max_sample_age_s: 0.04 # ⚠️ REASONED-BUT-UNMEASURED, but directly DERIVED, not guessed: tracking
+  # runs at `configs/hardware.yaml: stages.track.fps_sample`=25, so one real sampling step is
+  # 1/25=0.04s exactly. Set to EXACTLY one step (not a multiple) on purpose -- this is the plan's
+  # own hole-A fix ("never a nearest-sample fallback... interpolate only between two REAL
+  # bracketing samples"), and the whole point is that a target box must not survive even a single
+  # missed detection undetected as a gap. If `stages.track.fps_sample` ever changes, this must be
+  # recomputed (1 / new_fps_sample) in the same commit -- deliberately duplicated rather than
+  # cross-imported from hardware.yaml, per this project's own per-config-file-independence
+  # convention (see e.g. `configs/highlights.yaml: click_reid.min_height_ratio`'s own precedent).
+  occlusion_iou: 0.10 # ⚠️ REASONED-BUT-UNMEASURED (owner's spec names occlusion/loss as distinct
+  # states but gives no numeric IoU floor). 10% box overlap between the target's last known
+  # position and another track is a low bar deliberately -- an occluder rarely fully overlaps the
+  # occluded player's own box (they are standing beside/in front of, not exactly on top of, each
+  # other), so a stricter floor would mis-classify most real occlusions as plain LOST instead.
+  partial_occlusion_iou: 0.15 # ⚠️ REASONED-BUT-UNMEASURED. Slightly ABOVE occlusion_iou on purpose:
+  # this test only runs when a real accepted-fragment sample already exists (the box IS being
+  # drawn), so it should take a slightly more convincing overlap to flag "your view of this box is
+  # partially blocked" than the "is anyone even standing where the target was last seen" test above.
+  search_grace_s: 2.0 # ⚠️ REASONED-BUT-UNMEASURED. How long a target can be genuinely missing (no
+  # real sample, no occluding track) before the panel escalates from LOST to actively SEARCHING --
+  # matches this module's own established "a couple of seconds is a human-readable beat" scale
+  # (`_BANNER_SECONDS`=2.0, `_CAPTION_DURATION_S`=2.5 in `src/pipeline/annotated_video.py`).
+  reconnect_hold_s: 1.5 # ⚠️ REASONED-BUT-UNMEASURED. How long the panel keeps saying RECONNECTED
+  # after a SEARCHING gap closes, before reverting to the ordinary VERIFIED/COLOUR-MATCH header --
+  # long enough for a viewer to actually notice the callout, short enough not to linger once the
+  # target is confidently back.
+  render_lookup_tolerance_s: 0.20 # How far the RENDER LOOP (native fps, e.g. 25-30) may look
+  # sideways from a rendered frame's own timestamp to find the nearest precomputed
+  # `TargetFrameStatus` (built at the tracking-sample cadence above, `max_sample_age_s`=0.04s
+  # apart). ⚠️ REASONED-BUT-UNMEASURED: generous enough to always find SOME entry within a take's
+  # own real tracked span (never wider than one detection-fps step's worth of native frames), tight
+  # enough that a render never manufactures a timeline entry for a timestamp genuinely outside that
+  # span -- CLAUDE.md's own "fail closed: no timeline entry for a timestamp => no target box" rule.

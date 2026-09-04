@@ -97,7 +97,18 @@ JOBS: dict[str, dict[str, Any]] = {}
 
 class ProcessRequest(BaseModel):
     video_name: str
-    target_jersey: int | None = 10
+    # Real bug fixed here ("streamed-gathering-treehouse" plan Stage E, 2026-09-04): this used to
+    # default to `10`, and a request that simply omitted `target_jersey` (e.g. a pure click/track-id
+    # selection with no jersey field filled in) silently got jersey #10 wired into
+    # `configs["identity"]["target_jersey"]` below -- confirmed as the real, on-disk cause of
+    # `work/chelsea_burnley_target2/selection.json` carrying `target_jersey: 10` for a clip whose
+    # own filename says `target2`. `configs/run.yaml: target_jersey` is already `null` by default
+    # (CLAUDE.md Golden Rule 5: an honest "not given" beats a fabricated number) -- this API model
+    # now matches that, so nothing downstream silently substitutes 10 for "the field was left
+    # blank". `apps/web/index.html`'s jersey input field's own default value and `app.js`'s
+    # `|| 10`/`|| '10'` fallbacks were the other two places this same "10" was seeping in from and
+    # are fixed alongside this.
+    target_jersey: int | None = None
     track_id: str | None = None
     manual_annotations: str | None = None
     click_x: float | None = None
@@ -431,6 +442,217 @@ def _match_click_to_track(
     return take_id, (best_track_id if best_dist < max_dist_px else None)
 
 
+class ClickRejected(Exception):
+    """Raised by `_resolve_target_click` when a human selection (a raw coordinate click, or the
+    "Load Players" picker's own `take_id:raw_track_id` text entry -- both are "a click" for this
+    purpose) is judged REJECT or UNCERTAIN against the already-established persistent target
+    identity ("streamed-gathering-treehouse" plan Stage E). Carries the exact plain-language,
+    user-facing message; `_run_pipeline_job` catches this and fails the job loudly, touching
+    NOTHING on disk (CLAUDE.md Golden Rule 5 -- an honest failure beats a confident wrong answer).
+    """
+
+
+# Plain-language labels for `TargetVerdict.evidence["rejected_reason"]` (`src/track/target_verify.
+# py::verify_candidate`'s own hard-reject/score-floor codes) -- UI text, not a tunable threshold,
+# so (unlike every numeric knob in this codebase, CLAUDE.md §10) this is fine as an ordinary
+# in-code mapping rather than a `configs/*.yaml` entry: the SAME "no magic strings" discipline
+# `configs/annotations.yaml`'s phrase map follows would apply if these were being matched FROM
+# free text, but here they are simply reworded for display, matching the existing hardcoded
+# "Your click did not land on a detected player..." message already in this file.
+_REJECTION_REASON_LABELS = {
+    "wrong_kit_colour": "different kit colour",
+    "wrong_jersey_number": "different jersey number",
+    "height_mismatch": "different player height",
+    "score_below_uncertain_low": "overall match score too low",
+}
+
+
+def _click_rejection_message(profile: Any, verdict: Any) -> str:
+    """The owner's own wording (plan Stage E): `CLICK REJECTED -- this player does not match
+    TARGET #<N> (<reason>). Target remains lost; click the original player again.` `verdict` may be
+    REJECT (a hard reject, or score below `uncertain_low` -- `rejected_reason` is always present)
+    or UNCERTAIN (`target_verify.py`'s own docstring: never a weak accept, treated identically to
+    REJECT here -- `rejected_reason` is NOT set for this decision, so a generic score-based reason
+    is built instead, still carrying the real measured score)."""
+    reason_code = verdict.evidence.get("rejected_reason")
+    if reason_code is not None:
+        reason = _REJECTION_REASON_LABELS.get(reason_code, reason_code)
+    else:
+        reason = f"match uncertain, score={verdict.score:.2f}"
+    jersey_part = f"#{profile.jersey_number} " if profile.jersey_number is not None else ""
+    return (
+        f"CLICK REJECTED -- this player does not match {jersey_part}{profile.target_id} "
+        f"({reason}). Target remains lost; click the original player again."
+    )
+
+
+def _click_evidence_for_candidate(
+    video_path: Path, configs: dict[str, dict], take_id: int, track_id: int
+) -> tuple[Any, Any, str | None]:
+    """`(candidate_track, kit_sample, jersey_digits)` for ONE clicked/overridden track -- computed
+    for JUST that track (never the whole take) so an interactive click endpoint stays cheap.
+    `kit_sample` is a `src.track.target.KitColourSample` or `None`; `jersey_digits` is a confident
+    digit string or `None` -- both feed `src.track.target_verify.verify_candidate`'s
+    `kit_by_track`/`jersey_by_track` (a missing entry is "no evidence for this track", never a
+    rejection, per that module's own docstring) and `src.track.target.build_target_profile`'s own
+    `kit_samples`/`jersey_number` for a first-click establishment. `(None, None, None)` when the
+    track itself isn't even in that take's cached tracks -- the caller already confirmed the track
+    exists via `_match_click_to_track`/`parse_track_id_overrides` before calling in, so this should
+    not happen in practice, but is handled as an honest failure rather than assumed impossible.
+    """
+    from src.common.io import load_models_parquet
+    from src.common.types import Track
+    from src.common.video import probe
+    from src.identity.jersey_models import free_optional_jersey_stack, load_optional_jersey_stack
+    from src.pipeline.run import _effective_frame_size
+    from src.shots.boundaries import detect_takes
+    from src.track.click_reid import collect_track_jersey_digits
+    from src.track.kit_wiring import build_take_kit_colour
+
+    tracks_path = _canonical_work_dir(video_path) / "track" / "tracks.parquet"
+    tr_list = load_models_parquet(tracks_path, Track)
+    candidate = next((tr for tr in tr_list if tr.take_id == take_id and tr.id == track_id), None)
+    if candidate is None:
+        return None, None, None
+
+    takes = detect_takes(video_path, configs["shots"], work_root=WORK_DIR)
+    take = next((t for t in takes if t.id == take_id), None)
+    if take is None:
+        return candidate, None, None
+
+    frame_w, frame_h = _effective_frame_size(video_path, configs["hardware"]["decode"])
+    native_meta = probe(video_path)
+    native_w, native_h = native_meta["width"], native_meta["height"]
+    scale_x = native_w / frame_w if frame_w else 1.0
+    scale_y = native_h / frame_h if frame_h else 1.0
+    max_samples = (
+        configs["highlights"].get("click_reid", {}).get("max_jersey_samples_per_track", 40)
+    )
+
+    _kit_lab_by_track, kit_sample_by_track = build_take_kit_colour(
+        video_path,
+        take,
+        [candidate],
+        scale_x,
+        scale_y,
+        native_w,
+        native_h,
+        configs["identity"],
+        configs["target"],
+        configs["events"]["kit_colour"],
+        max_samples,
+    )
+    kit_sample = kit_sample_by_track.get(candidate.id)
+
+    legibility_model, parseq_model, parseq_transform = load_optional_jersey_stack(
+        configs["identity"]
+    )
+    try:
+        jersey_by_track = collect_track_jersey_digits(
+            video_path,
+            [candidate],
+            scale_x,
+            scale_y,
+            native_w,
+            native_h,
+            configs["identity"],
+            legibility_model,
+            parseq_model,
+            parseq_transform,
+            max_samples,
+            configs["identity"]["aggregation"],
+        )
+    finally:
+        free_optional_jersey_stack(legibility_model, parseq_model)
+
+    return candidate, kit_sample, jersey_by_track.get(candidate.id)
+
+
+def _resolve_target_click(
+    video_path: Path,
+    configs: dict[str, dict],
+    profile: Any,
+    take_id: int,
+    track_id: int,
+    click_t: float | None,
+) -> Any:
+    """One (take_id, track_id) human selection against the persistent target identity
+    ("streamed-gathering-treehouse" plan Stage E): "The click means: 'This is a candidate for
+    TARGET_001.' It does NOT mean: 'Make this player the target.'"
+
+    - No stored profile (`profile is None`) -> this selection ESTABLISHES the persistent target
+      (`src.track.target.build_target_profile`, `jersey_source="click"`), persisted immediately
+      via `save_target_profile` (CLAUDE.md Golden Rule 4 -- a human-provided identity is the
+      strongest evidence available, and persisting it right away means a later request in this
+      same run always finds it, even if this run's own background pipeline job fails partway
+      through). Returns the new profile.
+    - A stored profile exists -> the selection is a CANDIDATE, verified via
+      `src.track.target_verify.verify_candidate`. ACCEPT -> returns `profile` UNCHANGED: the
+      reconnect itself (same `target_id`) and the actual `update_memory_bank` call + re-persist
+      are already performed by `run_pipeline_for_video`'s own Stage 4/5 wiring when it re-verifies
+      this SAME override with the full per-take evidence a moment later -- doing it again here
+      would double-insert a near-duplicate kit sample for the identical physical evidence into the
+      memory bank. REJECT or UNCERTAIN (never a weak accept, `target_verify.py`'s own docstring)
+      -> raises `ClickRejected`; the caller must stop before ever calling `run_pipeline_for_video`
+      or touching `target.json` again.
+    """
+    from src.track.target import build_target_profile, save_target_profile
+    from src.track.target_verify import VerdictDecision, verify_candidate
+
+    candidate, kit_sample, jersey_digits = _click_evidence_for_candidate(
+        video_path, configs, take_id, track_id
+    )
+    if candidate is None:
+        raise ClickRejected(
+            f"take={take_id} track={track_id} could not be re-located for identity "
+            'verification. Target remains lost; use "Load Players" and click a currently '
+            "detected box."
+        )
+
+    jersey_number = int(jersey_digits) if jersey_digits is not None else None
+
+    if profile is None:
+        established_t = (
+            click_t if click_t is not None else (candidate.boxes[0].t if candidate.boxes else 0.0)
+        )
+        new_profile = build_target_profile(
+            candidate,
+            [kit_sample] if kit_sample is not None else [],
+            jersey_number,
+            "click",
+            take_id,
+            established_t,
+            configs["target"],
+        )
+        save_target_profile(new_profile, _canonical_work_dir(video_path) / "target.json")
+        return new_profile
+
+    target_cfg = {**configs["target"], "kit_colour": configs["events"]["kit_colour"]}
+    kit_by_track = {candidate.id: kit_sample} if kit_sample is not None else {}
+    jersey_by_track = {candidate.id: jersey_digits} if jersey_digits is not None else {}
+    verdict = verify_candidate(profile, candidate, kit_by_track, jersey_by_track, target_cfg)
+    if verdict.decision != VerdictDecision.ACCEPT:
+        raise ClickRejected(_click_rejection_message(profile, verdict))
+    return profile
+
+
+def _find_output_dir(output_dir: Path, slug: str) -> Path | None:
+    """`output_dir / slug` if it exists, else `None` -- EXACT match only.
+
+    Real bug fixed here ("streamed-gathering-treehouse" plan Stage E, 2026-09-04): this used to
+    fall back to `slug in d.name or d.name in slug` substring matching, which can serve a
+    DIFFERENT run's output entirely -- e.g. a request for slug `chelsea_burnley_target1` would
+    substring-match the on-disk `chelsea_burnley_target10` (the shorter string IS a substring of
+    the longer one), silently handing back a different player's stats/highlights under the
+    requested slug. `_canonical_slug`/`work_dir_for` already compute the exact slug every run
+    actually writes to (`src.common.io._slugify`), so an exact match is always available for any
+    real run -- a miss means the run truly doesn't exist (or hasn't finished), which is the honest
+    answer (CLAUDE.md Golden Rule 5), not a plausible-looking wrong one.
+    """
+    candidate = output_dir / slug
+    return candidate if candidate.exists() else None
+
+
 def _run_pipeline_job(
     job_id: str,
     video_name: str,
@@ -574,6 +796,48 @@ def _run_pipeline_job(
                     job["logs"].append(f"ERROR: {job['error']}")
                     return
 
+            # "streamed-gathering-treehouse" plan Stage E: every (take_id, track_id) pair in
+            # `overrides` above is a human SELECTION -- a raw coordinate click OR the "Load
+            # Players" picker's own `take_id:raw_track_id` text entry, both equally "a click" for
+            # this purpose -- and a click is a CANDIDATE for the persistent target identity, never
+            # a command that blindly overwrites it: "The click means: 'This is a candidate for
+            # TARGET_001.' It does NOT mean: 'Make this player the target.'" No stored
+            # `work/<slug>/target.json` -> the first pair here establishes it (authoritative,
+            # CLAUDE.md Golden Rule 4). A stored profile already exists -> every pair is verified
+            # against it (`src.track.target_verify.verify_candidate`) BEFORE the real pipeline
+            # ever runs -- a REJECT/UNCERTAIN fails the job loudly right here, with zero side
+            # effects, rather than silently resolving to `target_lost` deep inside a "completed"
+            # job (see `_resolve_target_click`'s own docstring for why the ACCEPT reconnect itself
+            # is deliberately left to `run_pipeline_for_video`'s own Stage 4/5 wiring below, not
+            # duplicated here).
+            from src.track.target import load_target_profile
+
+            target_json_path = _canonical_work_dir(video_path) / "target.json"
+            target_profile = (
+                load_target_profile(target_json_path) if target_json_path.exists() else None
+            )
+            try:
+                for pair_take_id, pair_track_id in sorted(overrides.items()):
+                    target_profile = _resolve_target_click(
+                        video_path, configs, target_profile, pair_take_id, pair_track_id, click_t
+                    )
+            except ClickRejected as rejection:
+                job["status"] = "failed"
+                job["error"] = str(rejection)
+                job["logs"].append(f"ERROR: {job['error']}")
+                return
+            if target_profile is not None:
+                jersey_label = (
+                    target_profile.jersey_number
+                    if target_profile.jersey_number is not None
+                    else "?"
+                )
+                job["logs"].append(
+                    f"{target_profile.target_id} (#{jersey_label}) confirmed for this "
+                    "selection -- verified identity now drives target rendering/stats for "
+                    "the whole run."
+                )
+
             run_pipeline_for_video(
                 video_path,
                 configs,
@@ -581,6 +845,7 @@ def _run_pipeline_job(
                 manual_overrides=overrides,
                 work_root=WORK_DIR,
                 output_root=OUTPUT_DIR,
+                target_profile=target_profile,
             )
         elif annotations_path.exists():
             job["logs"].append("Branching to MANUAL-EVENTS pipeline via sidecar...")
@@ -692,15 +957,14 @@ def get_job_status(job_id: str):
 @app.get("/api/results/{slug}")
 def get_results(slug: str):
     """Retrieve player stats, event timeline, heatmaps, and highlight clips URLs."""
-    # Find matching directory in OUTPUT_DIR
-    out_dir = OUTPUT_DIR / slug
-    if not out_dir.exists():
-        # Try matching substring or replacement
-        matches = [d for d in OUTPUT_DIR.glob("*") if slug in d.name or d.name in slug]
-        if matches:
-            out_dir = matches[0]
-        else:
-            raise HTTPException(status_code=404, detail=f"No results found for slug '{slug}'")
+    # Real bug fixed here ("streamed-gathering-treehouse" plan Stage E, 2026-09-04): this used to
+    # fall back to `slug in d.name or d.name in slug` substring matching when there was no exact
+    # directory, which can serve a DIFFERENT run's output entirely (e.g. `chelsea_burnley_target1`
+    # substring-matches the on-disk `chelsea_burnley_target10`). `_find_output_dir` is EXACT-match
+    # only -- see its own docstring.
+    out_dir = _find_output_dir(OUTPUT_DIR, slug)
+    if out_dir is None:
+        raise HTTPException(status_code=404, detail=f"No results found for slug '{slug}'")
 
     slug_name = out_dir.name
 

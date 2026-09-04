@@ -66,6 +66,7 @@ from src.highlights.ranking import rank_events
 from src.highlights.reel import build_reel, select_for_export
 from src.highlights.selection import (
     SelectionResult,
+    TakeSelection,
     select_targets,
     timeline_coverage_seconds,
 )
@@ -85,6 +86,7 @@ from src.track.click_reid import (
 from src.track.kit_wiring import build_take_kit_colour
 from src.track.run import run_track_stage
 from src.track.target import KitColourSample, TargetProfile, save_target_profile
+from src.track.target_state import TargetFrameStatus, build_target_timeline
 from src.track.tracker import assign_take_id
 
 logger = get_logger(__name__)
@@ -192,6 +194,22 @@ def _track_active_windows(
         if tr is not None and tr.boxes:
             windows[tid] = [(tr.boxes[0].t, tr.boxes[-1].t)]
     return windows
+
+
+def _accepted_target_ids(sel: TakeSelection, target_profile_active: bool) -> list[int]:
+    """The SAME accepted-fragment id set that gates the target's red/amber box (Stage A/C,
+    `src.track.target_state.build_target_timeline`) and Stage D's own event attribution -- the
+    plan's own explicit "box and statistics share one identity" requirement. A `TargetProfile`-
+    driven take (`target_profile_active=True`) uses ONLY `sel.verified_track_ids` -- the human-
+    established seed or whichever candidate(s) independently passed `verify_candidate` (never a
+    fragment `stitch_timeline` merely joined by geometry, "Candidate != Target"). Every
+    pre-existing profile-LESS method (arrow_vote/heuristic_fallback/none, and a profile-less
+    manual_override -- CLAUDE.md §14's auto flow, ADR-15, ADR-19) has no such verified/candidate
+    distinction at all, so this falls back to the full stitched `sel.track_ids`, EXACTLY the
+    pre-existing behaviour for every one of those flows (unchanged by this plan)."""
+    if target_profile_active:
+        return sel.verified_track_ids
+    return sel.track_ids
 
 
 def _stitched_virtual_track(take_id: int, take_tracks: list[Track], ids: list[int]) -> Track:
@@ -853,6 +871,63 @@ def run_pipeline_for_video(
         # out to every caller that happens to supply a profile.
         save_target_profile(target_profile, work_dir / "target.json")
 
+    # --- Stage A/B ("streamed-gathering-treehouse" plan): per-frame target state machine --------
+    # Only ever built when a persistent `TargetProfile` actually drove this run's own target
+    # selection above -- every pre-existing profile-less flow (CLAUDE.md §14's filename-jersey auto
+    # flow, ADR-15's extended pipeline, ADR-19's manual-events mode) never reaches this block, so
+    # its own rendering/stats stay byte-for-byte unchanged. See `src.track.target_state`'s own
+    # module docstring for the three holes this closes (stale box / silent ID switch / whole-span
+    # active window).
+    target_timeline_by_take: dict[int, list[TargetFrameStatus]] = {}
+    if target_profile is not None:
+        t0 = time.time()
+        tracks_by_take_for_timeline: dict[int, list[Track]] = defaultdict(list)
+        for tr in tracks:
+            tracks_by_take_for_timeline[tr.take_id].append(tr)
+        frame_state_cfg = configs["target"]["frame_state"]
+        timeline_path = work_dir / "target_timeline.json"
+        timeline_cache_config = {
+            "frame_state_cfg": frame_state_cfg,
+            "verified_track_ids_by_take": {
+                sel.take_id: sel.verified_track_ids for sel in selection.takes
+            },
+            "n_tracks": len(tracks),
+        }
+        timeline_cache = StageCache(timeline_path, timeline_cache_config, stage="target_timeline")
+        if timeline_cache.hit():
+            cached_timeline = load_json(timeline_path)
+            target_timeline_by_take = {
+                int(take_id_str): [TargetFrameStatus.model_validate(s) for s in statuses]
+                for take_id_str, statuses in cached_timeline.items()
+            }
+        else:
+            for sel in selection.takes:
+                take = takes_by_id.get(sel.take_id)
+                if take is None:
+                    continue
+                target_timeline_by_take[sel.take_id] = build_target_timeline(
+                    take,
+                    sel.verified_track_ids,
+                    tracks_by_take_for_timeline.get(sel.take_id, []),
+                    frame_state_cfg,
+                )
+            save_json(
+                {
+                    str(take_id): [status.model_dump(mode="json") for status in statuses]
+                    for take_id, statuses in target_timeline_by_take.items()
+                },
+                timeline_path,
+            )
+            timeline_cache.write_meta()
+        timings.append(
+            StageTiming(
+                stage="target_timeline",
+                wall_seconds=round(time.time() - t0, 2),
+                vram_peak_mb=None,
+                notes=f"n_takes={len(target_timeline_by_take)}",
+            )
+        )
+
     # --- Stage 6: ranking + cutting + reel + stats ---------------------------------------------
     t0 = time.time()
     timeline_tracks_by_take: dict[int, list[Track]] = defaultdict(list)
@@ -999,6 +1074,16 @@ def run_pipeline_for_video(
     full_attribution_cfg = configs["highlights"]["attribution"]
     full_key_moment_cfg = configs["key_moments"]
 
+    # Stage D ("streamed-gathering-treehouse" plan): box and statistics share ONE identity. Every
+    # per-take lookup below uses `_accepted_target_ids` -- the SAME accepted-fragment set that
+    # gates the target's own red/amber box (Stage A/B/C) -- instead of `tir.location_track_ids`
+    # directly, so a fragment the box gate refuses to draw (an unverified, merely geometry-stitched
+    # candidate) can never still silently feed this take's own stats. A no-op for every
+    # profile-less take (`_accepted_target_ids` falls back to `sel.track_ids` == the pre-existing
+    # `tir.location_track_ids` exactly) -- see that function's own docstring.
+    sel_by_take_id = {sel.take_id: sel for sel in selection.takes}
+    target_profile_active = target_profile is not None
+
     full_drops = DropCounter("full_events")
     events_by_number: dict[int, list[Event]] = defaultdict(list)
     takes_used_by_number: dict[int, list[tuple[int, list[int]]]] = defaultdict(list)
@@ -1011,6 +1096,13 @@ def run_pipeline_for_video(
         take_balls = full_balls_by_take.get(take.id, [])
         if not take_tracks:
             continue
+
+        sel = sel_by_take_id.get(take.id)
+        accepted_ids = (
+            _accepted_target_ids(sel, target_profile_active)
+            if sel is not None
+            else tir.location_track_ids
+        )
 
         all_events, identity_of, _identity_confidence = compute_take_all_events(
             take,
@@ -1028,12 +1120,12 @@ def run_pipeline_for_video(
             all_events,
             take_tracks,
             take_balls,
-            tir.location_track_ids,
+            accepted_ids,
             identity_of,
             full_attribution_cfg,
         )
 
-        virtual_track = _stitched_virtual_track(take.id, take_tracks, tir.location_track_ids)
+        virtual_track = _stitched_virtual_track(take.id, take_tracks, accepted_ids)
         existing_windows = [
             (ev.t_start, ev.t_end)
             for ev in target_events
@@ -1042,9 +1134,9 @@ def run_pipeline_for_video(
         candidates = find_candidate_windows(
             virtual_track, full_key_moment_cfg["prefilter"], existing_windows
         )
-        key_moment_player_id = target_identity_id(tir.location_track_ids, identity_of)
-        if key_moment_player_id is None and tir.location_track_ids:
-            key_moment_player_id = tir.location_track_ids[0]
+        key_moment_player_id = target_identity_id(accepted_ids, identity_of)
+        if key_moment_player_id is None and accepted_ids:
+            key_moment_player_id = accepted_ids[0]
         key_events = classify_candidate_windows(
             video_path,
             take.id,
@@ -1057,7 +1149,7 @@ def run_pipeline_for_video(
         target_events = target_events + key_events
 
         events_by_number[tir.jersey_number].extend(target_events)
-        takes_used_by_number[tir.jersey_number].append((take.id, tir.location_track_ids))
+        takes_used_by_number[tir.jersey_number].append((take.id, accepted_ids))
 
     full_dropped = full_drops.report()
     if full_dropped:
@@ -1091,6 +1183,7 @@ def run_pipeline_for_video(
         hardware_cfg=configs["hardware"],
         profile_cfg=configs["profile"],
         selection_cfg=configs["highlights"]["selection"],
+        target_timelines=target_timeline_by_take or None,
     )
     timings.append(
         StageTiming(

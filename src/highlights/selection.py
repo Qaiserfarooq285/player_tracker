@@ -100,6 +100,20 @@ class TakeSelection(BaseModel):
     # `selection.json` gains one new, harmless `"evidence": {}` key per take.
     evidence: dict = Field(default_factory=dict)
 
+    # Stage B of the "streamed-gathering-treehouse" plan (per-frame target identity gate,
+    # `src/track/target_state.py`): the SUBSET of `track_ids` that may ever render a red/amber box
+    # or be counted into the target's own stats -- "Candidate != Target". Populated ONLY by
+    # `_select_take_with_profile` below (i.e. only when a `TargetProfile` drives selection):
+    # `[override_track_id]`/`[winner_id]` for an ACCEPTed `manual_override`/`target_reidentified`
+    # (the click itself, or whichever candidate(s) independently passed `verify_candidate` -- see
+    # that function's own comment for why ALL of `accepts`, not just the winner, are kept), `[]`
+    # for `target_lost`. Left at its empty-list default for every pre-existing profile-less method
+    # (arrow_vote/heuristic_fallback/none, and a profile-less manual_override) -- those methods
+    # have no separate "verified vs merely-geometry-stitched" distinction at all, so
+    # `src.pipeline.run._accepted_target_ids` falls back to the full `track_ids` for them,
+    # preserving their exact pre-existing behaviour (CLAUDE.md §14's auto flow, ADR-15, ADR-19).
+    verified_track_ids: list[int] = Field(default_factory=list)
+
 
 class SelectionResult(BaseModel):
     """Stage 5's output artifact (`work/<slug>/selection.json`). Never claims human confirmation
@@ -444,6 +458,11 @@ def _select_take_with_profile(
                     coverage_seconds=timeline_coverage_seconds(track_ids, take_tracks),
                     take_duration_seconds=take_duration,
                     evidence=verdict.evidence,
+                    # Stage B: the click itself is the ONLY accepted fragment -- everything else
+                    # `stitch_timeline` joined above is geometry-only, never independently
+                    # verified, so it stays a candidate (green box), never red (plan's "Candidate
+                    # != Target").
+                    verified_track_ids=[override_track_id],
                 )
             else:
                 # Stage 2's own rule: UNCERTAIN is never a weak accept, treated exactly like
@@ -498,6 +517,14 @@ def _select_take_with_profile(
                     coverage_seconds=timeline_coverage_seconds(track_ids, take_tracks),
                     take_duration_seconds=take_duration,
                     evidence=verdict.evidence,
+                    # Stage B: EVERY candidate that independently passed `verify_candidate` this
+                    # take, not just the highest-scoring `winner_id` -- each one was tested against
+                    # the SAME strict hard-reject-then-score gate on its own merits (e.g. two
+                    # ByteTrack fragments of the same real player either side of a brief ID reset,
+                    # both plausibly the target). A fragment merely joined to the winner by
+                    # `stitch_timeline`'s own geometry (in `track_ids` but NOT in `accepts`) never
+                    # went through that gate and stays a candidate (green), never red.
+                    verified_track_ids=[tid for tid, _ in accepts],
                 )
 
     _update_profile_after_take(profile, take, selection, take_tracks, kit_by_track, target_cfg)

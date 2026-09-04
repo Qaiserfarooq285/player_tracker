@@ -33,6 +33,7 @@ from src.goal.detect import GoalStructure, goal_bbox_at, take_motion_score
 from src.identity.verify import TakeIdentityResult
 from src.pipeline.player_output import _TIMELINE_EVENT_TYPES, _key_moment_label
 from src.track.continuity import build_take_identities
+from src.track.target_state import TargetFrameState, TargetFrameStatus
 from src.track.tracker import assign_take_id
 
 logger = get_logger("annotated_video")
@@ -121,6 +122,16 @@ _MAX_BOX_INTERP_GAP_S = 0.35  # largest gap between two TRACKING samples that `i
 # is 0.10s, so this comfortably covers a couple of dropped samples while refusing to invent a
 # straight-line path across a real occlusion (Golden Rule 5) -- beyond it, the honest
 # nearest-sample behaviour is kept.
+# NOTE: this is the GREEN-box (non-target) tolerance only -- deliberately unchanged by the
+# "streamed-gathering-treehouse" plan (Stage C's own scoping: green boxes make no identity claim,
+# so today's forgiving nearest-sample behaviour stays exactly as it was). The TARGET box, when a
+# per-frame timeline is in play, is gated by `configs/target.yaml: frame_state.
+# render_lookup_tolerance_s` instead -- see `render_full_annotated_video`'s own `target_timelines`
+# handling below.
+_DEFAULT_TARGET_TIMELINE_LOOKUP_TOLERANCE_S = 0.20  # fallback ONLY for a caller that passes
+# `target_timelines` without also passing `target_frame_state_cfg` -- every real caller
+# (`src.pipeline.run`) passes both together, sourced from `configs/target.yaml`; see that config's
+# own comment for the real, provenance-tracked value.
 
 # Live-panel categories, matching statcard.md's own summary lines (CLAUDE.md §13.2) so the
 # overlay never presents a number the stat card itself doesn't also report (Golden Rule 5).
@@ -478,7 +489,9 @@ def _draw_box_with_label(
     )
 
 
-def _target_panel_header(identity: TakeIdentityResult) -> str:
+def _target_panel_header(
+    identity: TakeIdentityResult, frame_status: TargetFrameStatus | None = None
+) -> str:
     """The panel's own headline for a verified take -- owner-reported bug fix, 2026-08-31:
     "VERIFIED" used to be shown unconditionally, even when the drawn BOX itself was only a
     kit-colour pick among many identically-dressed teammates (no real digit read backing it) --
@@ -487,7 +500,21 @@ def _target_panel_header(identity: TakeIdentityResult) -> str:
     as its own pure function so this exact text decision is directly unit-testable without a real
     frame/cv2 draw call -- see `TakeIdentityResult.association_confirmed_by_jersey`'s own docstring
     for the full story.
+
+    `frame_status` ("streamed-gathering-treehouse" plan Stage C, optional, `None` for every
+    pre-existing caller -- backward compatible) is this NATIVE FRAME's own precomputed
+    `TargetFrameStatus` (`src.track.target_state.build_target_timeline`), when a per-frame timeline
+    is in play for this take. When its `bbox` is `None` (OCCLUDED/LOST/SEARCHING -- the target
+    genuinely isn't visible right now), that per-frame state REPLACES the per-take headline below,
+    exactly as the plan's own spec requires. `RECONNECTED` is called out even though a box IS
+    drawn, so a viewer knows the box just came back after a real search. Every other visible state
+    (`VISIBLE`/`PARTIALLY_OCCLUDED`) falls through to the ordinary per-take headline unchanged.
     """
+    if frame_status is not None:
+        if frame_status.bbox is None:
+            return f"TARGET #{identity.jersey_number} -- {frame_status.state.value.upper()}"
+        if frame_status.state == TargetFrameState.RECONNECTED:
+            return f"TARGET #{identity.jersey_number} -- RECONNECTED"
     if render_tier(identity) == "amber":
         # Plan Stage 5's own amber-tier panel text (owner decision, this session): a no-profile
         # arrow/heuristic pick is real location evidence, never a visually-confirmed jersey read
@@ -506,11 +533,21 @@ def _draw_live_panel(
     take_id: int | None,
     identity: TakeIdentityResult | None,
     counts: dict[str, int] | None,
+    frame_status: TargetFrameStatus | None = None,
 ) -> None:
+    """`frame_status` ("streamed-gathering-treehouse" plan Stage C, optional, `None` for every
+    pre-existing caller -- backward compatible): this native frame's own precomputed
+    `TargetFrameStatus`, when a per-frame timeline is in play for this take. When it says the
+    target genuinely isn't visible right now (`bbox is None` -- OCCLUDED/LOST/SEARCHING), that
+    per-frame reality overrides even a "red tier" take's own headline (plan's own explicit
+    requirement) instead of silently implying a box is still there."""
     lines: list[tuple[str, tuple[int, int, int]]] = []
     tier = render_tier(identity)
-    if tier in ("red", "amber"):
-        lines.append((_target_panel_header(identity), _PANEL_HEADER_COLOR))
+    target_not_visible_this_frame = (
+        frame_status is not None and frame_status.bbox is None and identity is not None
+    )
+    if target_not_visible_this_frame or tier in ("red", "amber"):
+        lines.append((_target_panel_header(identity, frame_status), _PANEL_HEADER_COLOR))
         for etype in _PANEL_EVENT_TYPES:
             lines.append(
                 (f"{_PANEL_LABELS[etype]}: {(counts or {}).get(etype, 0)}", _PANEL_TEXT_COLOR)
@@ -841,10 +878,24 @@ def render_full_annotated_video(
     hardware_cfg: dict | None = None,
     profile_cfg: dict | None = None,
     selection_cfg: dict | None = None,
+    target_timelines: dict[int, list[TargetFrameStatus]] | None = None,
+    target_frame_state_cfg: dict | None = None,
 ) -> Path:
     """Render CLAUDE.md §13.1's primary output for one video: the WHOLE input, at native
     resolution/fps, red-boxed only during known-identity takes, green everywhere else, with a
     live stats panel and CUT banners -- then mux the original audio back in.
+
+    `target_timelines`/`target_frame_state_cfg` ("streamed-gathering-treehouse" plan Stage C,
+    optional, `None` for every pre-existing caller -- behaviour-preserving): `target_timelines`
+    is `{take_id: [TargetFrameStatus, ...]}` (`src.track.target_state.build_target_timeline`),
+    built ONLY for takes whose target selection was driven by a persistent `TargetProfile`
+    (`src.pipeline.run`'s own Stage A/B wiring). For any take present here, the TARGET box is
+    drawn EXCLUSIVELY from that take's own precomputed timeline -- never from `identity_by_take`'s
+    `location_track_ids`/`interpolated_bbox`/`is_target_active_at` (the pre-existing, more
+    forgiving path, which stays completely unchanged for every OTHER take, i.e. every take not
+    present in `target_timelines` at all). This is what closes the plan's three holes (stale box /
+    silent ID switch / whole-span active window) without touching a single byte of behaviour for
+    any flow that never supplies a `TargetProfile` (CLAUDE.md §14's auto flow, ADR-15, ADR-19).
 
     `goal_region_cfg` (ADR-20/21, optional) is `configs/goal_region.yaml` verbatim -- when this
     video's own slug (`work_dir.name`) has one or more marked polygons, they're drawn as a thin
@@ -923,6 +974,19 @@ def render_full_annotated_video(
         (tr.take_id, tr.id): _SortedTimeIndex(tr.boxes, key=lambda b: b.t) for tr in tracks
     }
 
+    # Stage C ("streamed-gathering-treehouse" plan): one presorted lookup index per take that HAS a
+    # precomputed target timeline -- a take absent here (every pre-existing profile-less flow, and
+    # any profile-driven take that happened to produce an empty timeline) simply falls through to
+    # the pre-existing `interpolated_bbox`/`is_target_active_at`/`target_ids` path below, unchanged.
+    target_timeline_index_by_take: dict[int, _SortedTimeIndex] = {
+        take_id: _SortedTimeIndex(statuses, key=lambda s: s.t)
+        for take_id, statuses in (target_timelines or {}).items()
+        if statuses
+    }
+    target_timeline_lookup_tolerance_s = (target_frame_state_cfg or {}).get(
+        "render_lookup_tolerance_s", _DEFAULT_TARGET_TIMELINE_LOOKUP_TOLERANCE_S
+    )
+
     progress_by_number: dict[int, _NumberProgress] = {
         number: _NumberProgress(events) for number, events in events_by_number.items()
     }
@@ -973,10 +1037,38 @@ def render_full_annotated_video(
             target_ids = red_box_track_ids(identity)
             amber_ids = amber_box_track_ids(identity)
 
+            # Stage C ("streamed-gathering-treehouse" plan): a take present in
+            # `target_timeline_index_by_take` was resolved by a persistent `TargetProfile`
+            # (src.pipeline.run's Stage A/B) -- for THAT take, the target box comes EXCLUSIVELY
+            # from its own precomputed per-frame timeline below, never from the pre-existing
+            # `target_ids`/`interpolated_bbox`/`is_target_active_at` path (which stays completely
+            # unchanged for every other take -- see this function's own docstring).
+            timeline_index = (
+                target_timeline_index_by_take.get(take_id) if take_id is not None else None
+            )
+            frame_status: TargetFrameStatus | None = (
+                timeline_index.nearest(t, target_timeline_lookup_tolerance_s)
+                if timeline_index is not None
+                else None
+            )
+            # The plan's own absolute rule: "when choosing between (A) no target box or (B) a
+            # target box on a possibly wrong player, ALWAYS choose (A)". `frame_status.bbox` is
+            # `None` in every state except VISIBLE/PARTIALLY_OCCLUDED/RECONNECTED (see
+            # `src.track.target_state.build_target_timeline`'s own docstring) -- this is the ONLY
+            # id ever allowed to render red/amber when a timeline is in play this take.
+            target_drawn_track_id = (
+                frame_status.tracker_id
+                if frame_status is not None and frame_status.bbox is not None
+                else None
+            )
+
             for tr in take_tracks:
                 # Interpolated, not nearest-snapped: tracking is sampled well below the video's
                 # own frame rate, so snapping visibly lags the box behind a moving player -- see
-                # `interpolated_bbox`'s own docstring for the measured numbers.
+                # `interpolated_bbox`'s own docstring for the measured numbers. Used for EVERY
+                # non-target box regardless of timeline mode (green boxes make no identity claim,
+                # so they keep today's forgiving behaviour -- plan Stage C's own deliberate
+                # scoping).
                 bbox = interpolated_bbox(
                     box_index_by_track[(tr.take_id, tr.id)], t, 0.3, _MAX_BOX_INTERP_GAP_S
                 )
@@ -984,7 +1076,31 @@ def render_full_annotated_video(
                     continue
                 x1, y1 = bbox.x1 * scale_x, bbox.y1 * scale_y
                 x2, y2 = bbox.x2 * scale_x, bbox.y2 * scale_y
-                if tr.id in target_ids and is_target_active_at(identity, tr.id, t):
+
+                if timeline_index is not None:
+                    if tr.id == target_drawn_track_id:
+                        # Drawn separately below from `frame_status`'s own STRICT bbox -- skip the
+                        # ordinary green draw so this track isn't boxed twice this frame.
+                        continue
+                    # Every other track this take -- including any OTHER accepted fragment not
+                    # currently active, and any unverified candidate `stitch_timeline` merely
+                    # joined by geometry -- is an ordinary green "other player" box. "Candidate !=
+                    # Target": a fragment that was never independently verified must never render
+                    # red/amber, no matter how plausible its geometry looks.
+                    display_id = display_identity_by_take.get(take_id, {}).get(tr.id, tr.id)
+                    _draw_box_with_label(
+                        frame,
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        f"ID: {display_id}",
+                        _GREEN,
+                        _px(_GREEN_THICKNESS, overlay_scale),
+                        _LABEL_FONT_SCALE_OTHER * overlay_scale,
+                        _px(_LABEL_THICKNESS_OTHER, overlay_scale),
+                    )
+                elif tr.id in target_ids and is_target_active_at(identity, tr.id, t):
                     # ADR-18 (3): track ID and jersey identity are DIFFERENT concepts (a Track.id
                     # is a within-take tracker artifact that resets at every cut; a jersey number
                     # is a verified identity) -- show BOTH explicitly so no viewer ever reads
@@ -1042,6 +1158,37 @@ def render_full_annotated_video(
                         _px(_LABEL_THICKNESS_OTHER, overlay_scale),
                     )
 
+            if target_drawn_track_id is not None and identity is not None:
+                # The timeline's own STRICT bbox -- drawn ONCE per frame, independent of the
+                # per-track loop above (closes holes A/B/C: no nearest-sample fallback, no silent
+                # ID-switch inheritance, no whole-span "always active" window).
+                tx1, ty1 = frame_status.bbox.x1 * scale_x, frame_status.bbox.y1 * scale_y
+                tx2, ty2 = frame_status.bbox.x2 * scale_x, frame_status.bbox.y2 * scale_y
+                tier = render_tier(identity)
+                color, thickness = (
+                    (_AMBER, _AMBER_THICKNESS) if tier == "amber" else (_RED, _RED_THICKNESS)
+                )
+                state_suffix = (
+                    ""
+                    if frame_status.state == TargetFrameState.VISIBLE
+                    else f" | {frame_status.state.value.upper()}"
+                )
+                jersey_label = identity.jersey_by_track_id.get(
+                    target_drawn_track_id, identity.jersey_number
+                )
+                _draw_box_with_label(
+                    frame,
+                    tx1,
+                    ty1,
+                    tx2,
+                    ty2,
+                    f"#{jersey_label} | TARGET{state_suffix} | ID: {target_drawn_track_id}",
+                    color,
+                    _px(thickness, overlay_scale),
+                    _LABEL_FONT_SCALE_TARGET * overlay_scale,
+                    _px(_LABEL_THICKNESS_TARGET, overlay_scale),
+                )
+
             ball = ball_index.nearest(t, 0.2)
             if ball is not None:
                 scaled_bbox = ball.bbox.model_copy(
@@ -1057,7 +1204,7 @@ def render_full_annotated_video(
             counts = None
             if identity is not None and identity.status == "verified":
                 counts = progress_by_number[identity.jersey_number].advance_to(t)
-            _draw_live_panel(frame, take_id, identity, counts)
+            _draw_live_panel(frame, take_id, identity, counts, frame_status)
 
             if take is not None and t < take.t_start + _BANNER_SECONDS:
                 _draw_cut_banner(frame, take.id, identity)

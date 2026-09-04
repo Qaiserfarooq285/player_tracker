@@ -40,7 +40,7 @@ function updatePreviewVideo() {
     selectedClickPoint = null;
     selectedFramePlayer = null;
     document.getElementById('click-marker')?.classList.add('hidden');
-    document.getElementById('click-hint').innerHTML = `<i class="fa-solid fa-info-circle"></i> Pause video at any frame and click directly on player #10 to pin tracking target.`;
+    document.getElementById('click-hint').innerHTML = `<i class="fa-solid fa-info-circle"></i> Pause video at any frame and click directly on the target player to pin a tracking candidate.`;
     document.getElementById('frame-players-wrapper')?.classList.add('hidden');
     document.getElementById('frame-players-hint')?.classList.add('hidden');
     document.getElementById('track-id-input').value = '';
@@ -76,7 +76,12 @@ function initClickToTrack() {
     const xPct = (e.clientX - rect.left) / rect.width;
     const yPct = (e.clientY - rect.top) / rect.height;
     const t = video.currentTime || 0.0;
-    const targetJersey = document.getElementById('target-jersey-input').value || '10';
+    // "streamed-gathering-treehouse" plan Stage E, 2026-09-04: a click is a CANDIDATE for the
+    // persistent target identity, not a command that locks it in -- the server verifies it
+    // (kit colour / jersey / height) and may REJECT it, so this UI must never fabricate a jersey
+    // number (the old `|| '10'` fallback silently claimed "#10" for every click when the jersey
+    // field was left blank) or claim the target is "Locked" before that verification happens.
+    const jerseyValue = document.getElementById('target-jersey-input').value.trim();
 
     selectedClickPoint = { x: xPct, y: yPct, t: t };
     selectedFramePlayer = null;
@@ -88,11 +93,11 @@ function initClickToTrack() {
       marker.style.top = `${yPct * 100}%`;
       marker.classList.remove('hidden');
       const lbl = document.getElementById('click-marker-label');
-      if (lbl) lbl.textContent = `#${targetJersey} | TARGET`;
+      if (lbl) lbl.textContent = jerseyValue ? `#${jerseyValue}? CANDIDATE` : 'CANDIDATE';
     }
 
     if (hint) {
-      hint.innerHTML = `<i class="fa-solid fa-crosshair" style="color:#ef4444;"></i> <strong style="color:#ef4444;">Player #${targetJersey} Target Locked @ ${t.toFixed(1)}s!</strong> Click <em>"Run Player Tracking & Analytics"</em> below to trace player continuously in RED box.`;
+      hint.innerHTML = `<i class="fa-solid fa-crosshair" style="color:#ef4444;"></i> <strong style="color:#ef4444;">Candidate pinned @ ${t.toFixed(1)}s!</strong> The server verifies this click against the tracked target (and may reject it) before locking anything in. Click <em>"Run Player Tracking & Analytics"</em> below.`;
     }
   });
 }
@@ -300,7 +305,16 @@ async function handleFileUpload(file) {
 
 async function startPipelineProcessing() {
   const videoName = document.getElementById('video-select').value;
-  const targetJersey = parseInt(document.getElementById('target-jersey-input').value) || 10;
+  // "streamed-gathering-treehouse" plan Stage E, 2026-09-04: this used to be
+  // `parseInt(...) || 10`, which silently sent jersey #10 to the API whenever the field was left
+  // blank OR contained a non-numeric value -- the confirmed real cause of
+  // `work/chelsea_burnley_target2/selection.json` carrying `target_jersey: 10` for a clip whose
+  // own filename says `target2`. A blank/invalid field now means "no jersey number given"
+  // (`null`), matching `ProcessRequest.target_jersey`'s own corrected default -- identity comes
+  // from the verified click/profile (Stage E), not from a number nobody actually entered.
+  const jerseyRaw = document.getElementById('target-jersey-input').value.trim();
+  const parsedJersey = jerseyRaw ? parseInt(jerseyRaw, 10) : NaN;
+  const targetJersey = Number.isNaN(parsedJersey) ? null : parsedJersey;
   const trackId = document.getElementById('track-id-input').value.trim();
   const manualAnnotations = document.getElementById('manual-annotations-input').value;
 
@@ -309,7 +323,12 @@ async function startPipelineProcessing() {
     return;
   }
 
-  logTerminal(`Starting analysis for '${videoName}' with target jersey #${targetJersey}...`, 'info');
+  logTerminal(
+    targetJersey !== null
+      ? `Starting analysis for '${videoName}' with target jersey #${targetJersey}...`
+      : `Starting analysis for '${videoName}' (no jersey number given -- identity comes from the click/profile)...`,
+    'info'
+  );
   document.getElementById('btn-process').disabled = true;
   document.getElementById('btn-process').innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Processing Video...`;
 
@@ -478,8 +497,12 @@ function renderDashboard(data) {
   // Render 2D Tactical Pitch Canvas
   drawTacticalPitch(data.pitch_trajectory || []);
 
-  // Show Dashboard
-  document.getElementById('results-dashboard').scrollIntoView({ behavior: 'smooth' });
+  // Show Dashboard -- it starts `hidden` in index.html so a fresh page never shows a stale
+  // annotated video + placeholder stat values as if they were a real result (Golden Rule 5:
+  // nothing on screen should look like a finished analysis until one actually finished).
+  const dashboard = document.getElementById('results-dashboard');
+  dashboard.classList.remove('hidden');
+  dashboard.scrollIntoView({ behavior: 'smooth' });
 }
 
 function renderEventsTable(events) {
