@@ -7,6 +7,7 @@ jersey OCR, event detection, movement analytics, and stat card visualization.
 import os
 import shutil
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+from src.common.logging import get_logger
+
+logger = get_logger(__name__)
 
 # Project directory paths
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -892,9 +897,24 @@ def _run_pipeline_job(
         job["logs"].append("Pipeline processing completed successfully!")
 
     except Exception as e:
+        # Real bug found from a live failure report, 2026-09-04: `str(e)` on an exception raised
+        # with a single argument that IS `None` (e.g. `raise SomeError(some_var)` where
+        # `some_var` legitimately evaluates to `None`) renders as the literal 4-character string
+        # "None" -- which then looked EXACTLY like a swallowed error to the user ("ERROR: None" /
+        # "Job failed: None"), with no way to tell what actually broke. This job's own in-memory
+        # `job["error"]` is the ONLY thing the user ever sees; nothing was logged server-side
+        # either, so the real traceback was lost the moment this fired (CLAUDE.md Golden Rule 5 --
+        # "log everything dropped", and a silently-lost stack trace is exactly that). Now: the
+        # full traceback goes to the server log unconditionally, and `job["error"]` always carries
+        # at least the exception's own type name, even when `str(e)` itself is empty/uninformative.
+        tb = traceback.format_exc()
+        logger.error("pipeline job %s failed:\n%s", job_id, tb)
+        message = str(e).strip()
+        if not message or message == "None":
+            message = f"{type(e).__name__} (see server log for the full traceback)"
         job["status"] = "failed"
-        job["error"] = str(e)
-        job["logs"].append(f"ERROR: {str(e)}")
+        job["error"] = message
+        job["logs"].append(f"ERROR: {message}")
 
 
 @app.post("/api/process")
