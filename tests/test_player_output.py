@@ -3,12 +3,15 @@ GPU/video I/O."""
 
 from __future__ import annotations
 
+import pytest
+
 from src.common.types import Event, EventType
 from src.pipeline.player_output import (
     _HIGHLIGHT_CATEGORIES,
     _key_moment_label,
     build_event_timeline_rows,
     render_statcard_markdown,
+    write_player_output,
 )
 
 
@@ -249,3 +252,34 @@ def test_render_statcard_markdown_never_pads_timeline_to_look_complete():
     timeline_section = md.split("## Event Timeline", 1)[1]
     for label in ("Touch", "Pass", "Sprint", "Dribble", "Shot", "Tackle", "Celebration"):
         assert label not in timeline_section
+
+
+# ---------------------------------------------------------------------------
+# Plan Stage 3 (streamed-gathering-treehouse, 2026-09-14): write_player_output also writes
+# statcard.pdf beside statcard.md (src/pipeline/statcard_pdf.py). No real video/GPU I/O below --
+# empty `events`/`takes_by_id` make every highlight category empty, so `_cut_category_reel`
+# returns before touching `cut_clips`/ffmpeg (see that function's own early-return), keeping this
+# file's "pure-logic, no GPU/video I/O" scope intact (module docstring above).
+# ---------------------------------------------------------------------------
+
+pytest.importorskip("reportlab", reason="reportlab (api extra) not installed")
+
+
+def test_write_player_output_writes_statcard_pdf_alongside_markdown(tmp_path):
+    player_dir = tmp_path / "player_9"
+    write_player_output(
+        player_dir=player_dir,
+        jersey_number=9,
+        events=[],
+        possession_seconds=None,
+        distance_result=None,
+        takes_by_id={},
+        video_path=tmp_path / "does_not_matter.mp4",
+        highlights_cfg={},
+        goal_reason=None,
+        identity_status="Verified",
+    )
+    assert (player_dir / "statcard.md").exists()
+    pdf_path = player_dir / "statcard.pdf"
+    assert pdf_path.exists()
+    assert pdf_path.read_bytes().startswith(b"%PDF-")

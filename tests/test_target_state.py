@@ -434,7 +434,10 @@ def test_select_targets_with_profile_manual_override_accept_sets_verified_ids_to
         1920.0,
         1080.0,
         _selection_cfg(),
-        manual_overrides={0: 1},
+        # "streamed-gathering-treehouse" plan Stage 1: `select_targets`'s own `manual_overrides`
+        # shape is now `dict[int, list[int]]` (one or more click anchors per take) -- a
+        # single-anchor take is simply a one-element list.
+        manual_overrides={0: [1]},
         target_profile=_profile(),
         target_cfg=_target_cfg(),
         kit_by_track_by_take={0: kit_by_track},
@@ -471,3 +474,111 @@ def test_select_targets_with_profile_no_accept_is_target_lost_with_empty_verifie
     assert sel.method == "target_lost"
     assert sel.verified_track_ids == []
     assert sel.track_ids == []
+
+
+# ---------------------------------------------------------------------------
+# "streamed-gathering-treehouse" plan Stage 1: multiple click anchors in one take (the player
+# left frame and came back, giving the tracker a NEW track id -- one click can no longer cover
+# the whole take, see the plan's own Context section).
+# ---------------------------------------------------------------------------
+
+CLARET_21 = (52.9, 5.0, -1.0)  # same measured Burnley #21 CIELAB as tests/test_click_target.py
+
+
+def test_select_take_with_profile_two_seeds_both_accepted_unions_chains():
+    """Two anchors in the SAME take, far enough apart in time that `stitch_timeline` never joins
+    them on its own (5s gap vs. `stitch_max_gap_s`'s 1.5s) -- exactly the "left frame, came back,
+    got a new track id" scenario. Both independently pass `verify_candidate` -> their chains are
+    unioned (deduped, time-sorted) into ONE `track_ids`, both seeds land in `verified_track_ids`,
+    and `seed_track_id` is the FIRST accepted one (chronologically first here too)."""
+    seed1 = _player_track(1, [_box(0.0, BBox(x1=0, y1=0, x2=50, y2=100))])
+    seed2 = _player_track(5, [_box(5.0, BBox(x1=0, y1=0, x2=50, y2=100))])
+    take = _take(t_end=10.0)
+    kit_by_track = {1: _kit(BLUE_10), 5: _kit(BLUE_10)}
+    jersey_by_track = {1: "10", 5: "10"}
+
+    result = select_targets(
+        "fake.mp4",
+        None,
+        [take],
+        [seed1, seed2],
+        [],
+        1920.0,
+        1080.0,
+        _selection_cfg(),
+        manual_overrides={0: [1, 5]},
+        target_profile=_profile(),
+        target_cfg=_target_cfg(),
+        kit_by_track_by_take={0: kit_by_track},
+        jersey_by_track_by_take={0: jersey_by_track},
+    )
+    sel = result.takes[0]
+    assert sel.method == "manual_override"
+    assert sel.track_ids == [1, 5]  # unioned, time-sorted
+    assert sel.verified_track_ids == [1, 5]  # both anchors independently verified
+    assert sel.seed_track_id == 1  # first accepted, chronologically first here too
+
+
+def test_select_take_with_profile_one_accepted_one_rejected_keeps_only_accepted_chain():
+    """A second click that lands on a visually different player (wrong kit colour, same "Burnley
+    claret vs. Chelsea blue" measured pair the rest of this plan uses) must be REJECTED and
+    excluded -- never allowed to widen the accepted chain ("Candidate != Target")."""
+    good = _player_track(1, [_box(0.0, BBox(x1=0, y1=0, x2=50, y2=100))])
+    bad = _player_track(7, [_box(5.0, BBox(x1=0, y1=0, x2=50, y2=100))])
+    take = _take(t_end=10.0)
+    kit_by_track = {1: _kit(BLUE_10), 7: _kit(CLARET_21)}
+    jersey_by_track = {1: "10", 7: "21"}
+
+    result = select_targets(
+        "fake.mp4",
+        None,
+        [take],
+        [good, bad],
+        [],
+        1920.0,
+        1080.0,
+        _selection_cfg(),
+        manual_overrides={0: [1, 7]},
+        target_profile=_profile(),
+        target_cfg=_target_cfg(),
+        kit_by_track_by_take={0: kit_by_track},
+        jersey_by_track_by_take={0: jersey_by_track},
+    )
+    sel = result.takes[0]
+    assert sel.method == "manual_override"
+    assert sel.track_ids == [1]  # the rejected fragment never joins
+    assert sel.verified_track_ids == [1]
+    assert sel.seed_track_id == 1
+    assert sel.evidence["seed_evidence"][7]["decision"] == "reject"
+    assert sel.evidence["seed_evidence"][7]["rejected_reason"] == "wrong_kit_colour"
+
+
+def test_select_take_with_profile_no_seed_accepted_is_target_lost():
+    """Every anchor for this take fails verification (one wrong-kit REJECT, one whose track id
+    isn't even present in this take's tracks) -> `target_lost`, never a substitute player, exactly
+    the single-seed rule extended to N seeds."""
+    bad = _player_track(7, [_box(0.0, BBox(x1=0, y1=0, x2=50, y2=100))])
+    take = _take(t_end=10.0)
+    kit_by_track = {7: _kit(CLARET_21)}
+    jersey_by_track = {7: "21"}
+
+    result = select_targets(
+        "fake.mp4",
+        None,
+        [take],
+        [bad],
+        [],
+        1920.0,
+        1080.0,
+        _selection_cfg(),
+        manual_overrides={0: [7, 99]},  # 99 is not in this take's tracks at all
+        target_profile=_profile(),
+        target_cfg=_target_cfg(),
+        kit_by_track_by_take={0: kit_by_track},
+        jersey_by_track_by_take={0: jersey_by_track},
+    )
+    sel = result.takes[0]
+    assert sel.method == "target_lost"
+    assert sel.track_ids == []
+    assert sel.verified_track_ids == []
+    assert sel.evidence["seed_evidence"][99]["rejected_reason"] == "manual_override_track_not_found"

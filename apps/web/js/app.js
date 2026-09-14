@@ -14,10 +14,14 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 let selectedClickPoint = null;
-// Set by the frame-players picker (`/api/frame_players`) when the user clicks a detected box --
-// takes priority over `selectedClickPoint` (the raw coordinate-click fallback) because it names an
-// EXACT raw_track_id, needing no coordinate-to-box matching on the server at all.
-let selectedFramePlayer = null; // { take_id, raw_track_id, chain_id }
+// "streamed-gathering-treehouse" plan Stage 1: the frame-players picker used to overwrite a SINGLE
+// `selectedFramePlayer` scalar on every click, so a second click in the same take (the "player left
+// frame and came back with a new track id" case) silently discarded the first. `targetAnchors` is
+// now an array that APPENDS on every picker click -- each entry names an EXACT
+// `(take_id, raw_track_id)` pair, needing no coordinate-to-box matching on the server at all, and
+// takes priority over `selectedClickPoint` (the raw coordinate-click fallback, kept working
+// unchanged for backwards compatibility -- see `startPipelineProcessing`).
+let targetAnchors = []; // [{ take_id, raw_track_id, chain_id, t }, ...]
 
 function initApp() {
   checkHealth();
@@ -38,12 +42,13 @@ function updatePreviewVideo() {
     preview.src = `/media/${encodedName}`;
     preview.load();
     selectedClickPoint = null;
-    selectedFramePlayer = null;
+    targetAnchors = [];
     document.getElementById('click-marker')?.classList.add('hidden');
     document.getElementById('click-hint').innerHTML = `<i class="fa-solid fa-info-circle"></i> Pause video at any frame and click directly on the target player to pin a tracking candidate.`;
     document.getElementById('frame-players-wrapper')?.classList.add('hidden');
     document.getElementById('frame-players-hint')?.classList.add('hidden');
     document.getElementById('track-id-input').value = '';
+    renderAnchorChips();
   }
 }
 
@@ -83,8 +88,12 @@ function initClickToTrack() {
     // field was left blank) or claim the target is "Locked" before that verification happens.
     const jerseyValue = document.getElementById('target-jersey-input').value.trim();
 
+    // A raw coordinate click stays a single, EXCLUSIVE candidate (backwards compatible with the
+    // pre-Stage-1 behaviour) -- it supersedes whatever the picker had accumulated, same as the
+    // picker superseded it below. The two mechanisms are not merged into one shared anchor list.
     selectedClickPoint = { x: xPct, y: yPct, t: t };
-    selectedFramePlayer = null;
+    targetAnchors = [];
+    renderAnchorChips();
     document.getElementById('track-id-input').value = '';
     document.getElementById('frame-players-wrapper')?.classList.add('hidden');
 
@@ -187,18 +196,75 @@ function renderFramePlayers(data, videoName) {
     box.appendChild(label);
 
     box.addEventListener('click', () => {
-      boxesLayer.querySelectorAll('.player-box.selected').forEach((el) => el.classList.remove('selected'));
+      // "streamed-gathering-treehouse" plan Stage 1: APPEND, never overwrite -- a player who left
+      // frame and came back gets a NEW track id per reappearance, so this needs to be a growing
+      // set of anchors, not a single scalar (the pre-existing bug: a second click in the same take
+      // used to silently discard the first).
       box.classList.add('selected');
-      selectedFramePlayer = { take_id: data.take_id, raw_track_id: p.raw_track_id, chain_id: p.chain_id };
+      targetAnchors.push({
+        take_id: data.take_id,
+        track_id: p.raw_track_id,
+        chain_id: p.chain_id,
+        t: data.t,
+      });
       selectedClickPoint = null; // a picker selection supersedes the raw coordinate-click fallback
       document.getElementById('click-marker')?.classList.add('hidden');
-      document.getElementById('track-id-input').value = `${data.take_id}:${p.raw_track_id}`;
+      renderAnchorChips();
       document.getElementById('click-hint').innerHTML =
-        `<i class="fa-solid fa-crosshair" style="color:#10b981;"></i> <strong>Player (chain ID ${p.chain_id}) pinned @ t=${data.t.toFixed(1)}s!</strong> Click <em>"Run Player Tracking & Analytics"</em> below.`;
+        `<i class="fa-solid fa-crosshair" style="color:#10b981;"></i> <strong>Player (chain ID ${p.chain_id}) pinned @ t=${data.t.toFixed(1)}s!</strong> ${targetAnchors.length > 1 ? `${targetAnchors.length} anchors pinned so far -- click more (e.g. after the player re-enters frame) or ` : ''}Click <em>"Run Player Tracking & Analytics"</em> below.`;
     });
 
     boxesLayer.appendChild(box);
   });
+}
+
+/**
+ * "streamed-gathering-treehouse" plan Stage 1: render one removable chip per accumulated click
+ * anchor ("take 0 · track 44 · 0:48 ✕") and keep `#track-id-input` in sync as a human-readable,
+ * still hand-editable, `take:track` mirror of the same set -- typing into that field directly
+ * continues to work exactly as before (this function only ever WRITES to it in response to a
+ * picker click/chip removal, it never reads it, so nothing here fights a manual edit made in
+ * between two clicks).
+ */
+function renderAnchorChips() {
+  const container = document.getElementById('target-anchor-chips');
+  if (!container) return;
+  container.innerHTML = '';
+
+  if (targetAnchors.length === 0) {
+    container.classList.add('hidden');
+    return;
+  }
+  container.classList.remove('hidden');
+
+  targetAnchors.forEach((anchor, idx) => {
+    const chip = document.createElement('span');
+    chip.style.cssText = 'display:inline-flex; align-items:center; gap:6px; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.4); border-radius:14px; padding:4px 6px 4px 12px; font-size:12px; font-weight:600; color:#10b981; font-family:"JetBrains Mono", monospace;';
+    const tLabel = typeof anchor.t === 'number' ? `${anchor.t.toFixed(1)}s` : '?';
+    chip.innerHTML = `<span>take ${anchor.take_id} &middot; track ${anchor.track_id} &middot; ${tLabel}</span>`;
+
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.setAttribute('aria-label', `Remove anchor take ${anchor.take_id} track ${anchor.track_id}`);
+    removeBtn.style.cssText = 'background:none; border:none; color:inherit; cursor:pointer; font-weight:800; padding:0 2px; line-height:1;';
+    removeBtn.textContent = '✕';
+    removeBtn.addEventListener('click', () => removeAnchor(idx));
+    chip.appendChild(removeBtn);
+
+    container.appendChild(chip);
+  });
+
+  document.getElementById('track-id-input').value = targetAnchors
+    .map((a) => `${a.take_id}:${a.track_id}`)
+    .join(',');
+}
+
+function removeAnchor(index) {
+  targetAnchors.splice(index, 1);
+  renderAnchorChips();
+  document.getElementById('click-hint').innerHTML = targetAnchors.length
+    ? `<i class="fa-solid fa-crosshair" style="color:#10b981;"></i> <strong>${targetAnchors.length} anchor(s) pinned.</strong> Click <em>"Run Player Tracking & Analytics"</em> below.`
+    : `<i class="fa-solid fa-info-circle"></i> Pause the video at any frame and click directly on the target player to pin the tracking target -- shown at full size for precise clicking.`;
 }
 
 async function checkHealth() {
@@ -336,14 +402,26 @@ async function startPipelineProcessing() {
     const payload = {
       video_name: videoName,
       target_jersey: targetJersey,
+      // `#track-id-input` is read fresh here (not from `targetAnchors` directly) so a manual edit
+      // made after the last picker click still wins, exactly as it always has.
       track_id: trackId || null,
       manual_annotations: manualAnnotations,
     };
 
-    // Note: a frame-players picker selection doesn't need handling here -- its click handler
-    // (`renderFramePlayers`) writes `take_id:raw_track_id` directly into `#track-id-input`, which
-    // `trackId` above already reads fresh at submit time. Re-reading `selectedFramePlayer` here
-    // too would risk overriding a manual edit to that field with a stale remembered value.
+    // "streamed-gathering-treehouse" plan Stage 1: every accumulated picker-click anchor rides
+    // along as its own structured `target_clicks` entry -- the AUTHORITATIVE multi-anchor channel
+    // (the server merges it with `track_id` above, so sending both is safe: real duplicates are
+    // deduped server-side, see `normalize_manual_overrides`). `null`, not `[]`, when nothing was
+    // clicked, so the server can tell "no clicks" apart from "clicks that all got removed".
+    if (targetAnchors.length > 0) {
+      payload.target_clicks = targetAnchors.map((a) => ({
+        take_id: a.take_id,
+        track_id: a.track_id,
+        t: a.t,
+      }));
+      logTerminal(`Submitting ${targetAnchors.length} click anchor(s) across ${new Set(targetAnchors.map((a) => a.take_id)).size} take(s).`, 'info');
+    }
+
     if (selectedClickPoint) {
       payload.click_x = selectedClickPoint.x;
       payload.click_y = selectedClickPoint.y;

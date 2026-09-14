@@ -17,6 +17,7 @@ from src.common.logging import DropCounter, get_logger
 from src.common.types import Event, EventType, Take
 from src.highlights.cutting import cut_clips
 from src.highlights.reel import build_reel
+from src.pipeline.statcard_pdf import render_statcard_pdf
 
 logger = get_logger(__name__)
 
@@ -160,11 +161,13 @@ def render_statcard_markdown(
     # goal_reason is None => the event source for this run is authoritative (bug fix 2026-08-31,
     # see docstring) => a zero count is the real, honest answer "0", not "not available".
     goals_line = (
-        f"**Goals:** {goals_count}" if goals_count > 0 or goal_reason is None
+        f"**Goals:** {goals_count}"
+        if goals_count > 0 or goal_reason is None
         else f"**Goals:** {goal_reason}"
     )
     assists_line = (
-        f"**Assists:** {assists_count}" if assists_count > 0 or goal_reason is None
+        f"**Assists:** {assists_count}"
+        if assists_count > 0 or goal_reason is None
         else f"**Assists:** {goal_reason}"
     )
     lines = [
@@ -264,6 +267,9 @@ def write_player_output(
     reason (Golden Rule 5) instead of a bare "not available" whenever this player's own counts
     are genuinely zero. `identity_status` (ADR-19) is `"Verified"` by default (the existing
     ADR-15 auto path) or `"Human-provided (manual annotation)"` from Stage 4's manual-events mode.
+    Also writes `statcard.pdf` alongside `statcard.md` (Plan Stage 3, 2026-09-14,
+    `src.pipeline.statcard_pdf.render_statcard_pdf`) from the exact same inputs -- best-effort,
+    never fatal if `reportlab` isn't installed (see the try/except around that call below).
     """
     player_dir.mkdir(parents=True, exist_ok=True)
     (player_dir / "events").mkdir(parents=True, exist_ok=True)
@@ -286,6 +292,38 @@ def write_player_output(
         identity_status,
     )
     (player_dir / "statcard.md").write_text(markdown)
+
+    # Plan Stage 3 ("streamed-gathering-treehouse", 2026-09-14): a real, downloadable PDF next to
+    # the markdown, built from the SAME inputs (no re-typed/approximated numbers, unlike the old
+    # frontend exporter this replaces -- see statcard_pdf.py's own module docstring). `reportlab`
+    # lives in the OPTIONAL `api` extra (CLAUDE.md §7) -- never let its absence break the pipeline
+    # or the authoritative statcard.md this function already wrote above. Fail-soft, same pattern
+    # as `src.identity.jersey_models.load_optional_jersey_stack`: log a warning and move on, never
+    # raise, never crash the run over a missing/broken optional artifact.
+    try:
+        render_statcard_pdf(
+            jersey_number,
+            counts,
+            possession_seconds,
+            distance_result,
+            timeline_rows,
+            goal_reason,
+            identity_status,
+            output_path=player_dir / "statcard.pdf",
+        )
+    except ImportError:
+        logger.warning(
+            "reportlab is not installed (`api` extra, CLAUDE.md §7: `uv pip install -e '.[api]'`) "
+            "-- skipping statcard.pdf for player_%d; statcard.md was written normally",
+            jersey_number,
+        )
+    except Exception:
+        logger.warning(
+            "statcard.pdf rendering failed for player_%d -- statcard.md was written normally, "
+            "this player's PDF is simply missing this run",
+            jersey_number,
+            exc_info=True,
+        )
 
     drops = DropCounter(f"player_{jersey_number}_highlights")
     events_by_type: dict[EventType, list[Event]] = {}

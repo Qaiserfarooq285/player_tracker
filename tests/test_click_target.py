@@ -104,6 +104,42 @@ def test_process_request_target_jersey_still_honours_an_explicit_value():
 
 
 # ---------------------------------------------------------------------------
+# `ProcessRequest.target_clicks` / `TargetAnchor` -- "streamed-gathering-treehouse" plan Stage 1
+# ---------------------------------------------------------------------------
+
+
+def test_process_request_target_clicks_defaults_to_none():
+    """Omitting the field entirely (every pre-existing request shape: raw-coordinate click, or a
+    hand-typed `track_id`) must not implicitly become an empty list -- `None` and `[]` are
+    distinguishable states the merge logic in `_run_pipeline_job` can tell apart."""
+    req = main.ProcessRequest(video_name="x.mp4")
+    assert req.target_clicks is None
+
+
+def test_process_request_accepts_multiple_target_click_anchors():
+    """The picker's own accumulating chip list submits one `TargetAnchor` per click, possibly
+    several in the SAME take (the "player left frame, came back with a new track id" case)."""
+    req = main.ProcessRequest(
+        video_name="x.mp4",
+        target_clicks=[
+            {"take_id": 0, "track_id": 44, "t": 0.5},
+            {"take_id": 0, "track_id": 51, "t": 12.3},
+            {"take_id": 1, "track_id": 9},
+        ],
+    )
+    assert req.target_clicks == [
+        main.TargetAnchor(take_id=0, track_id=44, t=0.5),
+        main.TargetAnchor(take_id=0, track_id=51, t=12.3),
+        main.TargetAnchor(take_id=1, track_id=9, t=None),
+    ]
+
+
+def test_target_anchor_t_is_optional():
+    anchor = main.TargetAnchor(take_id=0, track_id=16)
+    assert anchor.t is None
+
+
+# ---------------------------------------------------------------------------
 # /api/results slug matching -- exact only
 # ---------------------------------------------------------------------------
 

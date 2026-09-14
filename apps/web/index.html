@@ -169,7 +169,7 @@
             <div class="form-group">
               <label><i class="fa-solid fa-hashtag"></i> Track ID Override (Optional)</label>
               <input type="text" id="track-id-input" class="form-control" placeholder="e.g. 10 or 0:10 (locks tracker onto exact player track ID)">
-              <span class="form-hint">If auto-detection picks the player standing in front, enter player #10's specific track ID here.</span>
+              <span class="form-hint">If auto-detection picks the player standing in front, enter player #10's specific track ID here. Auto-fills as a comma-separated <code>take:track</code> mirror of the anchor chips below when you click players in "Load Players" -- still fully hand-editable.</span>
             </div>
             
             <div class="form-group margin-top-md">
@@ -237,6 +237,12 @@
           <div id="frame-players-boxes"></div>
         </div>
         <span class="form-hint hidden" id="frame-players-hint"></span>
+
+        <!-- "streamed-gathering-treehouse" plan Stage 1: one chip per clicked anchor (a player who
+             leaves frame and comes back gets a NEW track id per reappearance, so tracking them for
+             a whole take can take more than one click). Populated/emptied by app.js's
+             `renderAnchorChips()` -- hidden whenever there are zero anchors. -->
+        <div id="target-anchor-chips" class="hidden" style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px;"></div>
       </div>
     </section>
 

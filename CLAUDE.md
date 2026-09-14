@@ -323,6 +323,7 @@ compute; QA vs ground truth; optional provider-data adapter; active-learning loo
 | PARSeq | Apache-2.0 | ✅ |
 | PaddleOCR / EasyOCR | Apache-2.0 | ✅ |
 | `requests` (ADR-15 Gemini HTTP) | Apache-2.0 | ✅ |
+| `reportlab` (Plan Stage 3, 2026-09-14, `statcard.pdf` export, `api` extra) | BSD-3-Clause | ✅ |
 | **manual-annotation parser (ADR-19)** | stdlib `re` + PyYAML (BSD/MIT) | ✅ **no new dependency** |
 | `SoccerNet` (pip package, `scripts/download_soccernet.py`) | MIT | ✅ package code only — the video *data* it downloads is the separate, NDA-gated row below |
 | SigLIP weights (via `transformers`/`timm`) | Apache-2.0 | ✅ (verify weight card) |

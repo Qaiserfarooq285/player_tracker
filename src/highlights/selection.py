@@ -336,6 +336,30 @@ def _lost_selection(take: Take, take_duration: float, evidence: dict) -> TakeSel
     )
 
 
+def _union_time_sorted(chains: list[list[int]], take_tracks: list[Track]) -> list[int]:
+    """Dedupe + time-sort several stitched fragment chains into ONE flat `track_ids` list --
+    "streamed-gathering-treehouse" plan Stage 1 ("Union all accepted chains (dedupe, time-sorted)
+    into track_ids"). A track id that appears in more than one chain (two anchors' own
+    `stitch_timeline` calls both happened to reach the same fragment) is kept exactly once, at its
+    first occurrence. Sort key is each track's own FIRST box timestamp -- a track absent from
+    `take_tracks` or with no boxes at all sorts last (defensive; should not happen for a real
+    stitched id, which by construction came from this exact take's own tracks)."""
+    by_id = {tr.id: tr for tr in take_tracks}
+    seen: set[int] = set()
+    flat: list[int] = []
+    for chain in chains:
+        for tid in chain:
+            if tid not in seen:
+                seen.add(tid)
+                flat.append(tid)
+
+    def _first_t(tid: int) -> float:
+        tr = by_id.get(tid)
+        return tr.boxes[0].t if tr is not None and tr.boxes else float("inf")
+
+    return sorted(flat, key=_first_t)
+
+
 def _last_position_evidence(track_ids: list[int], take_tracks: list[Track]) -> dict:
     """`{last_cx, last_cy, last_bbox_height}` from the LAST box (by time) across `track_ids`' own
     stitched fragments -- populates the three keys `src.track.target_verify.verify_candidate`'s
@@ -412,62 +436,114 @@ def _select_take_with_profile(
     target_cfg: dict,
     kit_by_track: dict[int, KitColourSample],
     jersey_by_track: dict[int, str],
-    override_track_id: int | None,
+    override_track_ids: list[int] | None,
     selection_cfg: dict,
     motion,
 ) -> TakeSelection:
     """Resolve ONE take against the persistent `TargetProfile` -- `heuristic_fallback_seed` and
     the arrow vote are never called from anywhere in this function. Mutates `profile` in place via
     `_update_profile_after_take` before returning (see that function + `select_targets`'s own
-    docstring)."""
+    docstring).
+
+    "streamed-gathering-treehouse" plan Stage 1 (multiple click anchors): `override_track_ids` is
+    now a LIST -- one entry per anchor the human clicked for this take (a player who left frame
+    and came back gets a NEW track id per reappearance, so one click can no longer cover the whole
+    take). EACH seed is independently run through `verify_candidate`; an ACCEPT gets its own
+    `stitch_timeline` chain, and every accepted chain is unioned (deduped, time-sorted, see
+    `_union_time_sorted`) into this take's `track_ids`. `verified_track_ids` is every ACCEPTed
+    seed (order preserved); `seed_track_id` is the FIRST accepted one (a judgement call -- there is
+    no single "the" seed anymore, and `seed_track_id`'s only other consumer,
+    `_update_profile_after_take`'s memory-bank fold, needs exactly one track to sample, so the
+    first accepted anchor -- typically the original click, chronologically or by submission order
+    -- keeps that fold well-defined without inventing a second aggregation rule). A REJECTed or
+    UNCERTAIN seed (Stage 2's own rule: UNCERTAIN is never a weak accept) is logged with its own
+    reason and simply excluded -- it can never widen the accepted chain ("Candidate != Target").
+    **No seed accepted at all -> `target_lost`**, exactly as the single-seed case always was.
+    """
     from src.track.target_verify import VerdictDecision, verify_candidate  # see module-level
 
     # import-order comment: `src.track.target_verify` cannot be imported at module scope here.
 
     by_id = {tr.id: tr for tr in take_tracks}
 
-    if override_track_id is not None:
-        candidate = by_id.get(override_track_id)
-        if candidate is None:
-            # Plan Stage 4's own fix for the pre-existing bug at (what was) selection.py:296-303:
-            # a manual override whose track isn't even IN this take's tracks used to silently fall
-            # through to automatic (heuristic/arrow) selection. With a profile in play that must
-            # become target_lost instead -- never a substitute player.
+    if override_track_ids:
+        accepted: list[tuple[int, TargetVerdict]] = []
+        chains: list[list[int]] = []
+        seed_evidence: dict[int, dict] = {}
+
+        for seed_id in override_track_ids:
+            candidate = by_id.get(seed_id)
+            if candidate is None:
+                # Plan Stage 4's own fix for the pre-existing bug at (what was)
+                # selection.py:296-303: a manual override whose track isn't even IN this take's
+                # tracks used to silently fall through to automatic (heuristic/arrow) selection.
+                # With a profile in play that anchor is simply excluded -- never a substitute
+                # player, never silently dropped without a trace either (logged below).
+                seed_evidence[seed_id] = {"rejected_reason": "manual_override_track_not_found"}
+                logger.warning(
+                    "take=%d: manual-override anchor track_id=%d not found among this take's "
+                    "tracks -- skipped, does not widen the accepted chain",
+                    take.id,
+                    seed_id,
+                )
+                continue
+            verdict = verify_candidate(
+                profile, candidate, kit_by_track, jersey_by_track, target_cfg
+            )
+            seed_evidence[seed_id] = {"decision": verdict.decision.value, **verdict.evidence}
+            if verdict.decision == VerdictDecision.ACCEPT:
+                accepted.append((seed_id, verdict))
+                track_ids, _stitch_conf = stitch_timeline(
+                    seed_id, take_tracks, selection_cfg, motion
+                )
+                chains.append(track_ids)
+            else:
+                # Stage 2's own rule: UNCERTAIN is never a weak accept, treated exactly like
+                # REJECT here -- this anchor is dropped, never assigned to a contradicted click.
+                reason = verdict.evidence.get("rejected_reason", f"score={verdict.score:.2f}")
+                logger.warning(
+                    "take=%d: manual-override anchor track_id=%d %s (%s) -- skipped, does not "
+                    'widen the accepted chain ("Candidate != Target")',
+                    take.id,
+                    seed_id,
+                    verdict.decision.value,
+                    reason,
+                )
+
+        if not accepted:
             selection = _lost_selection(
                 take,
                 take_duration,
                 {
-                    "reason": "manual_override_track_not_found",
-                    "seed_track_id": override_track_id,
+                    "reason": "no_seed_accepted",
+                    "seed_track_ids": list(override_track_ids),
+                    "seed_evidence": seed_evidence,
                 },
             )
         else:
-            verdict = verify_candidate(
-                profile, candidate, kit_by_track, jersey_by_track, target_cfg
+            union_ids = _union_time_sorted(chains, take_tracks)
+            verified_ids = [seed_id for seed_id, _ in accepted]
+            # Judgement call (plan doesn't specify a combination rule): the take's own overall
+            # confidence is the MEAN of every accepted seed's own `verify_candidate` score -- each
+            # anchor independently cleared the same strict hard-reject-then-score gate, so this
+            # reflects the average strength of the evidence actually used, rather than a single
+            # (possibly weaker or stronger) anchor standing in for all of them.
+            mean_score = sum(v.score for _, v in accepted) / len(accepted)
+            selection = TakeSelection(
+                take_id=take.id,
+                method="manual_override",
+                seed_track_id=verified_ids[0],
+                track_ids=union_ids,
+                confidence=mean_score,
+                coverage_seconds=timeline_coverage_seconds(union_ids, take_tracks),
+                take_duration_seconds=take_duration,
+                evidence={"seed_evidence": seed_evidence, "accepted_seed_ids": verified_ids},
+                # Stage B: only the seeds that independently passed `verify_candidate` -- every
+                # other fragment any of their `stitch_timeline` calls joined is geometry-only,
+                # never independently verified, so it stays a candidate (green box), never red
+                # (plan's "Candidate != Target").
+                verified_track_ids=verified_ids,
             )
-            if verdict.decision == VerdictDecision.ACCEPT:
-                track_ids, _stitch_conf = stitch_timeline(
-                    override_track_id, take_tracks, selection_cfg, motion
-                )
-                selection = TakeSelection(
-                    take_id=take.id,
-                    method="manual_override",
-                    seed_track_id=override_track_id,
-                    track_ids=track_ids,
-                    confidence=verdict.score,
-                    coverage_seconds=timeline_coverage_seconds(track_ids, take_tracks),
-                    take_duration_seconds=take_duration,
-                    evidence=verdict.evidence,
-                    # Stage B: the click itself is the ONLY accepted fragment -- everything else
-                    # `stitch_timeline` joined above is geometry-only, never independently
-                    # verified, so it stays a candidate (green box), never red (plan's "Candidate
-                    # != Target").
-                    verified_track_ids=[override_track_id],
-                )
-            else:
-                # Stage 2's own rule: UNCERTAIN is never a weak accept, treated exactly like
-                # REJECT here -- the target stays LOST, never assigned to a contradicted click.
-                selection = _lost_selection(take, take_duration, verdict.evidence)
     else:
         candidates = _reasonable_candidates(take_tracks, selection_cfg)
         accepts: list[tuple[int, TargetVerdict]] = []
@@ -545,7 +621,7 @@ def select_targets(
     frame_width: float,
     frame_height: float,
     selection_cfg: dict,
-    manual_overrides: dict[int, int] | None = None,
+    manual_overrides: dict[int, list[int]] | None = None,
     camera_motion_by_take: dict | None = None,
     target_profile: TargetProfile | None = None,
     target_cfg: dict | None = None,
@@ -554,10 +630,22 @@ def select_targets(
 ) -> SelectionResult:
     """Run Stage 5 target selection for every take of one video.
 
-    `manual_overrides` is the actual Phase-1 human-in-the-loop seam (`{take_id: track_id}`, from
-    `src/pipeline/run.py`'s `--track-id` CLI flag) — a human-supplied track always wins over both
-    the arrow vote and the fallback heuristic for that take, and is the ONLY case whose
+    `manual_overrides` is the actual Phase-1 human-in-the-loop seam: `{take_id: [track_id, ...]}`,
+    one or more human-supplied anchor track ids per take. A human-supplied track always wins over
+    both the arrow vote and the fallback heuristic for that take, and is the ONLY case whose
     `TakeSelection.method` is `"manual_override"`.
+
+    **"streamed-gathering-treehouse" plan Stage 1 (multiple click anchors).** The list shape
+    exists because a player who leaves frame and re-enters gets a NEW track id per reappearance --
+    one click can no longer cover a whole take. `src/pipeline/run.py`'s own `--track-id` CLI flag
+    still only ever produces a single-element list per take (its grammar is unchanged, 3 existing
+    tests depend on it); `apps/api/main.py`'s multi-anchor click flow is what actually populates
+    more than one id for the same take. When `target_profile` is supplied, every anchor is
+    independently verified and accepted anchors' chains are unioned (see
+    `_select_take_with_profile`). When no profile is supplied (the plain CLI/no-profile path
+    below), there is no `verify_candidate` gate to safely union multiple anchors, so only the
+    FIRST id in each take's list is used as the seed -- extra ids are logged and otherwise
+    ignored; in practice the CLI never supplies more than one anyway.
 
     **"streamed-gathering-treehouse" plan Stage 4 — `target_profile`.** When `None` (every
     pre-existing caller), this function is completely unchanged: arrow vote -> within-take
@@ -622,8 +710,23 @@ def select_targets(
             take_selections.append(selection)
             continue
 
-        if take.id in manual_overrides:
-            seed = manual_overrides[take.id]
+        if take.id in manual_overrides and manual_overrides[take.id]:
+            override_ids = manual_overrides[take.id]
+            seed = override_ids[0]
+            if len(override_ids) > 1:
+                # No `TargetProfile` is active for this run, so there is no `verify_candidate`
+                # gate to safely union multiple anchors without risking a silently-widened chain
+                # onto a different physical player -- only the first anchor is used. In practice
+                # the CLI's own `--track-id` grammar never produces more than one id per take
+                # (unchanged, see `parse_track_id_overrides`); this only matters for a caller that
+                # supplies a multi-id override with no profile at all.
+                logger.warning(
+                    "take=%d: %d manual-override anchors given but no TargetProfile is active "
+                    "for this run -- using only the first (track_id=%d); the rest are ignored",
+                    take.id,
+                    len(override_ids),
+                    seed,
+                )
             if not any(tr.id == seed for tr in take_tracks):
                 logger.warning(
                     "manual override track_id=%d for take=%d not found among that take's tracks "

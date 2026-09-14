@@ -118,6 +118,39 @@ def parse_track_id_overrides(raw: str | None) -> dict[int, int]:
     return overrides
 
 
+def normalize_manual_overrides(
+    raw: dict[int, int | list[int]] | None,
+) -> dict[int, list[int]]:
+    """ "streamed-gathering-treehouse" plan Stage 1 (multiple click anchors): the one place this
+    module normalizes `manual_overrides` before it reaches `select_targets`, whose own parameter
+    is `dict[int, list[int]] | None`.
+
+    `parse_track_id_overrides` and the `--track-id` CLI grammar stay UNCHANGED (3 existing tests
+    depend on the exact `dict[int, int]` shape it returns) -- this function is what bridges that
+    legacy shape, and `apps/api/main.py`'s own multi-anchor `dict[int, list[int]]` shape, into one
+    canonical form. A bare `int` becomes a single-element list; a `list[int]` is deduped
+    (order-preserving, first occurrence wins) and passed through; a take whose own list ends up
+    empty is dropped from the result entirely (equivalent to no override for that take at all,
+    never a dict entry pointing at nothing).
+    """
+    if not raw:
+        return {}
+    normalized: dict[int, list[int]] = {}
+    for take_id, value in raw.items():
+        if isinstance(value, int):
+            ids = [value]
+        else:
+            seen: set[int] = set()
+            ids = []
+            for tid in value:
+                if tid not in seen:
+                    seen.add(tid)
+                    ids.append(tid)
+        if ids:
+            normalized[take_id] = ids
+    return normalized
+
+
 def _effective_frame_size(video_path: str | Path, decode_cfg: dict) -> tuple[float, float]:
     """The `(width, height)` a `Track`'s/`BallDetection`'s pixel bboxes actually live in —
     mirrors `src.common.video.decode_frames`' own scale-then-keep-even computation exactly, since
@@ -350,7 +383,7 @@ def run_pipeline_for_video(
     video_path: str | Path,
     configs: dict[str, dict],
     target_jersey: int | None,
-    manual_overrides: dict[int, int] | None = None,
+    manual_overrides: dict[int, int | list[int]] | None = None,
     work_root: str | Path = "work",
     output_root: str | Path = "output",
     use_nvdec: bool = True,
@@ -371,8 +404,16 @@ def run_pipeline_for_video(
     `work/<slug>/target.json` itself before returning — the caller is only responsible for
     building/loading the profile before calling in (`apps/api/main.py`'s click endpoint does
     exactly that).
+
+    `manual_overrides` accepts EITHER the legacy `dict[int, int]` shape (`parse_track_id_overrides`,
+    the CLI's own `--track-id` flag) or the newer `dict[int, list[int]]` shape (`apps/api/main.py`'s
+    multi-anchor click flow, "streamed-gathering-treehouse" plan Stage 1) -- `normalize_manual_
+    overrides` below is the ONE place that reconciles both into the canonical `dict[int, list[int]]`
+    `select_targets` itself requires, so nothing downstream of this function ever needs to branch
+    on which shape was originally supplied.
     """
     video_path = Path(video_path)
+    manual_overrides = normalize_manual_overrides(manual_overrides)
     work_dir = work_dir_for(video_path, root=work_root)
     output_dir = Path(output_root) / work_dir.name
     output_dir.mkdir(parents=True, exist_ok=True)

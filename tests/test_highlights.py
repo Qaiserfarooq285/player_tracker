@@ -25,7 +25,7 @@ from src.common.types import (
 )
 from src.detect.overlay_mask import ArrowHint
 from src.highlights import cutting, ranking, selection
-from src.pipeline.run import parse_track_id_overrides
+from src.pipeline.run import normalize_manual_overrides, parse_track_id_overrides
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -388,3 +388,46 @@ def test_parse_track_id_overrides_multi_take_form():
 def test_parse_track_id_overrides_empty_is_empty():
     assert parse_track_id_overrides(None) == {}
     assert parse_track_id_overrides("") == {}
+
+
+# ---------------------------------------------------------------------------
+# `normalize_manual_overrides` -- "streamed-gathering-treehouse" plan Stage 1: the pipeline-
+# boundary bridge between `parse_track_id_overrides`'s unchanged `dict[int, int]` CLI shape and
+# `apps/api/main.py`'s multi-anchor `dict[int, list[int]]` shape, into ONE canonical form before
+# `select_targets` ever sees it.
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_manual_overrides_none_and_empty():
+    assert normalize_manual_overrides(None) == {}
+    assert normalize_manual_overrides({}) == {}
+
+
+def test_normalize_manual_overrides_bare_int_becomes_single_element_list():
+    """The legacy `parse_track_id_overrides` shape (`dict[int, int]`, e.g. the CLI's own
+    `--track-id` flag) passes straight through as a one-element list per take."""
+    assert normalize_manual_overrides({0: 16, 2: 9}) == {0: [16], 2: [9]}
+
+
+def test_normalize_manual_overrides_passes_list_through():
+    assert normalize_manual_overrides({0: [16, 44]}) == {0: [16, 44]}
+
+
+def test_normalize_manual_overrides_dedupes_within_a_take_order_preserving():
+    """A duplicate anchor for the same take (the user clicked the same box twice, or the raw-
+    coordinate click path and the picker both resolved to the same track) collapses to one entry,
+    keeping the FIRST occurrence's position -- never silently doubling a chain's weight."""
+    assert normalize_manual_overrides({0: [16, 44, 16]}) == {0: [16, 44]}
+
+
+def test_normalize_manual_overrides_drops_takes_with_no_surviving_anchors():
+    """An empty list for a take (e.g. every duplicate collapsed away, or the caller explicitly
+    passed `[]`) is dropped from the result entirely -- equivalent to no override for that take at
+    all, never a dict entry pointing at nothing."""
+    assert normalize_manual_overrides({0: [16], 3: []}) == {0: [16]}
+
+
+def test_normalize_manual_overrides_mixed_int_and_list_shapes():
+    """A real call site could plausibly merge a CLI-style bare int for one take with an API-style
+    list for another -- both normalize into the same canonical shape."""
+    assert normalize_manual_overrides({0: 16, 1: [7, 8]}) == {0: [16], 1: [7, 8]}

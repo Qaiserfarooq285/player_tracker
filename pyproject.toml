@@ -78,6 +78,11 @@ api = [
     "fastapi",
     "uvicorn[standard]",
     "python-multipart",
+    # Plan Stage 3 ("streamed-gathering-treehouse", 2026-09-14): renders statcard.pdf
+    # (src/pipeline/statcard_pdf.py) alongside statcard.md. BSD-3-Clause -- clean under Golden
+    # Rule 6, see CLAUDE.md §7. Imported lazily (never at module import time) so the rest of the
+    # pipeline stays importable without this extra installed.
+    "reportlab",
 ]
 dev = [
     "pytest",

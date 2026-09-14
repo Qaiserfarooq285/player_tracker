@@ -100,6 +100,21 @@ app.add_middleware(
 JOBS: dict[str, dict[str, Any]] = {}
 
 
+class TargetAnchor(BaseModel):
+    """One click anchor ("streamed-gathering-treehouse" plan Stage 1): a human-picked
+    `(take_id, track_id)` pair, optionally timestamped. `apps/web/js/app.js`'s picker chip list
+    appends one of these per click -- the fix for the pre-existing bug where a second click in the
+    SAME take silently overwrote the first (`selectedFramePlayer` was a scalar). `t` is advisory
+    only (shown in the chip label / used as a `click_t` fallback for `_resolve_target_click`'s own
+    profile-establishment timestamp when this is the very first anchor of a run); the pair itself
+    is always resolved against that take's own cached tracks, never against `t` directly.
+    """
+
+    take_id: int
+    track_id: int
+    t: float | None = None
+
+
 class ProcessRequest(BaseModel):
     video_name: str
     # Real bug fixed here ("streamed-gathering-treehouse" plan Stage E, 2026-09-04): this used to
@@ -119,6 +134,12 @@ class ProcessRequest(BaseModel):
     click_x: float | None = None
     click_y: float | None = None
     click_t: float | None = None
+    # "streamed-gathering-treehouse" plan Stage 1: the multi-anchor picker chip list submits its
+    # whole accumulated anchor set here -- zero or more `(take_id, track_id)` pairs, as many as the
+    # user clicked (across one or several takes). The free-text `track_id` field above stays
+    # supported and is MERGED in (`_run_pipeline_job` unions both sources per take), so a
+    # hand-typed `#track-id-input` value and clicked chips can be combined in one request.
+    target_clicks: list[TargetAnchor] | None = None
 
 
 @app.get("/api/health")
@@ -492,7 +513,11 @@ def _click_rejection_message(profile: Any, verdict: Any) -> str:
 
 
 def _click_evidence_for_candidate(
-    video_path: Path, configs: dict[str, dict], take_id: int, track_id: int
+    video_path: Path,
+    configs: dict[str, dict],
+    take_id: int,
+    track_id: int,
+    jersey_stack: tuple[Any, Any, Any] | None = None,
 ) -> tuple[Any, Any, str | None]:
     """`(candidate_track, kit_sample, jersey_digits)` for ONE clicked/overridden track -- computed
     for JUST that track (never the whole take) so an interactive click endpoint stays cheap.
@@ -504,6 +529,15 @@ def _click_evidence_for_candidate(
     track itself isn't even in that take's cached tracks -- the caller already confirmed the track
     exists via `_match_click_to_track`/`parse_track_id_overrides` before calling in, so this should
     not happen in practice, but is handled as an honest failure rather than assumed impossible.
+
+    `jersey_stack` ("streamed-gathering-treehouse" plan Stage 1 performance fix): an optional
+    already-loaded `(legibility_model, parseq_model, parseq_transform)` triple. Every PRE-EXISTING
+    caller (this function had exactly one, `_resolve_target_click`, called once per click) left
+    this `None`, so the DEFAULT behaviour is unchanged byte-for-byte: load the whole jersey-OCR
+    stack, use it for this one track, free it before returning. The multi-anchor loop in
+    `_run_pipeline_job` now loads the stack ONCE outside its own per-pair loop and passes it in
+    here for every pair, so N anchors cost one model load instead of N -- this function never
+    frees a stack it did not itself load.
     """
     from src.common.io import load_models_parquet
     from src.common.types import Track
@@ -549,9 +583,13 @@ def _click_evidence_for_candidate(
     )
     kit_sample = kit_sample_by_track.get(candidate.id)
 
-    legibility_model, parseq_model, parseq_transform = load_optional_jersey_stack(
-        configs["identity"]
-    )
+    owns_stack = jersey_stack is None
+    if owns_stack:
+        legibility_model, parseq_model, parseq_transform = load_optional_jersey_stack(
+            configs["identity"]
+        )
+    else:
+        legibility_model, parseq_model, parseq_transform = jersey_stack
     try:
         jersey_by_track = collect_track_jersey_digits(
             video_path,
@@ -568,7 +606,8 @@ def _click_evidence_for_candidate(
             configs["identity"]["aggregation"],
         )
     finally:
-        free_optional_jersey_stack(legibility_model, parseq_model)
+        if owns_stack:
+            free_optional_jersey_stack(legibility_model, parseq_model)
 
     return candidate, kit_sample, jersey_by_track.get(candidate.id)
 
@@ -580,6 +619,7 @@ def _resolve_target_click(
     take_id: int,
     track_id: int,
     click_t: float | None,
+    jersey_stack: tuple[Any, Any, Any] | None = None,
 ) -> Any:
     """One (take_id, track_id) human selection against the persistent target identity
     ("streamed-gathering-treehouse" plan Stage E): "The click means: 'This is a candidate for
@@ -600,12 +640,17 @@ def _resolve_target_click(
       memory bank. REJECT or UNCERTAIN (never a weak accept, `target_verify.py`'s own docstring)
       -> raises `ClickRejected`; the caller must stop before ever calling `run_pipeline_for_video`
       or touching `target.json` again.
+
+    `jersey_stack` ("streamed-gathering-treehouse" plan Stage 1 performance fix): forwarded
+    verbatim to `_click_evidence_for_candidate` -- `None` (every pre-existing caller) keeps that
+    function's own load-once-per-call behaviour; `_run_pipeline_job`'s multi-anchor loop passes an
+    already-loaded stack so N anchors in one request cost ONE model load, not N.
     """
     from src.track.target import build_target_profile, save_target_profile
     from src.track.target_verify import VerdictDecision, verify_candidate
 
     candidate, kit_sample, jersey_digits = _click_evidence_for_candidate(
-        video_path, configs, take_id, track_id
+        video_path, configs, take_id, track_id, jersey_stack=jersey_stack
     )
     if candidate is None:
         raise ClickRejected(
@@ -667,8 +712,16 @@ def _run_pipeline_job(
     click_x: float | None = None,
     click_y: float | None = None,
     click_t: float | None = None,
+    target_clicks: list[TargetAnchor] | None = None,
 ):
-    """Background task function executing the processing pipeline stages."""
+    """Background task function executing the processing pipeline stages.
+
+    `target_clicks` ("streamed-gathering-treehouse" plan Stage 1): zero or more click anchors from
+    the picker's own accumulating chip list (`ProcessRequest.target_clicks`) -- as many as the user
+    clicked, possibly several in the SAME take (the "player left frame, came back with a new track
+    id" case the whole plan exists for). Merged with the free-text `track_id` field below into one
+    `dict[int, list[int]]` override set before anything else runs.
+    """
     job = JOBS[job_id]
     job["status"] = "processing"
     job["progress"] = 5
@@ -729,6 +782,7 @@ def _run_pipeline_job(
         from src.pipeline.manual_events import run_manual_events_pipeline_for_video
         from src.pipeline.run import (
             _load_all_configs,
+            normalize_manual_overrides,
             parse_track_id_overrides,
             run_pipeline_for_video,
         )
@@ -746,16 +800,30 @@ def _run_pipeline_job(
         # `.annotations.txt` sidecar (which otherwise unconditionally takes over, ADR-19, and
         # would silently swallow the click). This is Golden Rule 4 exercised directly: a
         # human-provided identity outranks every other signal, sidecar included.
-        has_explicit_selection = bool(track_id) or (click_x is not None and click_y is not None)
+        has_explicit_selection = (
+            bool(track_id) or bool(target_clicks) or (click_x is not None and click_y is not None)
+        )
 
         if has_explicit_selection:
             job["logs"].append(
                 "Explicit player selection given -- routing to the auto-detect "
                 "pipeline for that player (sidecar, if any, is not used)."
             )
-            overrides: dict[int, int] = {}
+            # "streamed-gathering-treehouse" plan Stage 1: every anchor source is merged into ONE
+            # `dict[int, list[int]]` -- the hand-typed `#track-id-input` mirror (`track_id`, still
+            # the legacy `dict[int, int]` grammar, one bare/`take:track` entry per take) and the
+            # picker's own accumulating chip list (`target_clicks`, one entry PER CLICK, possibly
+            # several in the same take). `normalize_manual_overrides` (shared with
+            # `run_pipeline_for_video` itself) is what actually dedupes/normalizes both sources
+            # into the canonical shape -- this is the ONE merge point, not two separate ones.
+            raw_overrides: dict[int, list[int]] = {}
             if track_id:
-                overrides.update(parse_track_id_overrides(track_id))
+                for t_id, tr_id in parse_track_id_overrides(track_id).items():
+                    raw_overrides.setdefault(t_id, []).append(tr_id)
+            if target_clicks:
+                for anchor in target_clicks:
+                    raw_overrides.setdefault(anchor.take_id, []).append(anchor.track_id)
+            overrides = normalize_manual_overrides(raw_overrides)
 
             if click_x is not None and click_y is not None and not overrides:
                 job["logs"].append(
@@ -784,7 +852,9 @@ def _run_pipeline_job(
                     job["logs"].append(f"ERROR: {job['error']}")
                     return
                 if chosen_track_id is not None:
-                    overrides[chosen_take_id] = chosen_track_id
+                    # `overrides` is guaranteed empty here (the raw-coordinate path only runs
+                    # `if ... and not overrides` above) -- this establishes the sole anchor.
+                    overrides = {chosen_take_id: [chosen_track_id]}
                     job["logs"].append(
                         f"Interactive click matched take={chosen_take_id} "
                         f"track_id={chosen_track_id}."
@@ -821,16 +891,47 @@ def _run_pipeline_job(
             target_profile = (
                 load_target_profile(target_json_path) if target_json_path.exists() else None
             )
+            # Flattened in take order, then anchor-submission order within a take -- e.g. two
+            # clicks in take 0 (the "player left frame, came back" case) are verified in the order
+            # the human added them, first anchor first.
+            flattened_pairs = [
+                (t_id, tr_id) for t_id in sorted(overrides) for tr_id in overrides[t_id]
+            ]
+            # Performance fix ("streamed-gathering-treehouse" plan Stage 1): the jersey-OCR stack
+            # used to be loaded AND freed once per pair inside `_click_evidence_for_candidate`
+            # (`load_optional_jersey_stack`/`free_optional_jersey_stack`) -- with N anchors now
+            # possible in one request, that meant N model loads for one click endpoint call. Load
+            # it ONCE here (only when there is at least one pair to verify) and hand it to every
+            # `_resolve_target_click` call; `_click_evidence_for_candidate` never frees a stack it
+            # did not itself load, so this is safe to free exactly once, in `finally`, below.
+            jersey_stack: tuple[Any, Any, Any] | None = None
+            if flattened_pairs:
+                from src.identity.jersey_models import (
+                    free_optional_jersey_stack,
+                    load_optional_jersey_stack,
+                )
+
+                jersey_stack = load_optional_jersey_stack(configs["identity"])
             try:
-                for pair_take_id, pair_track_id in sorted(overrides.items()):
-                    target_profile = _resolve_target_click(
-                        video_path, configs, target_profile, pair_take_id, pair_track_id, click_t
-                    )
-            except ClickRejected as rejection:
-                job["status"] = "failed"
-                job["error"] = str(rejection)
-                job["logs"].append(f"ERROR: {job['error']}")
-                return
+                try:
+                    for pair_take_id, pair_track_id in flattened_pairs:
+                        target_profile = _resolve_target_click(
+                            video_path,
+                            configs,
+                            target_profile,
+                            pair_take_id,
+                            pair_track_id,
+                            click_t,
+                            jersey_stack=jersey_stack,
+                        )
+                except ClickRejected as rejection:
+                    job["status"] = "failed"
+                    job["error"] = str(rejection)
+                    job["logs"].append(f"ERROR: {job['error']}")
+                    return
+            finally:
+                if jersey_stack is not None:
+                    free_optional_jersey_stack(jersey_stack[0], jersey_stack[1])
             if target_profile is not None:
                 jersey_label = (
                     target_profile.jersey_number
@@ -946,6 +1047,7 @@ def process_video(req: ProcessRequest, background_tasks: BackgroundTasks):
         req.click_x,
         req.click_y,
         req.click_t,
+        req.target_clicks,
     )
 
     return {
