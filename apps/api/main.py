@@ -140,6 +140,12 @@ class ProcessRequest(BaseModel):
     # supported and is MERGED in (`_run_pipeline_job` unions both sources per take), so a
     # hand-typed `#track-id-input` value and clicked chips can be combined in one request.
     target_clicks: list[TargetAnchor] | None = None
+    # Plan Stage 2 ("streamed-gathering-treehouse", 2026-09-14): optional client-typed ball-touch
+    # times, as free text (comma- or newline-separated `M:SS`/`H:MM:SS` entries) -- parsed by
+    # `src.events.manual_touches.parse_touch_times`. Optional exactly like `target_jersey` (no
+    # default that could silently apply to the wrong run); threaded into whichever pipeline
+    # function actually runs for this request (`_run_pipeline_job` below).
+    touch_times: str | None = None
 
 
 @app.get("/api/health")
@@ -713,6 +719,7 @@ def _run_pipeline_job(
     click_y: float | None = None,
     click_t: float | None = None,
     target_clicks: list[TargetAnchor] | None = None,
+    touch_times: str | None = None,
 ):
     """Background task function executing the processing pipeline stages.
 
@@ -721,6 +728,13 @@ def _run_pipeline_job(
     clicked, possibly several in the SAME take (the "player left frame, came back with a new track
     id" case the whole plan exists for). Merged with the free-text `track_id` field below into one
     `dict[int, list[int]]` override set before anything else runs.
+
+    `touch_times` (Plan Stage 2): forwarded verbatim into `run_pipeline_for_video`/
+    `run_manual_events_pipeline_for_video` below, whichever branch actually runs -- see those
+    functions' own docstrings for the merge rule.  `run_extended_pipeline_for_video` (the
+    no-filename/no-click auto-ID branch) has no single "the target player" until identity
+    verification itself resolves one per take, so it has no natural place to attach these; that
+    branch does not accept this parameter (an honest scope limit, not an oversight).
     """
     job = JOBS[job_id]
     job["status"] = "processing"
@@ -952,6 +966,7 @@ def _run_pipeline_job(
                 work_root=WORK_DIR,
                 output_root=OUTPUT_DIR,
                 target_profile=target_profile,
+                manual_touch_times=touch_times,
             )
         elif annotations_path.exists():
             job["logs"].append("Branching to MANUAL-EVENTS pipeline via sidecar...")
@@ -962,6 +977,7 @@ def _run_pipeline_job(
                 target_jersey=target_jersey,
                 work_root=WORK_DIR,
                 output_root=OUTPUT_DIR,
+                manual_touch_times=touch_times,
             )
         else:
             import re
@@ -981,6 +997,7 @@ def _run_pipeline_job(
                     manual_overrides={},
                     work_root=WORK_DIR,
                     output_root=OUTPUT_DIR,
+                    manual_touch_times=touch_times,
                 )
             else:
                 job["logs"].append("Branching to extended verified-identity pipeline...")
@@ -1048,6 +1065,7 @@ def process_video(req: ProcessRequest, background_tasks: BackgroundTasks):
         req.click_y,
         req.click_t,
         req.target_clicks,
+        req.touch_times,
     )
 
     return {
@@ -1104,6 +1122,17 @@ def get_results(slug: str):
             statcard_text = statcard_file.read_text() if statcard_file.exists() else ""
 
             stats = parse_statcard_markdown(statcard_text, int(p_num) if p_num.isdigit() else None)
+
+            # Plan Stage 3 ("streamed-gathering-treehouse", 2026-09-14): a real, downloadable PDF
+            # link, `None` (never a broken link) when `statcard.pdf` genuinely isn't on disk for
+            # this player -- e.g. `reportlab` wasn't installed when this run happened
+            # (`write_player_output`'s own fail-soft `ImportError` handling, CLAUDE.md §7).
+            statcard_pdf_url = (
+                f"/api/download/statcard/{slug_name}/{p_num}"
+                if (p_folder / "statcard.pdf").exists()
+                else None
+            )
+            stats["statcard_pdf_url"] = statcard_pdf_url
 
             highlights = {}
             hl_dir = p_folder / "highlights"
@@ -1238,15 +1267,69 @@ def _safe_resolve_under(root: Path, path: str) -> Path | None:
     return candidate if candidate.exists() else None
 
 
+@app.get("/api/download/statcard/{slug}/{jersey}")
+def download_statcard_pdf(slug: str, jersey: str):
+    """Real, downloadable `statcard.pdf` for one player (Plan Stage 3, "streamed-gathering-
+    treehouse", 2026-09-14) -- the honest replacement for the old frontend exporter that re-typed
+    an approximation of the statcard client-side (see `exportStatCard`'s own history / the plan's
+    Context section: it flattened "not available (...)" to a bare `0`, a Golden Rule 5 violation).
+
+    Resolved via `_find_output_dir` (exact slug match, the same helper `/api/results/{slug}`
+    already uses) then `_safe_resolve_under`, rooted at `OUTPUT_DIR` -- deliberately NOT `BASE_DIR`
+    (that root is what the `/media/` fix below closes) -- since this endpoint only ever needs to
+    serve a file already known to live under `output/`. `jersey` is taken as an opaque path
+    segment straight from the URL and never joined onto the filesystem directly; it is resolved
+    strictly as one more path component under `OUTPUT_DIR` through the same traversal guard, so a
+    `../../etc/passwd`-shaped value 404s exactly like any other escape attempt, never a 500.
+
+    404s (never 500s) for a missing slug, a missing player folder, or a missing PDF file (e.g.
+    `reportlab` wasn't installed when this run happened -- `write_player_output`'s own fail-soft
+    handling, CLAUDE.md §7) -- an honest "not found", never a confusing server error for something
+    that is really just "this run doesn't have a PDF".
+    """
+    out_dir = _find_output_dir(OUTPUT_DIR, slug)
+    if out_dir is None:
+        raise HTTPException(status_code=404, detail=f"No results found for slug '{slug}'")
+
+    pdf_path = _safe_resolve_under(
+        OUTPUT_DIR, f"{out_dir.name}/players/player_{jersey}/statcard.pdf"
+    )
+    if pdf_path is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No statcard.pdf found for slug '{slug}' player '{jersey}'",
+        )
+
+    return FileResponse(
+        pdf_path,
+        media_type="application/pdf",
+        filename=f"player_{jersey}_statcard.pdf",
+    )
+
+
 @app.get("/media/{path:path}")
 def serve_media(path: str):
     """Serve media files (input videos, annotated output videos, highlights) -- resolved under
-    BASE_DIR first, then INPUT_DIR, then OUTPUT_DIR, each check rejecting any path that would
-    escape that root."""
+    INPUT_DIR or OUTPUT_DIR ONLY, each check rejecting any path that would escape that root.
+
+    Plan Stage 3 ("streamed-gathering-treehouse", 2026-09-14) security fix: this used to probe
+    `_safe_resolve_under(BASE_DIR, path)` FIRST. The traversal guard itself was sound, but its
+    containment root was the WHOLE REPO -- so `GET /media/.env` served the secrets file, and
+    `configs/`, `src/`, `models/` were all readable over HTTP. Every real `/media/` URL this
+    project actually generates (confirmed by grepping every reference in `apps/web/` and this
+    file) is one of exactly two shapes: a bare INPUT_DIR-relative video name/path (e.g.
+    `preview.src = /media/${videoName}`, `apps/web/js/app.js::updatePreviewVideo`) or an
+    OUTPUT_DIR-relative path PREFIXED with the literal `output/` segment -- a BASE_DIR-relative
+    convention left over from when BASE_DIR was this endpoint's root (`f"/media/output/{slug}/..."`,
+    `get_results`/`download_statcard_pdf` above). Stripping that one literal prefix and resolving
+    the remainder under OUTPUT_DIR (never BASE_DIR) keeps both existing URL shapes working
+    byte-for-byte while removing every other BASE_DIR-rooted path from ever being reachable here.
+    """
+    output_relative = path[len("output/") :] if path.startswith("output/") else None
     full_path = (
-        _safe_resolve_under(BASE_DIR, path)
-        or _safe_resolve_under(INPUT_DIR, path)
-        or _safe_resolve_under(OUTPUT_DIR, path)
+        _safe_resolve_under(OUTPUT_DIR, output_relative)
+        if output_relative is not None
+        else _safe_resolve_under(INPUT_DIR, path)
     )
     if full_path is None:
         raise HTTPException(status_code=404, detail="Media file not found")

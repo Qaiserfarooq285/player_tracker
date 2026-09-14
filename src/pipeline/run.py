@@ -57,6 +57,7 @@ from src.events.aggregate import (
 )
 from src.events.goals import GoalDetectionResult, detect_goals_for_video
 from src.events.key_moments import classify_candidate_windows, find_candidate_windows
+from src.events.manual_touches import manual_touch_events, merge_manual_touches, parse_touch_times
 from src.events.possession import compute_distance_covered
 from src.events.shots import detect_shots
 from src.events.sprints import detect_sprints
@@ -388,6 +389,7 @@ def run_pipeline_for_video(
     output_root: str | Path = "output",
     use_nvdec: bool = True,
     target_profile: TargetProfile | None = None,
+    manual_touch_times: str | None = None,
 ) -> RunReport:
     """Run Stages 4-6 for one already-detected/tracked video end to end (Stage 0.5-3 are invoked
     here too, via `run_track_stage`, but are no-ops on a cache hit — see module docstring).
@@ -411,6 +413,15 @@ def run_pipeline_for_video(
     overrides` below is the ONE place that reconciles both into the canonical `dict[int, list[int]]`
     `select_targets` itself requires, so nothing downstream of this function ever needs to branch
     on which shape was originally supplied.
+
+    `manual_touch_times` (Plan Stage 2, "streamed-gathering-treehouse"): an optional client-typed,
+    comma-/newline-separated list of `M:SS`/`H:MM:SS` ball-touch times (`configs/events.yaml:
+    manual_touch`, `src.events.manual_touches`), submitted alongside a click (this flow only ever
+    has ONE target -- `target_jersey` -- so there is no ambiguity about which player's touches
+    these are, unlike `run_extended_pipeline_for_video`'s no-target-yet auto branch, which does not
+    accept this parameter). Merged into that jersey number's own event list, once, right before
+    `write_player_output` -- see the merge site below for why (Golden Rule 5: "their times win,
+    auto-detection fills the gaps", never a silent double-count and never a silently dropped typo).
     """
     video_path = Path(video_path)
     manual_overrides = normalize_manual_overrides(manual_overrides)
@@ -1232,9 +1243,45 @@ def run_pipeline_for_video(
         )
     )
 
+    # --- Plan Stage 2 ("streamed-gathering-treehouse"): optional client-typed touch times --------
+    # Parsed ONCE for the whole run (a single free-text field, not per-take/per-number) -- merged
+    # in below, scoped to `target_jersey` only (the one player this flow's own click/filename
+    # identity names; see this function's own docstring). Never raises on a malformed entry
+    # (CLAUDE.md §10): unparseable entries are logged and carried into the run report, exactly like
+    # `src.annotations.parse.parse_annotations`'s own `problems` list.
+    manual_touch_cfg = configs["events"]["manual_touch"]
+    manual_touch_problems: list[str] = []
+    manual_touch_evts: list[Event] = []
+    if manual_touch_times:
+        touch_seconds, manual_touch_problems = parse_touch_times(
+            manual_touch_times, manual_touch_cfg
+        )
+        manual_touch_evts = manual_touch_events(touch_seconds, manual_touch_cfg)
+        if manual_touch_problems:
+            logger.warning(
+                "manual touch times for %s: %d unparseable entr(ies) (see run_report.json): %s",
+                video_path.name,
+                len(manual_touch_problems),
+                manual_touch_problems,
+            )
+    manual_touch_suppressed = 0
+
     t0 = time.time()
     for number in sorted(events_by_number.keys()):
         number_events = events_by_number.get(number, [])
+        if manual_touch_evts and number == target_jersey:
+            # Owner's merge rule ("their times win, auto-detection fills the gaps"): applied ONCE,
+            # scoped to the target jersey's own accumulated events across every take it appeared
+            # in -- not per-take, since the client's typed times are absolute video timestamps that
+            # could fall in any one of this player's takes, and a global merge here is simpler and
+            # exactly as correct as a per-take merge would be (a manual touch and an auto touch it
+            # suppresses are always compared within the same jersey number's own event list either
+            # way). Logged, never silently dropped (CLAUDE.md §10).
+            number_events, n_suppressed = merge_manual_touches(
+                number_events, manual_touch_evts, manual_touch_cfg
+            )
+            events_by_number[number] = number_events
+            manual_touch_suppressed += n_suppressed
         possession_seconds = sum(
             ev.t_end - ev.t_start for ev in number_events if ev.type == EventType.POSSESSION
         )
@@ -1285,6 +1332,11 @@ def run_pipeline_for_video(
             video_path.name,
         )
 
+    if manual_touch_times:
+        all_dropped["manual_touch.suppressed_auto_touch"] = manual_touch_suppressed
+        if manual_touch_problems:
+            all_dropped["manual_touch.unparseable_entries"] = len(manual_touch_problems)
+
     hashed_config = config_hash({**configs, "target_jersey": target_jersey})
     report = RunReport(
         run_id=f"{work_dir.name}-{int(time.time())}",
@@ -1302,6 +1354,13 @@ def run_pipeline_for_video(
         "CLAUDE.md §3.2(4))"
     )
     report_dict["selection"] = selection_summary
+    if manual_touch_times:
+        report_dict["manual_touch"] = {
+            "raw": manual_touch_times,
+            "n_parsed": len(manual_touch_evts),
+            "problems": manual_touch_problems,
+            "n_suppressed_auto_touch": manual_touch_suppressed,
+        }
     save_json(report_dict, output_dir / "run_report.json")
 
     logger.info(

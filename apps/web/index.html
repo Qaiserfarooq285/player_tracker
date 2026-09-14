@@ -159,6 +159,17 @@
           </div>
         </div>
 
+        <!-- Optional Ball-touch times (Plan Stage 2, "streamed-gathering-treehouse", 2026-09-14) --
+             optional -- metadata only, exactly like the jersey field above: a typed time is a
+             strong hint ("their times win, auto-detection fills the gaps"), never a requirement,
+             and never applied to the wrong run since it only ever merges into the target jersey's
+             own event list. -->
+        <div class="form-group margin-top-md">
+          <label><i class="fa-solid fa-futbol"></i> Ball-touch times <span class="form-hint">(optional -- metadata only; merged with auto-detected touches)</span></label>
+          <textarea id="touch-times-input" class="form-control text-area" rows="2" placeholder="12:34, 45:10&#10;or one per line"></textarea>
+          <span class="form-hint">Format: comma- or newline-separated <code>M:SS</code> / <code>H:MM:SS</code>, e.g. <code>12:34, 45:10</code>.</span>
+        </div>
+
         <!-- Optional Track ID & Manual Annotation Sidecar Inputs -->
         <div class="form-group margin-top-md">
           <div class="collapsible-header" onclick="toggleCollapsible('annotations-collapse')">

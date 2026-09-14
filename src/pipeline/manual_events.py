@@ -43,6 +43,7 @@ from src.common.types import Annotation, BallDetection, Event, EventType, Take, 
 from src.common.video import probe
 from src.detect.overlay_mask import ArrowHint
 from src.events.aggregate import attribute_events_to_target, compute_take_all_events
+from src.events.manual_touches import manual_touch_events, merge_manual_touches, parse_touch_times
 from src.events.possession import compute_distance_covered
 from src.identity.jersey_models import free_optional_jersey_stack, load_optional_jersey_stack
 from src.identity.jersey_ocr import free_easyocr_reader, load_easyocr_reader
@@ -471,6 +472,7 @@ def run_manual_events_pipeline_for_video(
     work_root: str | Path = "work",
     output_root: str | Path = "output",
     use_nvdec: bool = True,
+    manual_touch_times: str | None = None,
 ) -> dict:
     """ADR-19's manual-events entrypoint for ONE video with a `.annotations.txt` sidecar.
 
@@ -481,6 +483,13 @@ def run_manual_events_pipeline_for_video(
     a red target track or receive a player stat card. Annotations naming other players remain in
     the video as event captions, but can never replace the requested player as the target.
     Deletes any stale prior output first, same contract as `run_extended_pipeline_for_video`.
+
+    `manual_touch_times` (Plan Stage 2, "streamed-gathering-treehouse", wired here for parity with
+    `src.pipeline.run.run_pipeline_for_video`): an optional client-typed, comma-/newline-separated
+    list of touch times, merged into `target_jersey`'s own event list only -- when `target_jersey`
+    is `None` this mode has no single well-defined "the target player" (a sidecar can name several
+    jersey numbers, see `jersey_numbers` below), so touch times are honestly left unmerged rather
+    than guessed onto an arbitrary one (Golden Rule 5).
     """
     video_path = Path(video_path)
     work_dir = work_dir_for(video_path, root=work_root)
@@ -665,12 +674,38 @@ def run_manual_events_pipeline_for_video(
     )
     logger.info("manual-mode annotated video render -> %s", final_video_path)
 
+    # Plan Stage 2 ("streamed-gathering-treehouse"): optional client-typed touch times, wired here
+    # for parity with `src.pipeline.run.run_pipeline_for_video` -- parsed ONCE for the whole run
+    # (see this function's own docstring for why merging is scoped to `target_jersey` only).
+    manual_touch_cfg = configs["events"]["manual_touch"]
+    manual_touch_problems: list[str] = []
+    manual_touch_evts: list[Event] = []
+    if manual_touch_times:
+        touch_seconds, manual_touch_problems = parse_touch_times(
+            manual_touch_times, manual_touch_cfg
+        )
+        manual_touch_evts = manual_touch_events(touch_seconds, manual_touch_cfg)
+        if manual_touch_problems:
+            logger.warning(
+                "manual touch times for %s: %d unparseable entr(ies): %s",
+                video_path.name,
+                len(manual_touch_problems),
+                manual_touch_problems,
+            )
+    manual_touch_suppressed = 0
+
     takes_by_id = {t.id: t for t in takes}
     jersey_numbers = (
         [target_jersey] if target_jersey is not None else sorted(events_by_number.keys())
     )
     for number in jersey_numbers:
         events = events_by_number.get(number, [])
+        if manual_touch_evts and number == target_jersey:
+            # Owner's merge rule ("their times win, auto-detection fills the gaps") -- see
+            # `src.pipeline.run.run_pipeline_for_video`'s identical splice for the full reasoning.
+            events, n_suppressed = merge_manual_touches(events, manual_touch_evts, manual_touch_cfg)
+            events_by_number[number] = events
+            manual_touch_suppressed += n_suppressed
         # Owner decision 2026-09-02: possession/distance are now genuinely measured the same way
         # run.py's own auto branch computes them, since events are auto-detected (see above) --
         # no longer a hardcoded None/"uncertain" now that there is a real heuristic behind them.
@@ -731,7 +766,7 @@ def run_manual_events_pipeline_for_video(
             video_path.name,
         )
 
-    return {
+    summary = {
         "video": str(video_path),
         "mode": "manual_events",
         "n_takes": len(takes),
@@ -742,3 +777,11 @@ def run_manual_events_pipeline_for_video(
         "annotated_video_path": str(final_video_path),
         "player_dirs": [str(output_dir / "players" / f"player_{n}") for n in jersey_numbers],
     }
+    if manual_touch_times:
+        summary["manual_touch"] = {
+            "raw": manual_touch_times,
+            "n_parsed": len(manual_touch_evts),
+            "problems": manual_touch_problems,
+            "n_suppressed_auto_touch": manual_touch_suppressed,
+        }
+    return summary

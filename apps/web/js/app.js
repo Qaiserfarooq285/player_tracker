@@ -383,6 +383,10 @@ async function startPipelineProcessing() {
   const targetJersey = Number.isNaN(parsedJersey) ? null : parsedJersey;
   const trackId = document.getElementById('track-id-input').value.trim();
   const manualAnnotations = document.getElementById('manual-annotations-input').value;
+  // Plan Stage 2 ("streamed-gathering-treehouse", 2026-09-14): optional, like the jersey field --
+  // `null`, not an empty string, when left blank, matching `ProcessRequest.touch_times`'s own
+  // optional default.
+  const touchTimesRaw = document.getElementById('touch-times-input')?.value.trim();
 
   if (!videoName) {
     alert('Please select or upload a video clip first.');
@@ -406,6 +410,7 @@ async function startPipelineProcessing() {
       // made after the last picker click still wins, exactly as it always has.
       track_id: trackId || null,
       manual_annotations: manualAnnotations,
+      touch_times: touchTimesRaw || null,
     };
 
     // "streamed-gathering-treehouse" plan Stage 1: every accumulated picker-click anchor rides
@@ -763,32 +768,32 @@ function playReel(category) {
 }
 
 function exportStatCard() {
-  if (!currentResults || !currentResults.primary_player) return;
+  // Plan Stage 3 ("streamed-gathering-treehouse", 2026-09-14): this used to re-type an
+  // approximation of the statcard client-side -- it omitted Dribbles entirely, rescaled
+  // confidences, and (because the old `_safe_int` coercion turned the non-numeric
+  // "not available (...)" string into a bare `0`) printed "Goals: 0" where the real statcard.md
+  // carries the full "not available" explanation. That overclaimed certainty relative to the real
+  // file (a Golden Rule 5 violation), so this now just downloads the real, server-rendered
+  // `statcard.pdf` (`src.pipeline.statcard_pdf.render_statcard_pdf`) -- the SAME values
+  // `statcard.md` uses, no second, drifting re-typing of the stats anywhere.
+  if (!currentResults || !currentResults.primary_player) {
+    alert('No results loaded yet -- process a video first.');
+    return;
+  }
   const player = currentResults.primary_player;
-
-  let text = `# PLAYER STAT CARD - JERSEY #${player.jersey_number}\n\n`;
-  text += `Identity Status: ${player.identity_status}\n`;
-  text += `Touches: ${player.touches}\n`;
-  text += `Passes (Same-Colour): ${player.passes}\n`;
-  text += `Turnovers: ${player.turnovers}\n`;
-  text += `Sprints/Runs: ${player.sprints}\n`;
-  text += `Goals: ${player.goals}\n`;
-  text += `Assists: ${player.assists}\n`;
-  text += `Shots: ${player.shots}\n`;
-  text += `Tackles: ${player.tackles}\n`;
-  text += `Saves: ${player.saves}\n`;
-  text += `Possession Time: ${player.possession_time}\n`;
-  text += `Distance Covered: ${player.distance_covered}\n\n`;
-  text += `## EVENT TIMELINE\n`;
-  (player.events || []).forEach(e => {
-    text += `- ${e.time} | ${e.event} | Conf: ${(e.confidence * 100).toFixed(0)}%\n`;
-  });
-
-  const blob = new Blob([text], { type: 'text/markdown' });
-  const url = URL.createObjectURL(blob);
+  if (!player.statcard_pdf_url) {
+    // Honest message rather than the old silent `return` (itself a minor Golden Rule 5 gap) --
+    // e.g. `reportlab` wasn't installed on the server when this run happened.
+    alert(
+      'No downloadable stat-card PDF is available for this player (the PDF was not generated ' +
+      'for this run). The full statcard.md is still viewable at ' +
+      `/media/output/${currentResults.slug}/players/player_${player.jersey_number}/statcard.md`
+    );
+    return;
+  }
   const a = document.createElement('a');
-  a.href = url;
-  a.download = `Player_${player.jersey_number}_StatCard.md`;
+  a.href = player.statcard_pdf_url;
+  a.download = `player_${player.jersey_number}_statcard.pdf`;
   a.click();
 }
 

@@ -338,6 +338,30 @@ touch:
   # this file (literal measured pixel proximity), so it gets the highest ceiling of the new
   # categories — still never allowed to read as more than "worth a human glance".
 
+manual_touch:
+  # Plan Stage 2 ("streamed-gathering-treehouse", 2026-09-14) -- optional client-typed ball-touch
+  # times (src/events/manual_touches.py), submitted alongside the multi-anchor click flow rather
+  # than through the ADR-19 sidecar (a click already routes a run to the auto-detect pipeline and
+  # explicitly skips the sidecar). Owner's own merge rule: "their times win, auto-detection fills
+  # the gaps" -- a typed time is always kept; a same-instant AUTO touch is suppressed, not
+  # double-counted.
+  time_pattern: '(?:\d{1,2}:)?\d{1,2}:\d{2}' # IDENTICAL value to configs/annotations.yaml:
+  # time_pattern (MM:SS or H:MM:SS/HH:MM:SS) -- mirrored, not cross-imported, per this file's own
+  # "independently runnable stage configs" convention (see e.g. touch.match_tolerance_s above).
+  merge_window_s: 1.0 # ⚠️ REASONED-BUT-UNMEASURED (no real client-typed touch-time data exists yet
+  # to measure a genuine "same touch" gap against, same epistemic status as e.g. `goal`'s own
+  # block-level comment below): a client transcribing a touch from the video by eye is unlikely to
+  # be off by more than about a second from the auto-detector's own contact instant, and this also
+  # matches `event_window_seconds` below plus a small slop margin -- a real auto TOUCH within one
+  # second of the client's own typed instant is treated as the SAME touch, never a second one.
+  event_window_seconds: 1.0 # identical value/reasoning to configs/annotations.yaml:
+  # event_window_seconds -- a manual touch time records a single INSTANT the client watched, not a
+  # measured [t_start, t_end] interval the way an auto-detector's heuristic produces one.
+  confidence: 0.95 # identical value/reasoning to configs/annotations.yaml: default_confidence -- a
+  # human directly watching the footage and typing what they saw is the strongest evidence this
+  # project has (Golden Rule 4), short of a full 1.0 (an honest, non-zero "transcription-fallible"
+  # discount, not a fabricated exact certainty).
+
 possession:
   # For each (confidence-filtered) ball sample, the nearest non-referee player within
   # `possession_max_dist` "has" the ball; consecutive same-identity samples merge into possession
