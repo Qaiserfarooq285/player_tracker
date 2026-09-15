@@ -15,7 +15,7 @@ from pathlib import Path
 from src.common.io import load_yaml
 from src.common.types import BBox, Track, TrackBox
 from src.track.target import KitColourSample, TargetLink, TargetProfile, TargetState
-from src.track.target_verify import VerdictDecision, verify_candidate
+from src.track.target_verify import VerdictDecision, classify_chain_fragment, verify_candidate
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -239,46 +239,85 @@ def test_full_agreement_on_every_signal_is_a_confident_accept():
     assert verdict.score >= _cfg()["strong_match"]
 
 
+def test_perfect_kit_and_height_match_with_no_jersey_or_trajectory_evidence_now_accepts():
+    """The exact real-world bug this session fixes: on footage where the jersey number is simply
+    unreadable (ADR-21: 0/801 crops on `clip1_43`) and this is the profile's first take (no
+    trajectory history yet), a candidate that matches PERFECTLY on every signal that actually has
+    evidence (kit colour, height) must not be capped below `strong_match` just because jersey and
+    trajectory have nothing to contribute. Renormalised score = (0.4*1.0 + 0.15*1.0) / (0.4+0.15)
+    = 1.0 -- under the old fixed-denominator scoring this same fixture scored exactly 0.775 (see
+    git history), below strong_match=0.90, an ACCEPT that was mathematically impossible."""
+    cfg = _cfg()
+    profile = _profile(
+        kit=_kit(torso=BLUE_10, shorts=BLUE_10, socks=BLUE_10),
+        jersey_number=None,  # no jersey number on the profile at all -- unreadable footage
+        median_height=100.0,
+        links=[],  # no trajectory history
+    )
+    candidate = _track(2, [_box(0.0, 100)], team=0)
+    kit_by_track = {2: _kit(torso=BLUE_10, shorts=BLUE_10, socks=BLUE_10)}
+    verdict = verify_candidate(profile, candidate, kit_by_track, {}, cfg)
+    assert verdict.evidence["jersey_agrees"] is None
+    assert verdict.evidence["score_breakdown"]["trajectory"]["available"] is False
+    assert verdict.score == 1.0
+    assert verdict.decision == VerdictDecision.ACCEPT
+
+
 def test_no_evidence_anywhere_lands_in_reject_not_a_weak_accept():
-    """Every soft signal is neutral (0.5) when there's no evidence anywhere -- the resulting score
-    must sit BELOW `uncertain_low`, so a candidate with literally nothing corroborating it is
-    REJECTED, never accepted or left uncertain, by construction of the weights."""
+    """2026-09-15 update: `_score_candidate` no longer folds a neutral 0.5 into a fixed-denominator
+    average (that structural bug made ACCEPT impossible whenever jersey was unreadable -- see that
+    function's own docstring). With literally NO evidence on any of the four signals, there is
+    nothing to renormalise over at all -- the degenerate `total_weight == 0` case -- so the score
+    is the explicit floor, `0.0`, not the old neutral `0.5`. Either way the candidate must still
+    land REJECTED, never accepted or left uncertain: "no evidence anywhere" is not evidence of a
+    match."""
     cfg = _cfg()
     profile = _profile(kit=None, jersey_number=None, median_height=0.0)
     candidate = _track(2, [], team=0)
     verdict = verify_candidate(profile, candidate, {}, {}, cfg)
-    assert verdict.score == 0.5
+    assert verdict.score == 0.0
     assert verdict.score < cfg["uncertain_low"]
     assert verdict.decision == VerdictDecision.REJECT
     assert verdict.evidence["rejected_reason"] == "score_below_uncertain_low"
+    assert verdict.evidence["score_breakdown"]["components"] == {}
+    assert set(verdict.evidence["score_breakdown"]["skipped_no_evidence"]) == {
+        "kit_colour",
+        "jersey",
+        "height",
+        "trajectory",
+    }
 
 
 def test_uncertain_band_is_returned_not_a_weak_accept():
-    """Construct a score that lands strictly between `uncertain_low` and `strong_match` (kit
-    colour matches + jersey agrees, height/trajectory neutral -- no boxes/link history to measure
-    either) and confirm it comes back UNCERTAIN, not ACCEPT -- the plan's own core requirement
-    (§5/§14/§19: UNCERTAIN must never become a weak accept)."""
+    """2026-09-15 update: the old fixture (kit matches + jersey agrees, height/trajectory
+    "neutral") no longer lands UNCERTAIN under the renormalised scoring -- with height/trajectory
+    genuinely having NO evidence, they're now excluded rather than counted at a neutral 0.5, so
+    kit+jersey (both perfect, both with real evidence) renormalise to a clean 1.0 -- a CORRECT
+    ACCEPT (see `test_full_agreement_on_every_signal_is_a_confident_accept`-style reasoning; the
+    old test's `0.775` was an artifact of the bug this session fixed, not a genuine ambiguous
+    match). The real UNCERTAIN case is a signal that HAS evidence but is only a WEAK match: a
+    height ratio of 0.8 -- present, above the 0.60 hard-reject floor, but not a perfect 1.0 --
+    with no other evidence at all renormalises to exactly that one signal's own value
+    (weight*0.8 / weight = 0.8), which sits inside [uncertain_low, strong_match) and must still
+    come back UNCERTAIN, not a weak ACCEPT (the plan's own core requirement, §5/§14/§19)."""
     cfg = _cfg()
-    weights = cfg["scoring"]["weights"]
-    # kit_colour=1.0, jersey=1.0, height/trajectory neutral 0.5 each ->
-    # score = 0.5 + 0.5*(weights['kit_colour'] + weights['jersey'])
-    expected_score = 0.5 + 0.5 * (weights["kit_colour"] + weights["jersey"])
-    assert (
-        cfg["uncertain_low"] <= expected_score < cfg["strong_match"]
-    ), "fixture assumption broken -- adjust the profile/candidate below if config weights change"
-    profile = _profile(
-        kit=_kit(torso=BLUE_10, shorts=BLUE_10, socks=BLUE_10),
-        jersey_number=10,
-        median_height=0.0,  # -> height_ratio can't be computed -> neutral, not measured
-        links=[],  # -> no trajectory history -> neutral, not measured
+    assert cfg["uncertain_low"] <= 0.8 < cfg["strong_match"], (
+        "fixture assumption broken -- adjust the height ratio below if uncertain_low/strong_match "
+        "change"
     )
-    candidate = _track(2, [], team=0)  # no boxes -> its own median height is also 0.0
-    kit_by_track = {2: _kit(torso=BLUE_10, shorts=BLUE_10, socks=BLUE_10)}
-    jersey_by_track = {2: "10"}
-    verdict = verify_candidate(profile, candidate, kit_by_track, jersey_by_track, cfg)
-    assert verdict.score == round(expected_score, 4)
+    profile = _profile(kit=None, jersey_number=None, median_height=100.0, links=[])
+    candidate = _track(2, [_box(0.0, 80)], team=0)  # height_ratio = 80/100 = 0.8 -- real, weak
+    verdict = verify_candidate(profile, candidate, {}, {}, cfg)
+    assert verdict.evidence["height_ratio"] == 0.8
+    assert verdict.score == 0.8
     assert verdict.decision == VerdictDecision.UNCERTAIN
     assert "rejected_reason" not in verdict.evidence
+    assert verdict.evidence["score_breakdown"]["components"] == {"height": 0.8}
+    assert set(verdict.evidence["score_breakdown"]["skipped_no_evidence"]) == {
+        "kit_colour",
+        "jersey",
+        "trajectory",
+    }
 
 
 def test_evidence_always_present_regardless_of_decision():
@@ -343,3 +382,89 @@ def test_trajectory_far_jump_scores_low_but_is_not_a_hard_reject():
     # a bad trajectory score alone (one of four soft signals) must not itself be a REJECT reason
     # other than the ordinary low-score path (there is no dedicated trajectory hard-reject)
     assert verdict.evidence.get("rejected_reason") in (None, "score_below_uncertain_low")
+
+
+# ---------------------------------------------------------------------------
+# `classify_chain_fragment` -- "streamed-gathering-treehouse" (recheck) plan Fix A: the narrower
+# contradiction-only test `_verify_chain_fragments` (src/highlights/selection.py) runs against
+# every fragment a verified seed's own `stitch_timeline` chain picked up, never itself run through
+# the full hard-reject-then-score `verify_candidate` gate above.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_chain_fragment_no_evidence_anywhere_is_not_a_contradiction():
+    """Absence of evidence is not evidence of a different player (Golden Rule 5) -- same
+    discipline `prune_chain_by_jersey` already documents for the jersey-only case, now covering
+    kit colour too."""
+    profile = _profile(kit=None, jersey_number=None)
+    fragment = _track(2, [_box(0.0, 100)], team=0)
+    contradicts, evidence = classify_chain_fragment(profile, fragment, {}, {}, _cfg()["kit_colour"])
+    assert contradicts is False
+    assert evidence["kit_colour"]["decisive_band"] is None
+    assert evidence["jersey_agrees"] is None
+
+
+def test_classify_chain_fragment_kit_colour_none_verdict_is_not_a_contradiction():
+    """`_combined_kit_verdict`'s tri-state `None` result ("no evidence either way" -- e.g. every
+    band occluded on one side) must NEVER be treated as a contradiction -- only its explicit
+    `False` ("confidently a different kit") result may drop a fragment. This is the exact
+    instruction Fix A was given: "must use the `False` verdict, never the `None` one"."""
+    profile = _profile(kit=_kit(torso=None, shorts=None, socks=None), jersey_number=None)
+    fragment = _track(2, [_box(0.0, 100)], team=0)
+    kit_by_track = {2: _kit(torso=BLUE_10, shorts=BLUE_10, socks=BLUE_10)}
+    contradicts, evidence = classify_chain_fragment(
+        profile, fragment, kit_by_track, {}, _cfg()["kit_colour"]
+    )
+    assert contradicts is False
+    assert evidence["kit_colour"]["decisive_band"] is None
+
+
+def test_classify_chain_fragment_confident_kit_colour_mismatch_is_a_contradiction():
+    """The real measured failure this whole plan exists to catch (blue #10 vs claret #21) --
+    reused here to prove `classify_chain_fragment` catches it for a merely-stitched fragment, not
+    just a `verify_candidate`-scored seed."""
+    profile = _profile(kit=_kit(torso=BLUE_10, shorts=BLUE_10, socks=BLUE_10), jersey_number=None)
+    fragment = _track(47, [_box(0.0, 100)], team=0)
+    kit_by_track = {47: _kit(torso=CLARET_21, shorts=CLARET_21, socks=CLARET_21)}
+    contradicts, evidence = classify_chain_fragment(
+        profile, fragment, kit_by_track, {}, _cfg()["kit_colour"]
+    )
+    assert contradicts is True
+    assert evidence["reason"] == "wrong_kit_colour"
+    assert evidence["kit_colour"]["torso"]["same"] is False
+
+
+def test_classify_chain_fragment_jersey_disagreement_is_a_contradiction():
+    """Mirrors `prune_chain_by_jersey`'s own measured rule -- a confident jersey disagreement is a
+    contradiction even with no kit-colour evidence at all."""
+    profile = _profile(kit=None, jersey_number=10)
+    fragment = _track(2, [_box(0.0, 100)], team=0)
+    jersey_by_track = {2: "21"}
+    contradicts, evidence = classify_chain_fragment(
+        profile, fragment, {}, jersey_by_track, _cfg()["kit_colour"]
+    )
+    assert contradicts is True
+    assert evidence["reason"] == "wrong_jersey_number"
+
+
+def test_classify_chain_fragment_missing_jersey_read_on_either_side_is_not_a_contradiction():
+    profile = _profile(kit=None, jersey_number=10)
+    fragment = _track(2, [_box(0.0, 100)], team=0)
+    contradicts, evidence = classify_chain_fragment(profile, fragment, {}, {}, _cfg()["kit_colour"])
+    assert contradicts is False
+    assert evidence["jersey_agrees"] is None
+
+
+def test_classify_chain_fragment_kit_colour_false_takes_priority_over_jersey_agreement():
+    """Same ordering as `verify_candidate`'s own hard-reject chain: a confident kit-colour
+    contradiction is checked first and short-circuits before the jersey comparison even runs."""
+    profile = _profile(kit=_kit(torso=BLUE_10, shorts=BLUE_10, socks=BLUE_10), jersey_number=10)
+    fragment = _track(2, [_box(0.0, 100)], team=0)
+    kit_by_track = {2: _kit(torso=CLARET_21, shorts=CLARET_21, socks=CLARET_21)}
+    jersey_by_track = {2: "10"}  # AGREES -- must not rescue a confident kit-colour contradiction
+    contradicts, evidence = classify_chain_fragment(
+        profile, fragment, kit_by_track, jersey_by_track, _cfg()["kit_colour"]
+    )
+    assert contradicts is True
+    assert evidence["reason"] == "wrong_kit_colour"
+    assert "jersey_agrees" not in evidence  # never reached

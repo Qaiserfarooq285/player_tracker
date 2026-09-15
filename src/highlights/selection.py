@@ -378,6 +378,82 @@ def _last_position_evidence(track_ids: list[int], take_tracks: list[Track]) -> d
     }
 
 
+def _verify_chain_fragments(
+    take_id: int,
+    union_ids: list[int],
+    seed_ids: list[int],
+    take_tracks: list[Track],
+    profile: TargetProfile,
+    kit_by_track: dict[int, KitColourSample],
+    jersey_by_track: dict[int, str],
+    kit_colour_cfg: dict,
+) -> tuple[list[int], dict[int, dict]]:
+    """ "streamed-gathering-treehouse" (recheck) plan **Fix A**: classify every fragment id in
+    `union_ids` (a profile-driven take's own geometry-stitched chain, `_union_time_sorted`'s
+    output) into the VERIFIED chain -- what used to be seeds-only, undercounting every fragment
+    `stitch_timeline` legitimately joined (see the plan's own Context section, finding A).
+
+    - a `seed_ids` member (already independently cleared `verify_candidate`, i.e. an ACCEPTed
+      manual-override anchor or an ACCEPTed `target_reidentified` candidate) is ALWAYS kept, no
+      further check;
+    - every OTHER fragment is kept UNLESS `src.track.target_verify.classify_chain_fragment` finds
+      it actively contradicts the profile (confident different kit colour, or a confident jersey
+      disagreement) -- the exact same "absence of evidence is not evidence of a different player"
+      discipline `src.track.click_reid.prune_chain_by_jersey` already applies on the profile-LESS
+      click path, now covering kit colour too, not jersey alone;
+    - a contradicting fragment is DROPPED and logged with its reason (CLAUDE.md §10: "log
+      everything dropped") -- it stays in the take's own `track_ids` (still drawn green, still a
+      plausible candidate) but never enters the verified chain, so it can never draw the target's
+      red box or be counted into that player's stats (the owner's absolute rule, unchanged).
+
+    Returns `(verified_chain_ids, fragment_evidence)`, in `union_ids`'s own time-sorted order.
+    `fragment_evidence` records EVERY fragment's own verdict -- seed, kept, or dropped (+ reason)
+    -- never just the drops, so every inclusion is exactly as auditable as every exclusion (Golden
+    Rule 5), stored verbatim in `TakeSelection.evidence["chain_fragment_evidence"]`.
+    """
+    from src.track.target_verify import classify_chain_fragment  # see module-level import-order
+
+    # comment: `src.track.target_verify` cannot be imported at module scope here.
+
+    by_id = {tr.id: tr for tr in take_tracks}
+    seed_set = set(seed_ids)
+    kept: list[int] = []
+    fragment_evidence: dict[int, dict] = {}
+    for tid in union_ids:
+        if tid in seed_set:
+            kept.append(tid)
+            fragment_evidence[tid] = {"role": "seed", "contradicts": False}
+            continue
+        fragment = by_id.get(tid)
+        if fragment is None:
+            # Defensive only -- every id in `union_ids` was sourced from this exact take's own
+            # `take_tracks` by construction (`_union_time_sorted` only ever flattens `chains`,
+            # which only ever comes from `stitch_timeline(seed_id, take_tracks, ...)`). Keep it
+            # rather than silently drop something we have no evidence against.
+            kept.append(tid)
+            fragment_evidence[tid] = {
+                "role": "fragment",
+                "contradicts": False,
+                "reason": "track_not_found_in_take",
+            }
+            continue
+        contradicts, evidence = classify_chain_fragment(
+            profile, fragment, kit_by_track, jersey_by_track, kit_colour_cfg
+        )
+        fragment_evidence[tid] = {"role": "fragment", **evidence}
+        if contradicts:
+            logger.warning(
+                "take=%d: DROPPED stitched fragment track=%d from the verified chain -- %s "
+                "(stays a green candidate, never red / never counted into stats)",
+                take_id,
+                tid,
+                evidence.get("reason"),
+            )
+            continue
+        kept.append(tid)
+    return kept, fragment_evidence
+
+
 def _update_profile_after_take(
     profile: TargetProfile,
     take: Take,
@@ -459,10 +535,32 @@ def _select_take_with_profile(
     UNCERTAIN seed (Stage 2's own rule: UNCERTAIN is never a weak accept) is logged with its own
     reason and simply excluded -- it can never widen the accepted chain ("Candidate != Target").
     **No seed accepted at all -> `target_lost`**, exactly as the single-seed case always was.
-    """
-    from src.track.target_verify import VerdictDecision, verify_candidate  # see module-level
 
-    # import-order comment: `src.track.target_verify` cannot be imported at module scope here.
+    **2026-09-15 fix (Golden Rule 4): the establishing click is never re-derived from its own
+    profile.** `profile.established_track_id`/`established_take_id` record exactly which track, in
+    which take, a human clicked to CREATE this profile in the first place (`src.track.target.
+    build_target_profile`) -- that track's own kit/height/jersey evidence usually IS (or is
+    extremely close to) the evidence the profile itself was built from, so `verify_candidate`
+    re-scoring it against itself can only ever be pulled down by whatever evidence happens to be
+    thin (a jersey number that never got a confident read, no trajectory history yet on the very
+    first take) -- never pulled up. Re-deriving "is this the target" from appearance for the track
+    the target WAS DEFINED FROM is backwards: a human already confirmed this identity by clicking
+    it, the strongest evidence this pipeline has (CLAUDE.md Golden Rule 4). So when a seed's
+    `(take_id, track_id)` exactly matches the profile's own established anchor, it is accepted
+    OUTRIGHT here, without ever calling `verify_candidate` -- not a weak accept, not a score-based
+    one, `evidence["accepted_as"] = "established_anchor"` records exactly why (Golden Rule 5). A
+    LATER click -- a different track, or the same track id in a DIFFERENT take -- does not match
+    both fields at once and is verified normally: this bypass is scoped to the one specific
+    (take, track) pair a human directly clicked to create the profile, never a standing exemption
+    for "the same track id anywhere".
+    """
+    from src.track.target_verify import (  # see module-level import-order comment: `src.track.
+        TargetVerdict,
+        VerdictDecision,
+        verify_candidate,
+    )
+
+    # target_verify` cannot be imported at module scope here.
 
     by_id = {tr.id: tr for tr in take_tracks}
 
@@ -487,9 +585,23 @@ def _select_take_with_profile(
                     seed_id,
                 )
                 continue
-            verdict = verify_candidate(
-                profile, candidate, kit_by_track, jersey_by_track, target_cfg
-            )
+            if seed_id == profile.established_track_id and take.id == profile.established_take_id:
+                # This function's own docstring, "2026-09-15 fix" -- the click that CREATED the
+                # profile, re-encountered in the very take it created it in, is the target by
+                # definition. Accepted without needing to clear the score bar.
+                verdict = TargetVerdict(
+                    decision=VerdictDecision.ACCEPT,
+                    score=1.0,
+                    evidence={
+                        "candidate_track_id": seed_id,
+                        "accepted_as": "established_anchor",
+                        "reason": "human_established_this_profile_from_this_exact_track_and_take",
+                    },
+                )
+            else:
+                verdict = verify_candidate(
+                    profile, candidate, kit_by_track, jersey_by_track, target_cfg
+                )
             seed_evidence[seed_id] = {"decision": verdict.decision.value, **verdict.evidence}
             if verdict.decision == VerdictDecision.ACCEPT:
                 accepted.append((seed_id, verdict))
@@ -529,6 +641,22 @@ def _select_take_with_profile(
             # reflects the average strength of the evidence actually used, rather than a single
             # (possibly weaker or stronger) anchor standing in for all of them.
             mean_score = sum(v.score for _, v in accepted) / len(accepted)
+            # "streamed-gathering-treehouse" (recheck) plan Fix A: every ACCEPTed seed is always
+            # kept; every OTHER fragment `union_ids` picked up via the seeds' own `stitch_timeline`
+            # calls is kept too UNLESS it actively contradicts the profile (confident different kit
+            # colour or jersey number) -- see `_verify_chain_fragments`'s own docstring. This
+            # replaces the old "verified == seeds only" rule that silently excluded every
+            # legitimately-stitched fragment from stats/the red box.
+            verified_chain_ids, fragment_evidence = _verify_chain_fragments(
+                take.id,
+                union_ids,
+                verified_ids,
+                take_tracks,
+                profile,
+                kit_by_track,
+                jersey_by_track,
+                target_cfg["kit_colour"],
+            )
             selection = TakeSelection(
                 take_id=take.id,
                 method="manual_override",
@@ -537,12 +665,16 @@ def _select_take_with_profile(
                 confidence=mean_score,
                 coverage_seconds=timeline_coverage_seconds(union_ids, take_tracks),
                 take_duration_seconds=take_duration,
-                evidence={"seed_evidence": seed_evidence, "accepted_seed_ids": verified_ids},
-                # Stage B: only the seeds that independently passed `verify_candidate` -- every
-                # other fragment any of their `stitch_timeline` calls joined is geometry-only,
-                # never independently verified, so it stays a candidate (green box), never red
-                # (plan's "Candidate != Target").
-                verified_track_ids=verified_ids,
+                evidence={
+                    "seed_evidence": seed_evidence,
+                    "accepted_seed_ids": verified_ids,
+                    "chain_fragment_evidence": fragment_evidence,
+                },
+                # Stage B, extended by Fix A: every ACCEPTed seed, PLUS every other stitched
+                # fragment that doesn't actively contradict the profile -- a fragment that DOES
+                # contradict stays a candidate only (green box), never red (plan's "Candidate !=
+                # Target" still holds; it's the "no contradicting evidence" bar that widened).
+                verified_track_ids=verified_chain_ids,
             )
     else:
         candidates = _reasonable_candidates(take_tracks, selection_cfg)
@@ -584,6 +716,31 @@ def _select_take_with_profile(
                 track_ids, _stitch_conf = stitch_timeline(
                     winner_id, take_tracks, selection_cfg, motion
                 )
+                accept_ids = [tid for tid, _ in accepts]
+                # "streamed-gathering-treehouse" (recheck) plan Fix A: `accept_ids` (every
+                # candidate that independently passed `verify_candidate` this take, not just
+                # `winner_id`) is always kept, exactly as before. NEW: a fragment `track_ids` (the
+                # winner's own `stitch_timeline` chain) picked up that was never independently
+                # scored is now ALSO kept, unless it actively contradicts the profile -- see
+                # `_verify_chain_fragments`'s own docstring. `accept_ids` is passed both as this
+                # helper's `seed_ids` (so an already-accepted candidate is never re-classified) and
+                # unioned back in afterwards (an accepted candidate can legitimately sit outside
+                # the winner's own geometry chain -- e.g. a separate fragment either side of a
+                # brief ID reset -- and must stay verified regardless of chain membership, same as
+                # the pre-existing behaviour this replaces).
+                verified_from_chain, fragment_evidence = _verify_chain_fragments(
+                    take.id,
+                    track_ids,
+                    accept_ids,
+                    take_tracks,
+                    profile,
+                    kit_by_track,
+                    jersey_by_track,
+                    target_cfg["kit_colour"],
+                )
+                verified_chain_ids = _union_time_sorted(
+                    [verified_from_chain, accept_ids], take_tracks
+                )
                 selection = TakeSelection(
                     take_id=take.id,
                     method="target_reidentified",
@@ -592,15 +749,13 @@ def _select_take_with_profile(
                     confidence=verdict.score,
                     coverage_seconds=timeline_coverage_seconds(track_ids, take_tracks),
                     take_duration_seconds=take_duration,
-                    evidence=verdict.evidence,
-                    # Stage B: EVERY candidate that independently passed `verify_candidate` this
-                    # take, not just the highest-scoring `winner_id` -- each one was tested against
-                    # the SAME strict hard-reject-then-score gate on its own merits (e.g. two
-                    # ByteTrack fragments of the same real player either side of a brief ID reset,
-                    # both plausibly the target). A fragment merely joined to the winner by
-                    # `stitch_timeline`'s own geometry (in `track_ids` but NOT in `accepts`) never
-                    # went through that gate and stays a candidate (green), never red.
-                    verified_track_ids=[tid for tid, _ in accepts],
+                    evidence={**verdict.evidence, "chain_fragment_evidence": fragment_evidence},
+                    # Stage B, extended by Fix A: every independently-ACCEPTed candidate (as
+                    # before), PLUS every other fragment of the winner's own stitched chain that
+                    # doesn't actively contradict the profile. A fragment merely joined to the
+                    # winner by `stitch_timeline`'s own geometry that DOES contradict stays a
+                    # candidate only (green), never red (plan's "Candidate != Target" still holds).
+                    verified_track_ids=verified_chain_ids,
                 )
 
     _update_profile_after_take(profile, take, selection, take_tracks, kit_by_track, target_cfg)

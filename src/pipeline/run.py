@@ -234,16 +234,60 @@ def _accepted_target_ids(sel: TakeSelection, target_profile_active: bool) -> lis
     """The SAME accepted-fragment id set that gates the target's red/amber box (Stage A/C,
     `src.track.target_state.build_target_timeline`) and Stage D's own event attribution -- the
     plan's own explicit "box and statistics share one identity" requirement. A `TargetProfile`-
-    driven take (`target_profile_active=True`) uses ONLY `sel.verified_track_ids` -- the human-
-    established seed or whichever candidate(s) independently passed `verify_candidate` (never a
-    fragment `stitch_timeline` merely joined by geometry, "Candidate != Target"). Every
+    driven take (`target_profile_active=True`) uses ONLY `sel.verified_track_ids` -- as of the
+    "streamed-gathering-treehouse" (recheck) plan's own **Fix A**, this is no longer just the
+    human-established seed(s) / whichever candidate(s) independently passed `verify_candidate`: it
+    is that VERIFIED CHAIN -- those seeds/candidates plus every other same-take fragment
+    `stitch_timeline` joined onto them that does NOT actively contradict the profile (confident
+    different kit colour or jersey number), classified by
+    `src.highlights.selection._verify_chain_fragments`. A fragment that DOES contradict is still
+    excluded (never a red box, never counted into stats, "Candidate != Target" still holds) -- it
+    is only the "no contradicting evidence" bar that widened, fixing the plan's own Finding A
+    (every legitimately-stitched fragment used to be silently dropped from the stats count). Every
     pre-existing profile-LESS method (arrow_vote/heuristic_fallback/none, and a profile-less
     manual_override -- CLAUDE.md §14's auto flow, ADR-15, ADR-19) has no such verified/candidate
     distinction at all, so this falls back to the full stitched `sel.track_ids`, EXACTLY the
-    pre-existing behaviour for every one of those flows (unchanged by this plan)."""
+    pre-existing behaviour for every one of those flows (unchanged by either plan)."""
     if target_profile_active:
         return sel.verified_track_ids
     return sel.track_ids
+
+
+def _resolve_manual_touch_target_jersey(
+    typed_target_jersey: int | None,
+    profile_jersey_number: int | None,
+    produced_jersey_numbers: list[int],
+) -> tuple[int | None, str]:
+    """ "streamed-gathering-treehouse" (recheck) plan **Fix B**: resolve which jersey number a
+    client's typed manual touch-times attach to, replacing the old `number == target_jersey`
+    equality test (`src.pipeline.run.run_pipeline_for_video`'s own touch-merge loop) that silently
+    dropped every typed touch time whenever `target_jersey is None` -- which is the NORMAL case
+    now that the jersey field is optional and identity comes from a verified click instead of a
+    typed number (see this plan's own Context section, finding B).
+
+    Resolution order (owner's own words):
+    1. the client's own TYPED `target_jersey`, when given -- the strongest, most explicit signal;
+    2. else the persistent `TargetProfile`'s own `jersey_number` (`profile_jersey_number`) -- set
+       from a verified click (`jersey_source="click"`) or a filename/human-confirmed number, so it
+       is still a real, non-guessed identity, just not RE-typed alongside this touch submission;
+    3. else, when this run produced events for EXACTLY ONE jersey number
+       (`produced_jersey_numbers`), that one -- there is no genuine ambiguity left to resolve, only
+       a field the client didn't bother re-typing;
+    4. otherwise genuinely AMBIGUOUS (several jerseys, no profile number, no typed number) -- the
+       touch times attach to NONE of them (never guessed onto an arbitrary one) and the caller must
+       report this in the run report (CLAUDE.md §10: "log everything dropped"), never the old
+       silent drop.
+
+    Returns `(resolved_number_or_None, reason)` -- `reason` is always populated (Golden Rule 5):
+    one of `"typed"`, `"profile"`, `"single_jersey_inferred"`, `"ambiguous_not_attached"`.
+    """
+    if typed_target_jersey is not None:
+        return typed_target_jersey, "typed"
+    if profile_jersey_number is not None:
+        return profile_jersey_number, "profile"
+    if len(produced_jersey_numbers) == 1:
+        return produced_jersey_numbers[0], "single_jersey_inferred"
+    return None, "ambiguous_not_attached"
 
 
 def _stitched_virtual_track(take_id: int, take_tracks: list[Track], ids: list[int]) -> Track:
@@ -416,12 +460,17 @@ def run_pipeline_for_video(
 
     `manual_touch_times` (Plan Stage 2, "streamed-gathering-treehouse"): an optional client-typed,
     comma-/newline-separated list of `M:SS`/`H:MM:SS` ball-touch times (`configs/events.yaml:
-    manual_touch`, `src.events.manual_touches`), submitted alongside a click (this flow only ever
-    has ONE target -- `target_jersey` -- so there is no ambiguity about which player's touches
-    these are, unlike `run_extended_pipeline_for_video`'s no-target-yet auto branch, which does not
-    accept this parameter). Merged into that jersey number's own event list, once, right before
-    `write_player_output` -- see the merge site below for why (Golden Rule 5: "their times win,
-    auto-detection fills the gaps", never a silent double-count and never a silently dropped typo).
+    manual_touch`, `src.events.manual_touches`), submitted alongside a click. This flow's own
+    target identity is now resolved, not just read off `target_jersey` verbatim -- **Fix B**,
+    "streamed-gathering-treehouse" (recheck) plan: `target_jersey` is `None` whenever the owner
+    relies on a click instead of also typing a jersey number (the now-recommended flow), so the
+    typed touch times are attached via `_resolve_manual_touch_target_jersey` (typed field -> the
+    active `TargetProfile`'s own jersey number -> the run's single produced jersey number ->
+    genuinely ambiguous, reported, attached to none) rather than a bare `number == target_jersey`
+    equality test that used to silently drop them whenever `target_jersey` was `None`. Merged into
+    the resolved jersey number's own event list, once, right before `write_player_output` -- see
+    the merge site below for why (Golden Rule 5: "their times win, auto-detection fills the gaps",
+    never a silent double-count and never a silently dropped typo).
     """
     video_path = Path(video_path)
     manual_overrides = normalize_manual_overrides(manual_overrides)
@@ -1252,6 +1301,8 @@ def run_pipeline_for_video(
     manual_touch_cfg = configs["events"]["manual_touch"]
     manual_touch_problems: list[str] = []
     manual_touch_evts: list[Event] = []
+    resolved_touch_jersey: int | None = None
+    touch_jersey_reason = "no_manual_touch_times"
     if manual_touch_times:
         touch_seconds, manual_touch_problems = parse_touch_times(
             manual_touch_times, manual_touch_cfg
@@ -1264,12 +1315,37 @@ def run_pipeline_for_video(
                 len(manual_touch_problems),
                 manual_touch_problems,
             )
+        # Fix B: resolve the target jersey rather than requiring the (now-optional) typed field --
+        # see `_resolve_manual_touch_target_jersey`'s own docstring for the full order/reasoning.
+        resolved_touch_jersey, touch_jersey_reason = _resolve_manual_touch_target_jersey(
+            target_jersey,
+            target_profile.jersey_number if target_profile is not None else None,
+            sorted(events_by_number.keys()),
+        )
+        if resolved_touch_jersey is None:
+            logger.warning(
+                "manual touch times for %s: %d typed time(s) could not be attached to any "
+                "player -- ambiguous target (jerseys produced this run: %s, no typed jersey, no "
+                "profile jersey) -- reported in run_report.json, never silently dropped",
+                video_path.name,
+                len(manual_touch_evts),
+                sorted(events_by_number.keys()),
+            )
+        elif resolved_touch_jersey != target_jersey:
+            logger.info(
+                "manual touch times for %s: attached to jersey #%d (%s) -- not the typed "
+                "target_jersey field (%s)",
+                video_path.name,
+                resolved_touch_jersey,
+                touch_jersey_reason,
+                target_jersey,
+            )
     manual_touch_suppressed = 0
 
     t0 = time.time()
     for number in sorted(events_by_number.keys()):
         number_events = events_by_number.get(number, [])
-        if manual_touch_evts and number == target_jersey:
+        if manual_touch_evts and number == resolved_touch_jersey:
             # Owner's merge rule ("their times win, auto-detection fills the gaps"): applied ONCE,
             # scoped to the target jersey's own accumulated events across every take it appeared
             # in -- not per-take, since the client's typed times are absolute video timestamps that
@@ -1336,6 +1412,11 @@ def run_pipeline_for_video(
         all_dropped["manual_touch.suppressed_auto_touch"] = manual_touch_suppressed
         if manual_touch_problems:
             all_dropped["manual_touch.unparseable_entries"] = len(manual_touch_problems)
+        if resolved_touch_jersey is None and manual_touch_evts:
+            # Fix B: genuinely ambiguous target -- reported here (CLAUDE.md §10: "log everything
+            # dropped"), never the old silent drop that `number == target_jersey` produced whenever
+            # `target_jersey` was `None`.
+            all_dropped["manual_touch.ambiguous_target_not_attached"] = len(manual_touch_evts)
 
     hashed_config = config_hash({**configs, "target_jersey": target_jersey})
     report = RunReport(
@@ -1360,6 +1441,10 @@ def run_pipeline_for_video(
             "n_parsed": len(manual_touch_evts),
             "problems": manual_touch_problems,
             "n_suppressed_auto_touch": manual_touch_suppressed,
+            # Fix B: which jersey the typed times actually attached to, and why -- see
+            # `_resolve_manual_touch_target_jersey`'s own docstring for the resolution order.
+            "resolved_target_jersey": resolved_touch_jersey,
+            "target_jersey_resolution": touch_jersey_reason,
         }
     save_json(report_dict, output_dir / "run_report.json")
 

@@ -4,7 +4,9 @@ Provides REST endpoints and media streaming for video upload, player detection, 
 jersey OCR, event detection, movement analytics, and stat card visualization.
 """
 
+import json
 import os
+import re
 import shutil
 import time
 import traceback
@@ -19,6 +21,17 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.common.logging import get_logger
+
+# `src.pipeline.statcard_pdf` (unlike e.g. `src.track.target`/`src.identity.jersey_models`
+# elsewhere in this file) is deliberately imported at module level, breaking this file's usual
+# "heavy src.* imports stay local to the function that needs them" convention: the module itself
+# has no heavy transitive deps (`from __future__ import annotations`, `pathlib`,
+# `src.common.logging` only -- `reportlab` is its OWN lazy, function-local import, see that
+# module's docstring), so importing it here costs nothing at API startup, and a module-level
+# import is what lets `_generate_statcard_pdf_on_demand` below be monkeypatched/mocked cleanly in
+# tests the same way `apps.api.main.render_statcard_pdf` (Plan Fix D, "streamed-gathering-
+# treehouse" re-check, 2026-09-15).
+from src.pipeline.statcard_pdf import render_statcard_pdf
 
 logger = get_logger(__name__)
 
@@ -709,6 +722,60 @@ def _find_output_dir(output_dir: Path, slug: str) -> Path | None:
     return candidate if candidate.exists() else None
 
 
+def _resolve_primary_player_jersey(work_dir: Path) -> int | None:
+    """The run's own real target jersey number, if one is resolvable from cached `work/<slug>/`
+    artifacts -- `target.json` (Stage 1's persistent `TargetProfile`, written by the click/profile
+    -driven flow) first, else `selection.json` (`SelectionResult.target_jersey`, the filename/
+    typed-jersey flow). `None` when neither file exists, neither names a jersey number, or either
+    fails to parse -- callers treat that as "no resolvable target" and fall back to the pre-
+    existing behaviour, never a crash.
+
+    Real bug this exists to fix ("streamed-gathering-treehouse" plan re-check, Fix D, 2026-09-15):
+    `/api/results/{slug}` used to hand back `sorted(players_dir.glob("player_*"))[0]` as
+    `primary_player` -- a LEXICOGRAPHIC accident (the string `"player_10"` sorts before
+    `"player_2"`), so a run that targeted #2 showed the dashboard **#10's** numbers. `target.json`/
+    `selection.json` are the SAME two artifacts `_resolve_target_click`/`_run_pipeline_job` already
+    write for exactly this purpose -- the run's own real, human-confirmed target -- so reading them
+    back here is the honest fix rather than guessing from folder names.
+
+    `target.json` is loaded with the full `TargetProfile` pydantic model (`load_target_profile`,
+    same as `_resolve_target_click` above) since it IS this endpoint's own canonical schema for
+    that file; `selection.json` is read as plain JSON (not `SelectionResult.model_validate`) since
+    only its one `target_jersey` field is needed here and plain parsing degrades more gracefully
+    on an older/partial file than full schema validation would.
+    """
+    target_json_path = work_dir / "target.json"
+    if target_json_path.exists():
+        try:
+            from src.track.target import load_target_profile
+
+            profile = load_target_profile(target_json_path)
+            if profile.jersey_number is not None:
+                return profile.jersey_number
+        except Exception:
+            logger.warning(
+                "primary_player resolution: could not parse %s -- trying selection.json next",
+                target_json_path,
+                exc_info=True,
+            )
+
+    selection_json_path = work_dir / "selection.json"
+    if selection_json_path.exists():
+        try:
+            selection_data = json.loads(selection_json_path.read_text())
+            target_jersey = selection_data.get("target_jersey")
+            if target_jersey is not None:
+                return int(target_jersey)
+        except Exception:
+            logger.warning(
+                "primary_player resolution: could not parse %s -- falling back to sorted order",
+                selection_json_path,
+                exc_info=True,
+            )
+
+    return None
+
+
 def _run_pipeline_job(
     job_id: str,
     video_name: str,
@@ -1152,11 +1219,28 @@ def get_results(slug: str):
     if (out_dir / "original_annotated_video.mp4").exists():
         annotated_url = f"/media/output/{slug_name}/original_annotated_video.mp4"
 
+    # Plan Fix D ("streamed-gathering-treehouse" re-check, 2026-09-15): `primary_player` is the
+    # run's own REAL target -- `work/<slug>/target.json`/`selection.json`, in that order -- never
+    # the old lexicographic `sorted(glob("player_*"))[0]` accident (`"player_10" < "player_2"` as
+    # strings). Falls back to that exact pre-existing first-sorted entry, silently, whenever
+    # neither cache file exists OR the jersey it names has no matching `player_<N>` folder in
+    # THIS run's own output (e.g. only some other jersey's take was ever verified/selected) --
+    # both are honest "couldn't resolve a better answer" cases, not errors.
+    primary_player = None
+    if player_data:
+        target_jersey = _resolve_primary_player_jersey(WORK_DIR / slug_name)
+        if target_jersey is not None:
+            primary_player = next(
+                (p for p in player_data if p.get("jersey_number") == target_jersey), None
+            )
+        if primary_player is None:
+            primary_player = player_data[0]
+
     return {
         "slug": slug_name,
         "annotated_video_url": annotated_url,
         "players": player_data,
-        "primary_player": player_data[0] if player_data else None,
+        "primary_player": primary_player,
         "message": (
             None
             if player_data
@@ -1173,11 +1257,38 @@ def get_results(slug: str):
     }
 
 
+# Every statcard.md field `_safe_int` coerces to an int-or-0 for the dashboard, mapped to its
+# markdown label -- shared between `parse_statcard_markdown`'s parsing loop and its own `"raw"`
+# capture (Plan Fix D, "streamed-gathering-treehouse" re-check, 2026-09-15) so both come from a
+# single line match rather than two separate scans.
+_STATCARD_COUNT_FIELDS: dict[str, str] = {
+    "**Touches:**": "touches",
+    "**Passes:**": "passes",
+    "**Turnovers:**": "turnovers",
+    "**Sprints/Runs:**": "sprints",
+    "**Goals:**": "goals",
+    "**Assists:**": "assists",
+    "**Shots:**": "shots",
+    "**Tackles:**": "tackles",
+    "**Saves:**": "saves",
+    "**Dribbles:**": "dribbles",
+}
+
+
 def parse_statcard_markdown(md_text: str, jersey_num: int | None) -> dict[str, Any]:
     """Parse statcard.md into a structured dict. `identity_status` defaults to "Unknown" (never
     "Verified") until the statcard's own line is actually parsed below -- CLAUDE.md Golden Rule 5:
-    a missing/unparseable statcard must never be presented as a verified result."""
-    res = {
+    a missing/unparseable statcard must never be presented as a verified result.
+
+    `res["raw"]` (Plan Fix D, "streamed-gathering-treehouse" re-check, 2026-09-15): the same ten
+    count fields above, but as the EXACT text that followed `**Label:**` in the markdown, before
+    `_safe_int`'s int-or-0 coercion collapses a non-numeric value down to `0`. Added for
+    `_generate_statcard_pdf_on_demand` below -- Goals/Assists in particular can legitimately read
+    `"not available (...)"` there (CLAUDE.md §13.2), and regenerating a PDF from the coerced `0`
+    would silently overclaim certainty that was never there (Golden Rule 5). Purely additive: every
+    pre-existing caller only ever read the other keys, so this changes nothing for them.
+    """
+    res: dict[str, Any] = {
         "jersey_number": jersey_num,
         "identity_status": "Unknown",
         "touches": 0,
@@ -1193,34 +1304,20 @@ def parse_statcard_markdown(md_text: str, jersey_num: int | None) -> dict[str, A
         "possession_time": "uncertain",
         "distance_covered": "uncertain",
         "events": [],
+        "raw": {},
     }
     if not md_text:
         return res
 
     for line in md_text.splitlines():
         line = line.strip()
+        matched_label = next((k for k in _STATCARD_COUNT_FIELDS if line.startswith(k)), None)
         if line.startswith("**Identity Status:**"):
             res["identity_status"] = line.split(":**")[1].strip()
-        elif line.startswith("**Touches:**"):
-            res["touches"] = _safe_int(line)
-        elif line.startswith("**Passes:**"):
-            res["passes"] = _safe_int(line)
-        elif line.startswith("**Turnovers:**"):
-            res["turnovers"] = _safe_int(line)
-        elif line.startswith("**Sprints/Runs:**"):
-            res["sprints"] = _safe_int(line)
-        elif line.startswith("**Goals:**"):
-            res["goals"] = _safe_int(line)
-        elif line.startswith("**Assists:**"):
-            res["assists"] = _safe_int(line)
-        elif line.startswith("**Shots:**"):
-            res["shots"] = _safe_int(line)
-        elif line.startswith("**Tackles:**"):
-            res["tackles"] = _safe_int(line)
-        elif line.startswith("**Saves:**"):
-            res["saves"] = _safe_int(line)
-        elif line.startswith("**Dribbles:**"):
-            res["dribbles"] = _safe_int(line)
+        elif matched_label is not None:
+            field = _STATCARD_COUNT_FIELDS[matched_label]
+            res["raw"][field] = line.split(":**")[1].strip()
+            res[field] = _safe_int(line)
         elif line.startswith("**Possession Time:**"):
             res["possession_time"] = line.split(":**")[1].strip()
         elif line.startswith("**Distance Covered:**"):
@@ -1267,6 +1364,180 @@ def _safe_resolve_under(root: Path, path: str) -> Path | None:
     return candidate if candidate.exists() else None
 
 
+# `render_statcard_markdown`'s own two format strings this whole module has to invert below
+# (Plan Fix D) -- `f"{possession_seconds:.1f}s"` and `f"{distance:.2f} {unit} (uncalibrated)"`
+# (`src/pipeline/player_output.py`). Named here, not inline, per CLAUDE.md §10 ("no magic
+# numbers/strings in code"); if either format ever changes, this regex must change with it in the
+# same commit -- same discipline `statcard_pdf.py`'s own module docstring already asks for between
+# its two renderers.
+_DISTANCE_TEXT_PATTERN = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s+(\S+)\s+\(uncalibrated\)$")
+
+
+def _is_int_string(value: str) -> bool:
+    """Whether `_safe_int`'s own parsing (`int(val.split()[0])`) would have succeeded on `value`
+    -- used to tell a REAL zero/count (`"0"`, `"4"`) apart from a non-numeric reason string
+    (`"not available (...)"`) that `_safe_int` also coerces down to `0`."""
+    try:
+        int(value.split()[0])
+        return True
+    except (ValueError, IndexError):
+        return False
+
+
+def _extract_goal_reason(parsed: dict[str, Any]) -> str | None:
+    """The `goal_reason` `render_statcard_pdf` needs (its own `_goal_assist_text`) to show the
+    full "not available (...)" text on the Goals/Assists lines instead of a bare `0` -- read back
+    from `parse_statcard_markdown`'s `raw` capture (the text BEFORE `_safe_int` coerced it),
+    exactly the raw-string requirement this on-demand path exists to satisfy. `None` when both
+    counts are real numbers (the common case: a genuine goal/assist count, or a genuine `0` from
+    an authoritative event source, CLAUDE.md §13.2)."""
+    for key in ("goals", "assists"):
+        raw_value = parsed["raw"].get(key, "")
+        if parsed[key] == 0 and raw_value and not _is_int_string(raw_value):
+            return raw_value
+    return None
+
+
+def _parse_possession_seconds(raw: str) -> float | None:
+    """Inverse of `render_statcard_markdown`'s own `f"{possession_seconds:.1f}s"` / `"uncertain"`
+    formatting -- `None` (rendered as `"uncertain"` again by `render_statcard_pdf`) for anything
+    that doesn't match, rather than guessing a number CLAUDE.md §13.2 never claimed."""
+    raw = raw.strip()
+    if raw.endswith("s"):
+        try:
+            return float(raw[:-1])
+        except ValueError:
+            pass
+    return None
+
+
+def _parse_distance_result(raw: str) -> dict[str, Any] | None:
+    """Inverse of `render_statcard_markdown`'s own
+    `f"{distance:.2f} {unit} (uncalibrated)"` / `"uncertain"` formatting."""
+    match = _DISTANCE_TEXT_PATTERN.match(raw.strip())
+    if not match:
+        return None
+    return {"distance": float(match.group(1)), "unit": match.group(2)}
+
+
+def _parse_timeline_timestamp_to_seconds(time_str: str) -> float:
+    """Inverse of `src.pipeline.player_output._format_timestamp`/
+    `src.pipeline.statcard_pdf._format_timestamp` (both: `f"{minutes}:{secs:04.1f}"`, always
+    exactly one colon -- minutes can exceed 59 on a long clip, never an H:MM:SS form)."""
+    minutes_str, seconds_str = time_str.rsplit(":", 1)
+    return int(minutes_str) * 60 + float(seconds_str)
+
+
+def _reconstruct_timeline_rows_from_markdown(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """`parse_statcard_markdown`'s own `events` (each `{"time": "M:SS.s", "event": label,
+    "confidence"}`, straight off statcard.md's 3-column Event Timeline table) turned into the
+    `{t_start, label, confidence, source}` shape `render_statcard_pdf` expects. FALLBACK ONLY --
+    used by `_generate_statcard_pdf_on_demand` only when that player's own richer
+    `events/event_timeline.json` (written by `write_player_output` alongside every real
+    statcard.md, with a real float `t_start` and a real per-event `source` string) is missing or
+    unreadable. statcard.md's own table (CLAUDE.md §13.2's exact template) never carries a
+    `source` column at all, so one is honestly labelled here rather than guessed at (Golden Rule
+    5: never fabricate a detector name that wasn't actually recorded)."""
+    return [
+        {
+            "t_start": _parse_timeline_timestamp_to_seconds(ev["time"]),
+            "label": ev["event"],
+            "confidence": ev["confidence"],
+            "source": "archived statcard.md (original event source not recorded there)",
+        }
+        for ev in events
+    ]
+
+
+def _load_or_reconstruct_timeline_rows(
+    player_dir: Path, parsed_events: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Prefer `events/event_timeline.json` (exact float `t_start` + real per-event `source`,
+    byte-identical to what a live run hands `render_statcard_pdf`) over reconstructing from
+    statcard.md's own lossy 3-column table -- see `_reconstruct_timeline_rows_from_markdown`."""
+    timeline_json_path = player_dir / "events" / "event_timeline.json"
+    if timeline_json_path.exists():
+        try:
+            return json.loads(timeline_json_path.read_text())
+        except Exception:
+            logger.warning(
+                "on-demand statcard.pdf: could not parse %s -- reconstructing the timeline from "
+                "statcard.md's own table instead (source will read as archived/unrecorded)",
+                timeline_json_path,
+                exc_info=True,
+            )
+    return _reconstruct_timeline_rows_from_markdown(parsed_events)
+
+
+def _generate_statcard_pdf_on_demand(out_dir: Path, jersey: str) -> Path | None:
+    """Plan Fix D ("streamed-gathering-treehouse" re-check, 2026-09-15): render `statcard.pdf`
+    from a player's already-archived `statcard.md` (+ that player's own sibling
+    `events/event_timeline.json` when present, for exact timestamps/sources) -- makes every run
+    completed BEFORE Plan Stage 3 shipped the PDF feature downloadable too (confirmed on disk:
+    `output/chelsea_burnley_target10/players/player_*/` has only `.md`), not just runs from after.
+
+    Returns the new PDF's path on success (cached next to the markdown, so a second request for
+    the same player serves the cached file directly via the caller's own existing
+    `_safe_resolve_under` check, never regenerating twice). Returns `None` on ANY failure --
+    missing markdown, a non-numeric `jersey` path segment, `reportlab` not installed
+    (`ImportError`, CLAUDE.md §7), or any other rendering error -- so the caller can turn that into
+    an honest 404, never a 500 (this file's own convention throughout `/api/download/statcard`).
+    """
+    md_path = _safe_resolve_under(OUTPUT_DIR, f"{out_dir.name}/players/player_{jersey}/statcard.md")
+    if md_path is None:
+        return None
+    if not jersey.isdigit():
+        # Every real `player_<N>` folder this codebase writes uses a plain int N (CLAUDE.md
+        # §13.5) -- a non-numeric `jersey` here means `_safe_resolve_under` above resolved to a
+        # real file, but not through a shape any real run would have produced (or a URL a real
+        # `statcard_pdf_url` link would ever contain). No real player to render, so no PDF.
+        return None
+
+    try:
+        parsed = parse_statcard_markdown(md_path.read_text(), int(jersey))
+        timeline_rows = _load_or_reconstruct_timeline_rows(md_path.parent, parsed["events"])
+        counts = {
+            "touch": parsed["touches"],
+            "pass": parsed["passes"],
+            "turnover": parsed["turnovers"],
+            "sprint": parsed["sprints"],
+            "goal": parsed["goals"],
+            "assist": parsed["assists"],
+            "shot": parsed["shots"],
+            "tackle": parsed["tackles"],
+            "save": parsed["saves"],
+            "dribble": parsed["dribbles"],
+        }
+        pdf_path = md_path.parent / "statcard.pdf"
+        render_statcard_pdf(
+            int(jersey),
+            counts,
+            _parse_possession_seconds(parsed["possession_time"]),
+            _parse_distance_result(parsed["distance_covered"]),
+            timeline_rows,
+            _extract_goal_reason(parsed),
+            parsed["identity_status"],
+            output_path=pdf_path,
+        )
+        return pdf_path
+    except ImportError:
+        logger.warning(
+            "on-demand statcard.pdf generation: reportlab is not installed (`api` extra, "
+            "CLAUDE.md §7: `uv pip install -e '.[api]'`) -- cannot regenerate a PDF for %s -- "
+            "serving 404",
+            md_path,
+        )
+        return None
+    except Exception:
+        logger.warning(
+            "on-demand statcard.pdf generation failed for %s -- serving 404; the archived "
+            "statcard.md itself is unaffected",
+            md_path,
+            exc_info=True,
+        )
+        return None
+
+
 @app.get("/api/download/statcard/{slug}/{jersey}")
 def download_statcard_pdf(slug: str, jersey: str):
     """Real, downloadable `statcard.pdf` for one player (Plan Stage 3, "streamed-gathering-
@@ -1282,10 +1553,14 @@ def download_statcard_pdf(slug: str, jersey: str):
     strictly as one more path component under `OUTPUT_DIR` through the same traversal guard, so a
     `../../etc/passwd`-shaped value 404s exactly like any other escape attempt, never a 500.
 
-    404s (never 500s) for a missing slug, a missing player folder, or a missing PDF file (e.g.
-    `reportlab` wasn't installed when this run happened -- `write_player_output`'s own fail-soft
-    handling, CLAUDE.md §7) -- an honest "not found", never a confusing server error for something
-    that is really just "this run doesn't have a PDF".
+    Plan Fix D ("streamed-gathering-treehouse" re-check, 2026-09-15): when `statcard.pdf` is
+    missing but `statcard.md` exists, the PDF is now generated ON DEMAND
+    (`_generate_statcard_pdf_on_demand`) and cached to disk, so every completed run becomes
+    downloadable -- not just runs from after Plan Stage 3 shipped the PDF feature.
+
+    404s (never 500s) for a missing slug, a missing player folder, or a statcard.md that genuinely
+    doesn't exist either (nothing to generate from) -- an honest "not found", never a confusing
+    server error for something that is really just "this run doesn't have a PDF (yet)".
     """
     out_dir = _find_output_dir(OUTPUT_DIR, slug)
     if out_dir is None:
@@ -1295,9 +1570,12 @@ def download_statcard_pdf(slug: str, jersey: str):
         OUTPUT_DIR, f"{out_dir.name}/players/player_{jersey}/statcard.pdf"
     )
     if pdf_path is None:
+        pdf_path = _generate_statcard_pdf_on_demand(out_dir, jersey)
+    if pdf_path is None:
         raise HTTPException(
             status_code=404,
-            detail=f"No statcard.pdf found for slug '{slug}' player '{jersey}'",
+            detail=f"No statcard.pdf (and no generatable statcard.md) found for slug '{slug}' "
+            f"player '{jersey}'",
         )
 
     return FileResponse(

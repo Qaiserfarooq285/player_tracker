@@ -417,10 +417,16 @@ def _player_track(tid: int, boxes: list[TrackBox]) -> Track:
     return Track(id=tid, take_id=0, boxes=boxes, dominant_class=DetectionClass.PLAYER, team=0)
 
 
-def test_select_targets_with_profile_manual_override_accept_sets_verified_ids_to_seed_only():
+def test_select_targets_with_profile_manual_override_keeps_non_contradicting_joined_fragment():
+    """ "streamed-gathering-treehouse" (recheck) plan **Fix A**. Renamed/updated from the old
+    `..._accept_sets_verified_ids_to_seed_only` -- that test encoded the PRE-Fix-A rule
+    (`verified_track_ids` == seeds only), which is exactly Finding A's bug: every fragment
+    `stitch_timeline` legitimately joined onto the click used to be silently excluded from the
+    verified chain (and therefore from stats/the red box). Same fixture as before (a second
+    fragment close enough in time/space that `stitch_timeline` geometrically joins it), but now
+    with the SAME kit colour as the seed and no jersey evidence against it -- i.e. no contradicting
+    evidence -- so Fix A's rule keeps it in `verified_track_ids` too."""
     seed = _player_track(1, [_box(0.0, BBox(x1=0, y1=0, x2=50, y2=100))])
-    # a second fragment close enough in time/space that stitch_timeline WILL geometrically join it
-    # -- this is exactly the "candidate, never verified" fragment the plan's rule is about.
     joined = _player_track(2, [_box(0.2, BBox(x1=5, y1=0, x2=55, y2=100))])
     take = _take(t_end=1.0)
     kit_by_track = {1: _kit(BLUE_10), 2: _kit(BLUE_10)}
@@ -441,12 +447,53 @@ def test_select_targets_with_profile_manual_override_accept_sets_verified_ids_to
         target_profile=_profile(),
         target_cfg=_target_cfg(),
         kit_by_track_by_take={0: kit_by_track},
+        # no jersey read for track 2 at all -- "absence of evidence is not evidence of a different
+        # player" must not veto it either.
         jersey_by_track_by_take={0: {1: "10"}},
     )
     sel = result.takes[0]
     assert sel.method == "manual_override"
     assert 2 in sel.track_ids  # geometry DID stitch it in
-    assert sel.verified_track_ids == [1]  # but only the click itself is "accepted"
+    assert sel.verified_track_ids == [1, 2]  # Fix A: kept, no contradicting evidence
+    frag_evidence = sel.evidence["chain_fragment_evidence"][2]
+    assert frag_evidence["contradicts"] is False
+
+
+def test_select_targets_with_profile_manual_override_drops_contradicting_joined_fragment():
+    """Same geometry as the test above (close enough in time/space that `stitch_timeline` still
+    joins fragment 2 -- it has no colour signal of its own to consult), but fragment 2's OWN kit
+    colour is the measured CLARET_21, a confident, different kit from the BLUE_10 profile -- Fix
+    A's "actively contradicts" test must drop it from `verified_track_ids` (never red / never
+    counted into stats) while it still shows up in `track_ids` (still a green candidate box) --
+    exactly the plan's own "Candidate != Target" rule, now applied to a geometry-only fragment
+    instead of just an independently-scored seed."""
+    seed = _player_track(1, [_box(0.0, BBox(x1=0, y1=0, x2=50, y2=100))])
+    joined = _player_track(2, [_box(0.2, BBox(x1=5, y1=0, x2=55, y2=100))])
+    take = _take(t_end=1.0)
+    kit_by_track = {1: _kit(BLUE_10), 2: _kit(CLARET_21)}
+
+    result = select_targets(
+        "fake.mp4",
+        None,
+        [take],
+        [seed, joined],
+        [],
+        1920.0,
+        1080.0,
+        _selection_cfg(),
+        manual_overrides={0: [1]},
+        target_profile=_profile(),
+        target_cfg=_target_cfg(),
+        kit_by_track_by_take={0: kit_by_track},
+        jersey_by_track_by_take={0: {1: "10"}},
+    )
+    sel = result.takes[0]
+    assert sel.method == "manual_override"
+    assert 2 in sel.track_ids  # geometry still joins it -- stitch_timeline has no colour signal
+    assert sel.verified_track_ids == [1]  # but Fix A drops it from the VERIFIED chain
+    frag_evidence = sel.evidence["chain_fragment_evidence"][2]
+    assert frag_evidence["contradicts"] is True
+    assert frag_evidence["reason"] == "wrong_kit_colour"
 
 
 def test_select_targets_with_profile_no_accept_is_target_lost_with_empty_verified_ids():
@@ -474,6 +521,139 @@ def test_select_targets_with_profile_no_accept_is_target_lost_with_empty_verifie
     assert sel.method == "target_lost"
     assert sel.verified_track_ids == []
     assert sel.track_ids == []
+
+
+# ---------------------------------------------------------------------------
+# "streamed-gathering-treehouse" (recheck) plan Fix A, `target_reidentified` branch (no manual
+# override -- the automatic profile-driven re-identification path): the winner's own
+# `stitch_timeline` chain can pick up a fragment that never itself went through
+# `verify_candidate` (e.g. too short to clear `_reasonable_candidates`' own duration floor). Same
+# treatment as the `manual_override` branch above.
+# ---------------------------------------------------------------------------
+
+
+def test_select_take_with_profile_target_reidentified_keeps_non_contradicting_joined_fragment():
+    # winner needs >= 0.5s duration to clear `_reasonable_candidates`' own floor and be scored at
+    # all; the joined fragment is a single box (duration 0) -- too short to be scored on its own,
+    # but `stitch_timeline` still geometrically joins it onto the winner's own chain.
+    winner = _player_track(
+        5,
+        [
+            _box(0.0, BBox(x1=0, y1=0, x2=50, y2=100)),
+            _box(0.5, BBox(x1=0, y1=0, x2=50, y2=100)),
+        ],
+    )
+    joined = _player_track(6, [_box(0.7, BBox(x1=5, y1=0, x2=55, y2=100))])
+    take = _take(t_end=10.0)
+    kit_by_track = {5: _kit(BLUE_10), 6: _kit(BLUE_10)}
+    jersey_by_track = {5: "10"}
+
+    result = select_targets(
+        "fake.mp4",
+        None,
+        [take],
+        [winner, joined],
+        [],
+        1920.0,
+        1080.0,
+        _selection_cfg(),
+        target_profile=_profile(),
+        target_cfg=_target_cfg(),
+        kit_by_track_by_take={0: kit_by_track},
+        jersey_by_track_by_take={0: jersey_by_track},
+    )
+    sel = result.takes[0]
+    assert sel.method == "target_reidentified"
+    assert sel.seed_track_id == 5
+    assert 6 in sel.track_ids  # geometry stitched it into the winner's own chain
+    assert sel.verified_track_ids == [5, 6]  # Fix A: kept, no contradicting evidence
+    frag_evidence = sel.evidence["chain_fragment_evidence"][6]
+    assert frag_evidence["contradicts"] is False
+
+
+def test_select_take_with_profile_target_reidentified_drops_contradicting_joined_fragment():
+    winner = _player_track(
+        5,
+        [
+            _box(0.0, BBox(x1=0, y1=0, x2=50, y2=100)),
+            _box(0.5, BBox(x1=0, y1=0, x2=50, y2=100)),
+        ],
+    )
+    joined = _player_track(6, [_box(0.7, BBox(x1=5, y1=0, x2=55, y2=100))])
+    take = _take(t_end=10.0)
+    kit_by_track = {5: _kit(BLUE_10), 6: _kit(CLARET_21)}
+    jersey_by_track = {5: "10"}
+
+    result = select_targets(
+        "fake.mp4",
+        None,
+        [take],
+        [winner, joined],
+        [],
+        1920.0,
+        1080.0,
+        _selection_cfg(),
+        target_profile=_profile(),
+        target_cfg=_target_cfg(),
+        kit_by_track_by_take={0: kit_by_track},
+        jersey_by_track_by_take={0: jersey_by_track},
+    )
+    sel = result.takes[0]
+    assert sel.method == "target_reidentified"
+    assert 6 in sel.track_ids  # stitch_timeline still joins it -- it has no colour signal itself
+    assert sel.verified_track_ids == [5]  # Fix A drops it from the VERIFIED chain
+    frag_evidence = sel.evidence["chain_fragment_evidence"][6]
+    assert frag_evidence["contradicts"] is True
+    assert frag_evidence["reason"] == "wrong_kit_colour"
+
+
+def test_select_take_with_profile_target_reidentified_keeps_accepted_candidate_outside_the_chain():
+    """Pre-existing behaviour, preserved: a SEPARATE candidate that independently cleared
+    `verify_candidate` on its own merits (e.g. a distinct fragment either side of a brief ID
+    reset) stays verified even though it's too far away in time for the winner's own
+    `stitch_timeline` chain to ever join it."""
+    winner = _player_track(
+        5,
+        [
+            _box(0.0, BBox(x1=0, y1=0, x2=50, y2=100)),
+            _box(0.5, BBox(x1=0, y1=0, x2=50, y2=100)),
+        ],
+    )
+    # A second, independently-accepted candidate far enough away in time (4.3s gap, vs.
+    # stitch_max_gap_s=1.5) that stitch_timeline from the winner never reaches it -- a slightly
+    # shorter box height (90 vs profile's 100) keeps its own score below the winner's so there is
+    # no tie, while still clearing strong_match (0.90).
+    other_accept = _player_track(
+        7,
+        [
+            _box(5.0, BBox(x1=0, y1=0, x2=50, y2=90)),
+            _box(5.6, BBox(x1=0, y1=0, x2=50, y2=90)),
+        ],
+    )
+    take = _take(t_end=10.0)
+    kit_by_track = {5: _kit(BLUE_10), 7: _kit(BLUE_10)}
+    jersey_by_track = {5: "10", 7: "10"}
+
+    result = select_targets(
+        "fake.mp4",
+        None,
+        [take],
+        [winner, other_accept],
+        [],
+        1920.0,
+        1080.0,
+        _selection_cfg(),
+        target_profile=_profile(),
+        target_cfg=_target_cfg(),
+        kit_by_track_by_take={0: kit_by_track},
+        jersey_by_track_by_take={0: jersey_by_track},
+    )
+    sel = result.takes[0]
+    assert sel.method == "target_reidentified"
+    assert sel.seed_track_id == 5  # the higher-scoring candidate wins as the chain's own seed
+    assert 7 not in sel.track_ids  # too far away for stitch_timeline to ever join it
+    assert 7 in sel.verified_track_ids  # but still independently verified -- stays in the set
+    assert set(sel.verified_track_ids) == {5, 7}
 
 
 # ---------------------------------------------------------------------------
@@ -582,3 +762,86 @@ def test_select_take_with_profile_no_seed_accepted_is_target_lost():
     assert sel.track_ids == []
     assert sel.verified_track_ids == []
     assert sel.evidence["seed_evidence"][99]["rejected_reason"] == "manual_override_track_not_found"
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-15 fix (Golden Rule 4): the establishing click must not be rejected by its own profile.
+# `_profile()`'s own `established_take_id=0`/`established_track_id=1` (defined above) is exactly
+# the (take, track) pair a human clicked to CREATE the profile in the first place.
+# ---------------------------------------------------------------------------
+
+
+def test_established_anchor_is_accepted_without_clearing_the_score_bar():
+    """The clicked track (id=1) reappears in its OWN establishing take (id=0) with only WEAK
+    evidence on offer -- no kit sample, no jersey read, only a borderline height ratio (0.8) that
+    on its own would land UNCERTAIN (see `tests/test_target_verify.py::
+    test_uncertain_band_is_returned_not_a_weak_accept`, the same 0.8 fixture). Because this is
+    literally the human-established anchor re-encountered in its own take, it must be accepted
+    OUTRIGHT -- never re-derived from appearance, never capped by thin evidence -- exactly the bug
+    the real `chelsea_burnley_target10`-style run surfaced (seed 5 landed UNCERTAIN despite being
+    the very track the click established)."""
+    seed = _player_track(1, [_box(0.0, BBox(x1=0, y1=0, x2=50, y2=80))])  # height=80 -> ratio 0.8
+    take = _take(t_end=1.0)
+
+    result = select_targets(
+        "fake.mp4",
+        None,
+        [take],
+        [seed],
+        [],
+        1920.0,
+        1080.0,
+        _selection_cfg(),
+        manual_overrides={0: [1]},
+        target_profile=_profile(),  # established_take_id=0, established_track_id=1
+        target_cfg=_target_cfg(),
+        kit_by_track_by_take={0: {}},  # no kit sample at all for track 1
+        jersey_by_track_by_take={0: {}},  # no jersey read at all for track 1
+    )
+    sel = result.takes[0]
+    assert sel.method == "manual_override"
+    assert sel.seed_track_id == 1
+    assert sel.verified_track_ids == [1]
+    assert sel.confidence == 1.0
+    seed_evidence = sel.evidence["seed_evidence"][1]
+    assert seed_evidence["decision"] == "accept"
+    assert seed_evidence["accepted_as"] == "established_anchor"
+
+
+def test_same_track_id_in_a_different_take_is_not_the_established_anchor_bypass():
+    """The bypass is scoped to the EXACT `(established_take_id, established_track_id)` pair, not
+    "this track id anywhere". Track id 1 reappearing in a DIFFERENT take (id=1, not the profile's
+    own `established_take_id=0`) with the same thin evidence as the test above must be scored
+    normally by `verify_candidate` -- landing UNCERTAIN on the same 0.8-height-ratio-only fixture,
+    exactly as it would for any ordinary candidate, never silently accepted."""
+    take = Take(id=1, t_start=0.0, t_end=1.0, frame_start=0, frame_end=25)  # NOT
+    # profile.established_take_id (0)
+    seed = Track(
+        id=1,
+        take_id=take.id,
+        boxes=[_box(0.0, BBox(x1=0, y1=0, x2=50, y2=80))],  # height=80 -> ratio 0.8
+        dominant_class=DetectionClass.PLAYER,
+        team=0,
+    )
+
+    result = select_targets(
+        "fake.mp4",
+        None,
+        [take],
+        [seed],
+        [],
+        1920.0,
+        1080.0,
+        _selection_cfg(),
+        manual_overrides={1: [1]},
+        target_profile=_profile(),  # established_take_id=0, established_track_id=1
+        target_cfg=_target_cfg(),
+        kit_by_track_by_take={1: {}},
+        jersey_by_track_by_take={1: {}},
+    )
+    sel = result.takes[0]
+    assert sel.method == "target_lost"  # UNCERTAIN is never a weak accept -- treated as REJECT
+    seed_evidence = sel.evidence["seed_evidence"][1]
+    assert seed_evidence["decision"] == "uncertain"
+    assert "accepted_as" not in seed_evidence
+    assert seed_evidence["score_breakdown"]["components"] == {"height": 0.8}

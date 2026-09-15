@@ -17,6 +17,9 @@ Covers:
 from __future__ import annotations
 
 import importlib
+import json
+import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -328,3 +331,58 @@ def test_click_rejection_message_labels_every_hard_reject_reason(reason_code, ex
     assert expected_label in message
     assert "#11" in message
     assert "TARGET_001" in message
+
+
+# ---------------------------------------------------------------------------
+# Plan Fix C ("streamed-gathering-treehouse" re-check, 2026-09-15): "the click is a candidate, not
+# a command" extends to the FRONTEND too -- `apps/web/js/app.js`'s raw-coordinate click handler
+# (`initClickToTrack`) used to treat every click on the video preview as a fresh single-candidate
+# selection and unconditionally run `targetAnchors = [];`, so the owner's own stated workflow
+# (click the player, seek forward -- by clicking the video -- click again, seek again...) silently
+# lost every anchor but the last one clicked. This repo has no JS test runner/package.json (no
+# jsdom dependency either), so this drives the REAL, unmodified `app.js` source directly via
+# Node's built-in `vm` module inside a minimal hand-built DOM stub
+# (`tests/js/click_anchor_harness.js`) -- skipped, never failed, when `node` isn't on PATH.
+# ---------------------------------------------------------------------------
+
+REPO_ROOT_FOR_JS = Path(__file__).resolve().parents[1]
+
+
+def _run_click_anchor_harness() -> dict:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed -- cannot exercise the real app.js source")
+    harness = REPO_ROOT_FOR_JS / "tests" / "js" / "click_anchor_harness.js"
+    app_js = REPO_ROOT_FOR_JS / "apps" / "web" / "js" / "app.js"
+    proc = subprocess.run(
+        [node, str(harness), str(app_js)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, f"harness failed: stderr={proc.stderr!r}"
+    return json.loads(proc.stdout)
+
+
+def test_raw_click_still_pins_a_candidate_when_no_anchors_exist():
+    """Backwards compatibility (explicitly required by the plan): with the chip list empty, a
+    raw coordinate click on the video still behaves exactly as it did before Fix C -- pins
+    `selectedClickPoint` and un-hides the marker."""
+    results = _run_click_anchor_harness()
+    assert results["emptyListPinsCandidate"] is True
+    assert results["markerVisibleAfterFirstClick"] is True
+
+
+def test_raw_click_no_longer_empties_anchor_array_once_anchors_exist():
+    """THE regression test for the real bug: once the picker has accumulated anchors, clicking
+    the video preview again (the owner's own "seek to the next moment" action) must NOT wipe
+    `targetAnchors` -- both its length and its exact contents must survive untouched, and the
+    chip list must stay visible. Confirmed this harness actually catches the pre-fix bug (not just
+    a tautology) by running it against the pre-Fix-C `app.js` from git history: there,
+    `anchorCountAfterVideoClick` drops to `0` and `chipsStillVisibleAfterVideoClick` is `False`."""
+    results = _run_click_anchor_harness()
+    assert results["anchorCountBeforeVideoClick"] == 2
+    assert results["chipsVisibleBeforeVideoClick"] is True
+    assert results["anchorCountAfterVideoClick"] == 2
+    assert results["chipsStillVisibleAfterVideoClick"] is True
+    assert results["anchorsUnchangedAfterVideoClick"] is True

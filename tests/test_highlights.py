@@ -8,6 +8,7 @@ attribution, and the `--track-id` human-override parser.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -25,7 +26,11 @@ from src.common.types import (
 )
 from src.detect.overlay_mask import ArrowHint
 from src.highlights import cutting, ranking, selection
-from src.pipeline.run import normalize_manual_overrides, parse_track_id_overrides
+from src.pipeline.run import (
+    _resolve_manual_touch_target_jersey,
+    normalize_manual_overrides,
+    parse_track_id_overrides,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -269,6 +274,118 @@ def test_stitch_timeline_confidence_penalised_per_join():
 
 
 # ---------------------------------------------------------------------------
+# `_verify_chain_fragments` -- "streamed-gathering-treehouse" (recheck) plan Fix A: classify a
+# profile-driven take's own geometry-stitched chain into the VERIFIED subset that may draw the
+# red box / count into stats, instead of the old seeds-only rule that silently excluded every
+# fragment `stitch_timeline` legitimately joined.
+# ---------------------------------------------------------------------------
+
+_BLUE_10 = (44.9, 7.5, -24.0)  # same real measured CIELAB as tests/test_target_verify.py
+_CLARET_21 = (52.9, 5.0, -1.0)
+
+
+def _chain_kit_colour_cfg() -> dict:
+    return load_yaml(REPO_ROOT / "configs" / "events.yaml")["kit_colour"]
+
+
+def _chain_kit_sample(lab):
+    from src.track.target import KitColourSample
+
+    return KitColourSample(
+        torso_lab=lab, shorts_lab=lab, socks_lab=lab, take_id=0, t=0.0, confidence=1.0
+    )
+
+
+def _chain_profile(jersey_number=None, kit_lab=None):
+    from src.track.target import TargetProfile
+
+    return TargetProfile(
+        jersey_number=jersey_number,
+        jersey_source="click" if jersey_number is not None else None,
+        kit=_chain_kit_sample(kit_lab) if kit_lab is not None else None,
+        kit_bank=[],
+        median_height=100.0,
+        team_cluster=0,
+        established_take_id=0,
+        established_track_id=1,
+        established_t=0.0,
+        links=[],
+    )
+
+
+def test_verify_chain_fragments_seed_is_always_kept_with_no_further_check():
+    profile = _chain_profile(jersey_number=10, kit_lab=_BLUE_10)
+    seed = Track(id=1, take_id=0, boxes=[_box(0.0, 25.0, 50.0)])
+    kept, evidence = selection._verify_chain_fragments(
+        0, [1], [1], [seed], profile, {}, {}, _chain_kit_colour_cfg()
+    )
+    assert kept == [1]
+    assert evidence[1] == {"role": "seed", "contradicts": False}
+
+
+def test_verify_chain_fragments_keeps_fragment_with_no_contradicting_evidence():
+    """A fragment `stitch_timeline` joined by geometry alone, with no kit/jersey evidence against
+    it -- Fix A's whole point: this used to be silently excluded from `verified_track_ids` (and
+    therefore from stats/the red box) even though nothing contradicts it."""
+    profile = _chain_profile(jersey_number=10, kit_lab=_BLUE_10)
+    seed = Track(id=1, take_id=0, boxes=[_box(0.0, 25.0, 50.0)])
+    fragment = Track(id=2, take_id=0, boxes=[_box(0.2, 30.0, 50.0)])
+    kit_by_track = {2: _chain_kit_sample(_BLUE_10)}
+    kept, evidence = selection._verify_chain_fragments(
+        0, [1, 2], [1], [seed, fragment], profile, kit_by_track, {}, _chain_kit_colour_cfg()
+    )
+    assert kept == [1, 2]
+    assert evidence[2]["role"] == "fragment"
+    assert evidence[2]["contradicts"] is False
+
+
+def test_verify_chain_fragments_keeps_fragment_with_no_kit_sample_at_all():
+    """Same as above but the fragment has NO kit sample recorded at all (not merely a matching
+    one) -- still no contradicting evidence, still kept (Golden Rule 5)."""
+    profile = _chain_profile(jersey_number=10, kit_lab=_BLUE_10)
+    seed = Track(id=1, take_id=0, boxes=[_box(0.0, 25.0, 50.0)])
+    fragment = Track(id=2, take_id=0, boxes=[_box(0.2, 30.0, 50.0)])
+    kept, evidence = selection._verify_chain_fragments(
+        0, [1, 2], [1], [seed, fragment], profile, {}, {}, _chain_kit_colour_cfg()
+    )
+    assert kept == [1, 2]
+    assert evidence[2]["contradicts"] is False
+
+
+def test_verify_chain_fragments_drops_contradicting_fragment_and_logs(caplog):
+    """A fragment whose OWN kit colour confidently contradicts the profile must be dropped from
+    the verified chain (never red, never counted into stats) even though `stitch_timeline`'s pure
+    geometry already joined it -- and the drop must be logged (CLAUDE.md §10)."""
+    profile = _chain_profile(jersey_number=10, kit_lab=_BLUE_10)
+    seed = Track(id=1, take_id=0, boxes=[_box(0.0, 25.0, 50.0)])
+    fragment = Track(id=2, take_id=0, boxes=[_box(0.2, 30.0, 50.0)])
+    kit_by_track = {2: _chain_kit_sample(_CLARET_21)}
+    with caplog.at_level(logging.WARNING):
+        kept, evidence = selection._verify_chain_fragments(
+            7, [1, 2], [1], [seed, fragment], profile, kit_by_track, {}, _chain_kit_colour_cfg()
+        )
+    assert kept == [1]
+    assert evidence[2]["contradicts"] is True
+    assert evidence[2]["reason"] == "wrong_kit_colour"
+    assert any(
+        "DROPPED" in r.message and "take=7" in r.message and "track=2" in r.message
+        for r in caplog.records
+    )
+
+
+def test_verify_chain_fragments_drops_on_jersey_disagreement_alone():
+    profile = _chain_profile(jersey_number=10, kit_lab=None)
+    seed = Track(id=1, take_id=0, boxes=[_box(0.0, 25.0, 50.0)])
+    fragment = Track(id=2, take_id=0, boxes=[_box(0.2, 30.0, 50.0)])
+    jersey_by_track = {2: "21"}
+    kept, evidence = selection._verify_chain_fragments(
+        0, [1, 2], [1], [seed, fragment], profile, {}, jersey_by_track, _chain_kit_colour_cfg()
+    )
+    assert kept == [1]
+    assert evidence[2]["reason"] == "wrong_jersey_number"
+
+
+# ---------------------------------------------------------------------------
 # arrow vote
 # ---------------------------------------------------------------------------
 
@@ -431,3 +548,49 @@ def test_normalize_manual_overrides_mixed_int_and_list_shapes():
     """A real call site could plausibly merge a CLI-style bare int for one take with an API-style
     list for another -- both normalize into the same canonical shape."""
     assert normalize_manual_overrides({0: 16, 1: [7, 8]}) == {0: [16], 1: [7, 8]}
+
+
+# ---------------------------------------------------------------------------
+# `_resolve_manual_touch_target_jersey` -- "streamed-gathering-treehouse" (recheck) plan **Fix
+# B**: replaces the old `number == target_jersey` equality test that silently dropped every typed
+# touch time whenever `target_jersey is None` (the normal case once identity comes from a click
+# instead of a typed number). Resolution order: typed field -> `TargetProfile.jersey_number` ->
+# the run's own single produced jersey number -> genuinely ambiguous (reported, attached to none).
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_manual_touch_target_jersey_typed_field_wins_outright():
+    resolved, reason = _resolve_manual_touch_target_jersey(7, 99, [1, 2, 7])
+    assert resolved == 7
+    assert reason == "typed"
+
+
+def test_resolve_manual_touch_target_jersey_falls_back_to_profile_number():
+    resolved, reason = _resolve_manual_touch_target_jersey(None, 9, [1, 9, 12])
+    assert resolved == 9
+    assert reason == "profile"
+
+
+def test_resolve_manual_touch_target_jersey_infers_the_single_produced_jersey():
+    """No typed field, no profile -- but the run only ever produced events for ONE jersey number,
+    so there is no genuine ambiguity left to resolve."""
+    resolved, reason = _resolve_manual_touch_target_jersey(None, None, [4])
+    assert resolved == 4
+    assert reason == "single_jersey_inferred"
+
+
+def test_resolve_manual_touch_target_jersey_ambiguous_is_reported_not_dropped():
+    """Several jerseys, no typed field, no profile number -- genuinely ambiguous. Must resolve to
+    `None` (never guessed onto an arbitrary one) while still returning a reason the caller can
+    report -- never the old silent drop."""
+    resolved, reason = _resolve_manual_touch_target_jersey(None, None, [3, 4])
+    assert resolved is None
+    assert reason == "ambiguous_not_attached"
+
+
+def test_resolve_manual_touch_target_jersey_ambiguous_when_nothing_produced_either():
+    """No typed field, no profile, and the run produced NO jersey numbers at all -- also
+    ambiguous (zero is not "exactly one"), never a crash on an empty list."""
+    resolved, reason = _resolve_manual_touch_target_jersey(None, None, [])
+    assert resolved is None
+    assert reason == "ambiguous_not_attached"

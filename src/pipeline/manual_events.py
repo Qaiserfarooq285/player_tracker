@@ -90,6 +90,37 @@ def bucket_annotations_by_take(
     return dict(by_take), n_unassigned
 
 
+def _resolve_manual_touch_target_jersey(
+    typed_target_jersey: int | None,
+    produced_jersey_numbers: list[int],
+) -> tuple[int | None, str]:
+    """Mirrors `src.pipeline.run._resolve_manual_touch_target_jersey` ("streamed-gathering-
+    treehouse" (recheck) plan **Fix B**) for this manual-events path, minus that function's
+    `TargetProfile` tier -- this mode has no persistent click-based profile at all (identity comes
+    straight from the sidecar, ADR-19), so there is nothing there to consult.
+
+    Replaces the old `number == target_jersey` equality test in
+    `run_manual_events_pipeline_for_video`'s own touch-merge loop below, which silently dropped
+    every typed touch time whenever `target_jersey` was `None` -- the NORMAL case for a sidecar
+    video the client never also typed a jersey number for (identity already comes from the
+    annotations themselves).
+
+    Resolution order: (1) the client's own TYPED `target_jersey`, when given; (2) else, when this
+    run produced events for EXACTLY ONE jersey number (`produced_jersey_numbers`), that one -- no
+    genuine ambiguity left, only a field the client didn't type; (3) otherwise genuinely AMBIGUOUS
+    (several jerseys, no typed number) -- attach to none (never guessed onto an arbitrary one) and
+    the caller reports it (CLAUDE.md §10), never the old silent drop.
+
+    Returns `(resolved_number_or_None, reason)` -- `reason` always populated (Golden Rule 5): one
+    of `"typed"`, `"single_jersey_inferred"`, `"ambiguous_not_attached"`.
+    """
+    if typed_target_jersey is not None:
+        return typed_target_jersey, "typed"
+    if len(produced_jersey_numbers) == 1:
+        return produced_jersey_numbers[0], "single_jersey_inferred"
+    return None, "ambiguous_not_attached"
+
+
 def build_manual_identity_by_take(
     takes: list[Take],
     tracks_by_take: dict[int, list[Track]],
@@ -486,10 +517,16 @@ def run_manual_events_pipeline_for_video(
 
     `manual_touch_times` (Plan Stage 2, "streamed-gathering-treehouse", wired here for parity with
     `src.pipeline.run.run_pipeline_for_video`): an optional client-typed, comma-/newline-separated
-    list of touch times, merged into `target_jersey`'s own event list only -- when `target_jersey`
-    is `None` this mode has no single well-defined "the target player" (a sidecar can name several
-    jersey numbers, see `jersey_numbers` below), so touch times are honestly left unmerged rather
-    than guessed onto an arbitrary one (Golden Rule 5).
+    list of touch times. Revised by the "streamed-gathering-treehouse" (recheck) plan's own **Fix
+    B**: merged into `target_jersey`'s own event list when typed; else, when this run produced
+    events for exactly one jersey number, that one (a sidecar naming just the one player is the
+    common case, and typing the number again alongside it would be redundant); only when the
+    sidecar genuinely names SEVERAL distinct jersey numbers AND no `target_jersey` was typed is
+    there no single well-defined "the target player" left to resolve -- touch times are then
+    honestly left unmerged rather than guessed onto an arbitrary one (Golden Rule 5), and this is
+    reported in the returned summary's own `manual_touch.target_jersey_resolution`/
+    `resolved_target_jersey` fields, never a silent drop. See
+    `_resolve_manual_touch_target_jersey`'s own docstring for the exact order.
     """
     video_path = Path(video_path)
     work_dir = work_dir_for(video_path, root=work_root)
@@ -680,6 +717,8 @@ def run_manual_events_pipeline_for_video(
     manual_touch_cfg = configs["events"]["manual_touch"]
     manual_touch_problems: list[str] = []
     manual_touch_evts: list[Event] = []
+    resolved_touch_jersey: int | None = None
+    touch_jersey_reason = "no_manual_touch_times"
     if manual_touch_times:
         touch_seconds, manual_touch_problems = parse_touch_times(
             manual_touch_times, manual_touch_cfg
@@ -692,6 +731,29 @@ def run_manual_events_pipeline_for_video(
                 len(manual_touch_problems),
                 manual_touch_problems,
             )
+        # Fix B: resolve the target jersey rather than requiring the (now-optional) typed field --
+        # see `_resolve_manual_touch_target_jersey`'s own docstring for the full order/reasoning.
+        resolved_touch_jersey, touch_jersey_reason = _resolve_manual_touch_target_jersey(
+            target_jersey, sorted(events_by_number.keys())
+        )
+        if resolved_touch_jersey is None:
+            logger.warning(
+                "manual touch times for %s: %d typed time(s) could not be attached to any "
+                "player -- ambiguous target (jerseys produced this run: %s, no typed jersey) -- "
+                "reported in the run summary, never silently dropped",
+                video_path.name,
+                len(manual_touch_evts),
+                sorted(events_by_number.keys()),
+            )
+        elif resolved_touch_jersey != target_jersey:
+            logger.info(
+                "manual touch times for %s: attached to jersey #%d (%s) -- not the typed "
+                "target_jersey field (%s)",
+                video_path.name,
+                resolved_touch_jersey,
+                touch_jersey_reason,
+                target_jersey,
+            )
     manual_touch_suppressed = 0
 
     takes_by_id = {t.id: t for t in takes}
@@ -700,7 +762,7 @@ def run_manual_events_pipeline_for_video(
     )
     for number in jersey_numbers:
         events = events_by_number.get(number, [])
-        if manual_touch_evts and number == target_jersey:
+        if manual_touch_evts and number == resolved_touch_jersey:
             # Owner's merge rule ("their times win, auto-detection fills the gaps") -- see
             # `src.pipeline.run.run_pipeline_for_video`'s identical splice for the full reasoning.
             events, n_suppressed = merge_manual_touches(events, manual_touch_evts, manual_touch_cfg)
@@ -783,5 +845,9 @@ def run_manual_events_pipeline_for_video(
             "n_parsed": len(manual_touch_evts),
             "problems": manual_touch_problems,
             "n_suppressed_auto_touch": manual_touch_suppressed,
+            # Fix B: which jersey the typed times actually attached to, and why -- see
+            # `_resolve_manual_touch_target_jersey`'s own docstring for the resolution order.
+            "resolved_target_jersey": resolved_touch_jersey,
+            "target_jersey_resolution": touch_jersey_reason,
         }
     return summary

@@ -13,6 +13,14 @@ document.addEventListener('DOMContentLoaded', () => {
   initCanvasPitch();
 });
 
+// "streamed-gathering-treehouse" plan Fix D, 2026-09-15: the player currently shown in the
+// results dashboard -- starts as whatever `primary_player` the backend resolved (the run's real
+// target, see `_resolve_primary_player_jersey` in `apps/api/main.py`) and moves to whichever
+// player the owner picks via `renderPlayerSwitcher`'s chips on a multi-player run. `playReel`/
+// `exportStatCard` read THIS, not `currentResults.primary_player` directly, so a switcher click
+// actually changes what those actions operate on.
+let activePlayer = null;
+
 let selectedClickPoint = null;
 // "streamed-gathering-treehouse" plan Stage 1: the frame-players picker used to overwrite a SINGLE
 // `selectedFramePlayer` scalar on every click, so a second click in the same take (the "player left
@@ -75,8 +83,29 @@ function initClickToTrack() {
     const clickYRel = e.clientY - rect.top;
     if (clickYRel > rect.height - 40) return;
 
-    // Pause video at click frame
+    // Pause video at click frame -- this holds regardless of the branch below: it is how the
+    // owner's own stated workflow ("click the player, seek forward, click again, seek again...")
+    // lands on an exact frame, whether that click is about to pin a raw-coordinate candidate or
+    // (once anchors already exist, see the early return just below) simply line up the moment
+    // they're about to add via "Load Players at This Moment".
     video.pause();
+
+    // "streamed-gathering-treehouse" plan Fix C, 2026-09-15 (recheck finding C): once one or more
+    // picker anchors already exist, a click anywhere on the video preview is PLAYBACK
+    // interaction -- seeking to a new moment -- not a fresh targeting command. The bug this fixes:
+    // this handler used to unconditionally run `targetAnchors = [];` below, so the very act of
+    // clicking the video to move to the next timestamp silently discarded every anchor the picker
+    // had accumulated -- only one anchor ever survived to submission, defeating the owner's
+    // explicit multi-click-across-timestamps workflow. Once there is at least one chip, this
+    // branch does NOT touch `targetAnchors` at all (no marker, no wipe) -- the chips' own ✕
+    // (`removeAnchor`) is the only way to remove one, and "Load Players at This Moment" is the
+    // only way to add another at the newly-sought timestamp.
+    if (targetAnchors.length > 0) {
+      if (hint) {
+        hint.innerHTML = `<i class="fa-solid fa-circle-info"></i> ${targetAnchors.length} anchor(s) pinned already -- this click just paused/sought the video. Use <em>"Load Players at This Moment"</em> to add another anchor here, or remove one with its chip's ✕ below.`;
+      }
+      return;
+    }
 
     const xPct = (e.clientX - rect.left) / rect.width;
     const yPct = (e.clientY - rect.top) / rect.height;
@@ -89,11 +118,10 @@ function initClickToTrack() {
     const jerseyValue = document.getElementById('target-jersey-input').value.trim();
 
     // A raw coordinate click stays a single, EXCLUSIVE candidate (backwards compatible with the
-    // pre-Stage-1 behaviour) -- it supersedes whatever the picker had accumulated, same as the
-    // picker superseded it below. The two mechanisms are not merged into one shared anchor list.
+    // pre-Stage-1 behaviour) -- reachable ONLY while the chip list is empty (the early return
+    // above), so there is nothing left here to wipe; once a picker anchor exists this branch
+    // never runs again for a plain video click.
     selectedClickPoint = { x: xPct, y: yPct, t: t };
-    targetAnchors = [];
-    renderAnchorChips();
     document.getElementById('track-id-input').value = '';
     document.getElementById('frame-players-wrapper')?.classList.add('hidden');
 
@@ -545,14 +573,11 @@ async function loadResults(slug) {
 
 function renderDashboard(data) {
   const player = data.primary_player || data.players[0];
-  const jerseyNum = player.jersey_number || 11;
+  activePlayer = player;
 
-  // Header Summary
-  document.getElementById('dash-jersey-num').textContent = jerseyNum;
-  document.getElementById('statcard-jersey-tag').textContent = `#${jerseyNum}`;
-  document.getElementById('dash-player-title').textContent = `TARGET PLAYER #${jerseyNum}`;
-  document.getElementById('dash-identity-status').innerHTML = `<i class="fa-solid fa-shield-check"></i> Identity: ${player.identity_status}`;
   document.getElementById('dash-video-name').textContent = data.slug;
+  renderPlayerSwitcher(data);
+  renderPlayerStats(player);
 
   // Video Source
   const videoPlayer = document.getElementById('annotated-video-player');
@@ -560,6 +585,32 @@ function renderDashboard(data) {
     videoPlayer.src = data.annotated_video_url;
     videoPlayer.load();
   }
+
+  // Render 2D Tactical Pitch Canvas
+  drawTacticalPitch(data.pitch_trajectory || []);
+
+  // Show Dashboard -- it starts `hidden` in index.html so a fresh page never shows a stale
+  // annotated video + placeholder stat values as if they were a real result (Golden Rule 5:
+  // nothing on screen should look like a finished analysis until one actually finished).
+  const dashboard = document.getElementById('results-dashboard');
+  dashboard.classList.remove('hidden');
+  dashboard.scrollIntoView({ behavior: 'smooth' });
+}
+
+/**
+ * "streamed-gathering-treehouse" plan Fix D, 2026-09-15: fills in every per-player field of the
+ * dashboard header/stat panel/timeline for ONE player -- factored out of `renderDashboard` so
+ * `renderPlayerSwitcher`'s chip clicks can re-run exactly this without re-fetching or re-drawing
+ * the (shared, not per-player) video/pitch canvas.
+ */
+function renderPlayerStats(player) {
+  const jerseyNum = player.jersey_number || 11;
+
+  // Header Summary
+  document.getElementById('dash-jersey-num').textContent = jerseyNum;
+  document.getElementById('statcard-jersey-tag').textContent = `#${jerseyNum}`;
+  document.getElementById('dash-player-title').textContent = `TARGET PLAYER #${jerseyNum}`;
+  document.getElementById('dash-identity-status').innerHTML = `<i class="fa-solid fa-shield-check"></i> Identity: ${player.identity_status}`;
 
   // Stat Card Metrics (#11: touches, passes, turnovers, sprints, goals, assists, shots, tackles, saves)
   document.getElementById('stat-goals').textContent = player.goals || 0;
@@ -576,16 +627,42 @@ function renderDashboard(data) {
 
   // Render Timestamped Event Timeline
   renderEventsTable(player.events || []);
+}
 
-  // Render 2D Tactical Pitch Canvas
-  drawTacticalPitch(data.pitch_trajectory || []);
+/**
+ * "streamed-gathering-treehouse" plan Fix D, 2026-09-15: `/api/results/{slug}` now resolves one
+ * real `primary_player` (the run's own actual target -- `target.json`/`selection.json`, never a
+ * lexicographic accident), but a run can genuinely produce more than one known jersey number
+ * (e.g. two separate verified takes, or a multi-anchor click run whose chain fragments across two
+ * players). This renders one small chip per player so the owner can look at -- and download the
+ * statcard for -- whichever one they want, instead of only ever seeing `primary_player`. Hidden
+ * entirely on the common single-player case (an always-visible switcher with one disabled option
+ * would just be clutter).
+ */
+function renderPlayerSwitcher(data) {
+  const container = document.getElementById('player-switcher');
+  if (!container) return;
+  container.innerHTML = '';
 
-  // Show Dashboard -- it starts `hidden` in index.html so a fresh page never shows a stale
-  // annotated video + placeholder stat values as if they were a real result (Golden Rule 5:
-  // nothing on screen should look like a finished analysis until one actually finished).
-  const dashboard = document.getElementById('results-dashboard');
-  dashboard.classList.remove('hidden');
-  dashboard.scrollIntoView({ behavior: 'smooth' });
+  if (!data.players || data.players.length < 2) {
+    container.classList.add('hidden');
+    return;
+  }
+  container.classList.remove('hidden');
+
+  data.players.forEach((p) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'chip' + (p === activePlayer ? ' active' : '');
+    btn.textContent = `#${p.jersey_number}`;
+    btn.title = `View player #${p.jersey_number}'s stats and highlights`;
+    btn.addEventListener('click', () => {
+      activePlayer = p;
+      renderPlayerStats(p);
+      renderPlayerSwitcher(data);
+    });
+    container.appendChild(btn);
+  });
 }
 
 function renderEventsTable(events) {
@@ -752,11 +829,14 @@ function drawTacticalPitch(points) {
 }
 
 function playReel(category) {
-  if (!currentResults || !currentResults.primary_player) {
+  // Plan Fix D, 2026-09-15: reads `activePlayer` (whichever player the switcher currently has
+  // selected), not always `currentResults.primary_player` -- so on a multi-player run this plays
+  // the reel for the player actually on screen, not always the backend-resolved primary one.
+  if (!activePlayer) {
     alert('Please process or select a match video first.');
     return;
   }
-  const highlights = currentResults.primary_player.highlights || {};
+  const highlights = activePlayer.highlights || {};
   if (highlights[category]) {
     const videoPlayer = document.getElementById('annotated-video-player');
     videoPlayer.src = highlights[category];
@@ -776,11 +856,13 @@ function exportStatCard() {
   // file (a Golden Rule 5 violation), so this now just downloads the real, server-rendered
   // `statcard.pdf` (`src.pipeline.statcard_pdf.render_statcard_pdf`) -- the SAME values
   // `statcard.md` uses, no second, drifting re-typing of the stats anywhere.
-  if (!currentResults || !currentResults.primary_player) {
+  // Plan Fix D, 2026-09-15: exports whichever player the switcher currently has active, not
+  // always the backend-resolved `primary_player` -- see `renderPlayerSwitcher`.
+  if (!currentResults || !activePlayer) {
     alert('No results loaded yet -- process a video first.');
     return;
   }
-  const player = currentResults.primary_player;
+  const player = activePlayer;
   if (!player.statcard_pdf_url) {
     // Honest message rather than the old silent `return` (itself a minor Golden Rule 5 gap) --
     // e.g. `reportlab` wasn't installed on the server when this run happened.

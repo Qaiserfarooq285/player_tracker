@@ -22,6 +22,17 @@ the target's own state machine at TEMPORARILY_LOST/SEARCHING -- an ambiguous rea
 either way, and accepting it "because nothing else looked better" is precisely how a profile drifts
 onto the wrong physical player. This module enforces that at the TYPE level (`VerdictDecision` has
 three members, not two) but the "stays LOST" behaviour itself belongs to the caller.
+
+**2026-09-15 fix: missing evidence must not drag the score down (`_score_candidate`).** Root-caused
+from a real end-to-end run: folding a neutral `0.5` into a FIXED-denominator weighted average meant
+a candidate with NO jersey read at all could never clear `strong_match` even with a perfect
+kit+height match -- `0.4*1.0 + 0.3*0.5 + 0.15*1.0 + 0.15*trajectory` tops out at 0.85, below 0.90,
+making ACCEPT mathematically impossible whenever jersey numbers are illegible (ADR-21's own
+measured 0/801 legibility rate on `clip1_43`). `_score_candidate` now renormalises over signals
+that actually have evidence, excluding (not neutrally scoring) the rest -- see that function's own
+docstring for the exact rule and its degenerate no-evidence-at-all guard. Every hard-reject above
+is untouched by this fix; it only changes what happens to a candidate that has ALREADY cleared all
+three.
 """
 
 from __future__ import annotations
@@ -154,7 +165,10 @@ def verify_candidate(
        being a different person (same reasoning as `click_reid.candidate_score`).
 
     **Only once all three pass** does `_score_candidate` blend colour + jersey + height +
-    trajectory continuity per `cfg['scoring']['weights']`, and the decision follows
+    trajectory continuity per `cfg['scoring']['weights']`, **renormalised over whichever of those
+    four signals actually have evidence** (see `_score_candidate`'s own docstring for why -- a
+    signal with no evidence is excluded from the average entirely, never folded in at a neutral
+    value that would otherwise drag the score down), and the decision follows
     `cfg['strong_match']`/`cfg['uncertain_low']` (plan §5): `>= strong_match` -> ACCEPT;
     `[uncertain_low, strong_match)` -> **UNCERTAIN** (never a weak accept -- see this module's own
     docstring); below `uncertain_low` -> REJECT `score_below_uncertain_low`.
@@ -209,6 +223,62 @@ def verify_candidate(
     return TargetVerdict(decision=decision, score=round(score, 4), evidence=evidence)
 
 
+def classify_chain_fragment(
+    profile: TargetProfile,
+    fragment: Track,
+    kit_by_track: dict[int, KitColourSample],
+    jersey_by_track: dict[int, str],
+    kit_colour_cfg: dict,
+) -> tuple[bool, dict]:
+    """ "streamed-gathering-treehouse" (recheck) plan Fix A: whether `fragment` -- a same-take track
+    `stitch_timeline`/`_union_time_sorted` already joined onto an ACCEPTED seed's own chain, never
+    itself independently run through the full hard-reject-then-score `verify_candidate` gate above
+    -- actively CONTRADICTS `profile`. Returns `(contradicts, evidence)`.
+
+    Deliberately narrower than `verify_candidate`'s own three hard-reject checks: only kit colour
+    (the SAME torso-dominant `_combined_kit_verdict` tri-state test verify_candidate itself uses,
+    reusing `configs/events.yaml: kit_colour`'s `diff_team_min_dist` -- no new threshold) and a
+    confident jersey disagreement (mirrors `src.track.click_reid.prune_chain_by_jersey`'s own
+    existing, measured rule verbatim -- see that function's docstring for the real
+    blue-#10-vs-claret-#21 case this reproduces). Height and trajectory are deliberately NOT
+    consulted here: unlike a fresh candidate being scored for ACCEPT, this fragment is already IN
+    the chain because a verified seed's own `stitch_timeline` call already vouched for it on
+    time/space geometry -- only a genuine identity contradiction (a different kit, a different
+    printed number), never a soft score, may still remove it from the verified chain.
+
+    `contradicts=False` on missing evidence either side (no kit sample for this fragment, no
+    confident jersey read on one or both sides) -- "absence of evidence is not evidence of a
+    different player" (Golden Rule 5), the exact discipline `prune_chain_by_jersey`'s own
+    docstring documents and `_combined_kit_verdict`'s `None` ("no evidence") tri-state result
+    already encodes; only an explicit `False`/disagreement verdict is ever treated as a
+    contradiction, never the `None` one.
+    """
+    evidence: dict = {"candidate_track_id": fragment.id}
+
+    candidate_kit = kit_by_track.get(fragment.id)
+    kit_same, kit_evidence = _combined_kit_verdict(profile.kit, candidate_kit, kit_colour_cfg)
+    evidence["kit_colour"] = kit_evidence
+    if kit_same is False:
+        evidence["contradicts"] = True
+        evidence["reason"] = "wrong_kit_colour"
+        return True, evidence
+
+    profile_digits = str(profile.jersey_number) if profile.jersey_number is not None else None
+    candidate_digits = jersey_by_track.get(fragment.id)
+    if profile_digits is not None and candidate_digits is not None:
+        jersey_agrees = profile_digits == candidate_digits
+        evidence["jersey_agrees"] = jersey_agrees
+        if not jersey_agrees:
+            evidence["contradicts"] = True
+            evidence["reason"] = "wrong_jersey_number"
+            return True, evidence
+    else:
+        evidence["jersey_agrees"] = None
+
+    evidence["contradicts"] = False
+    return False, evidence
+
+
 def _trajectory_score(profile: TargetProfile, candidate: Track, cfg: dict) -> tuple[float, dict]:
     """Continuity score in `[0, 1]` between wherever the profile's most recent `TargetLink` recorded
     its last known position and `candidate`'s own first box.
@@ -253,29 +323,59 @@ def _score_candidate(
 ) -> tuple[float, dict]:
     """Weighted blend of the four soft signals, reached ONLY after every hard reject has already
     passed (`kit_same` can therefore never be `False` here, and `jersey_agrees` can never be
-    `False` -- both would already have returned a REJECT). A `True`/agreeing signal scores `1.0`;
-    a genuinely absent one (colour undecided, jersey unread on one side, height unmeasurable)
-    scores a neutral `0.5` rather than penalising the candidate for a gap in evidence that isn't
-    itself contradictory (Golden Rule 5: absence of evidence is not evidence of a mismatch).
+    `False` -- both would already have returned a REJECT).
+
+    **Renormalised over available evidence only -- the fix for a real structural bug.** A signal
+    with NO evidence (colour undecided, jersey unread on either side, height unmeasurable, no
+    trajectory history) used to be folded into the weighted average at a neutral `0.5`, but against
+    a FIXED denominator (`sum(weights.values())`) that neutral value still actively drags the
+    score down relative to a perfect match: with jersey unreadable, the best ANY candidate could
+    ever score was `0.4*1.0(kit) + 0.3*0.5(jersey) + 0.15*1.0(height) + 0.15*trajectory <= 0.85`,
+    strictly below `strong_match=0.90` -- making ACCEPT mathematically impossible on any footage
+    with no legible jersey number (ADR-21 measured 0/801 crops clearing the legibility gate on
+    `clip1_43`). That is backwards: "absence of evidence is not evidence of a mismatch" (Golden
+    Rule 5) is exactly the discipline `_combined_kit_verdict`'s tri-state result, `prune_chain_by_
+    jersey`, and `click_reid.candidate_score`'s own team/jersey handling already apply -- a missing
+    signal should be excluded from the average, not treated as "50% wrong". Fixed: a signal with no
+    evidence is dropped from BOTH the numerator and the denominator --
+    `score = sum(weight[k]*component[k] for k in signals WITH evidence) / sum(weight[k] for k in
+    signals WITH evidence)`. A perfect kit(1.0)+height(1.0) match with no jersey read and no
+    trajectory history now scores `(0.4*1.0 + 0.15*1.0) / (0.4+0.15) = 1.0`, not the old 0.775.
+
+    **Degenerate case -- literally NO signal has any evidence at all** (`total_weight == 0`, e.g. a
+    candidate with no kit sample, no jersey read, no height data, and no trajectory history).
+    There is nothing to renormalise over -- an empty-sum-over-empty-sum is undefined, not proof of
+    a match -- and a candidate nobody can say ANYTHING about must not silently become a free `1.0`
+    just because there is nothing left to drag it down. Scored at the floor, `0.0`: "no evidence
+    anywhere" is not itself evidence of a match, so this must land in REJECT, never ACCEPT or even
+    UNCERTAIN (mirrors `verify_candidate`'s own already-decided `0.0` REJECT score for a hard
+    reject -- "we have nothing" and "we found a contradiction" both read as the floor, not a
+    neutral middle value that could be misread as "somewhat plausible").
     """
     weights = cfg["scoring"]["weights"]
-    kit_score = 1.0 if kit_same is True else 0.5
-    jersey_score = 1.0 if jersey_agrees is True else 0.5
-    height_score = height_ratio if height_ratio is not None else 0.5
     trajectory_score, trajectory_evidence = _trajectory_score(profile, candidate, cfg)
 
-    components = {
-        "kit_colour": kit_score,
-        "jersey": jersey_score,
-        "height": height_score,
-        "trajectory": trajectory_score,
+    # `None` == no evidence for that signal (excluded below); a present signal's own value is
+    # already `[0, 1]` (kit/jersey agreement collapses to a flat 1.0 -- disagreement is a hard
+    # reject and never reaches this function at all).
+    raw_components: dict[str, float | None] = {
+        "kit_colour": 1.0 if kit_same is True else None,
+        "jersey": 1.0 if jersey_agrees is True else None,
+        "height": height_ratio,
+        "trajectory": trajectory_score if trajectory_evidence.get("available") else None,
     }
-    total_weight = sum(weights.values())
-    weighted_sum = sum(weights[k] * components[k] for k in components)
-    score = weighted_sum / total_weight if total_weight > 0 else 0.0
+    available = {k: v for k, v in raw_components.items() if v is not None}
+    skipped_no_evidence = [k for k in raw_components if k not in available]
+
+    total_weight = sum(weights[k] for k in available)
+    if total_weight <= 0.0:
+        score = 0.0
+    else:
+        score = sum(weights[k] * available[k] for k in available) / total_weight
 
     return score, {
-        "components": {k: round(v, 4) for k, v in components.items()},
+        "components": {k: round(v, 4) for k, v in available.items()},
+        "skipped_no_evidence": skipped_no_evidence,
         "weights": dict(weights),
         "trajectory": trajectory_evidence,
     }

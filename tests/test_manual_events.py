@@ -728,3 +728,125 @@ def test_reacquisition_stays_caption_only_when_jersey_read_also_fails(monkeypatc
     assert debug["0:5.00"]["agreement"] == "locked_identity_absent_at_instant"
     assert debug["0:5.00"]["association_signal"] == "none"
     assert identity_by_take[0].location_track_ids == [100]
+
+
+# ---------------------------------------------------------------------------
+# `_resolve_manual_touch_target_jersey` -- "streamed-gathering-treehouse" (recheck) plan **Fix
+# B**, mirrored here for the manual-events path (no `TargetProfile` tier -- this mode has no
+# persistent click-based profile at all, identity comes straight from the sidecar). Replaces the
+# old `number == target_jersey` equality test that silently dropped every typed touch time
+# whenever `target_jersey` was `None` (the common case for a sidecar video the client never also
+# typed a jersey number for).
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_manual_touch_target_jersey_typed_field_wins_outright():
+    resolved, reason = me_mod._resolve_manual_touch_target_jersey(2, [2, 10])
+    assert resolved == 2
+    assert reason == "typed"
+
+
+def test_resolve_manual_touch_target_jersey_infers_the_single_produced_jersey():
+    """The sidecar's own worked example (CLAUDE.md §3.5/§14.3) names only player #2 -- no typed
+    field needed for the touch times to attach correctly."""
+    resolved, reason = me_mod._resolve_manual_touch_target_jersey(None, [2])
+    assert resolved == 2
+    assert reason == "single_jersey_inferred"
+
+
+def test_resolve_manual_touch_target_jersey_ambiguous_is_reported_not_dropped():
+    """A sidecar naming SEVERAL distinct jersey numbers (e.g. an assist/goal pair) with no typed
+    field is genuinely ambiguous -- resolves to `None` (never guessed onto an arbitrary one) with
+    a reason the caller reports, never the old silent drop."""
+    resolved, reason = me_mod._resolve_manual_touch_target_jersey(None, [2, 10])
+    assert resolved is None
+    assert reason == "ambiguous_not_attached"
+
+
+def test_resolve_manual_touch_target_jersey_ambiguous_when_nothing_produced_either():
+    resolved, reason = me_mod._resolve_manual_touch_target_jersey(None, [])
+    assert resolved is None
+    assert reason == "ambiguous_not_attached"
+
+
+def test_run_manual_events_pipeline_manual_touch_resolves_without_typed_jersey(
+    tmp_path, monkeypatch
+):
+    """Integration-level Fix B check: a click/sidecar run with NO typed `target_jersey` (the
+    normal case this fix exists for) but a sidecar naming only ONE jersey number must still
+    attach the client's typed touch time to that player -- not silently drop it, the old
+    `number == target_jersey` behaviour whenever `target_jersey` was `None`."""
+    video_path = tmp_path / "match.mp4"
+    video_path.write_bytes(b"not a real video -- every I/O boundary below is mocked")
+    sidecar = tmp_path / "match.annotations.txt"
+    sidecar.write_text("Min 0:02 player #2 in white makes a pass\n")
+
+    take = _take(0, 0.0, 10.0)
+    track = _track(1, 1.0)
+
+    class _FakeProfile:
+        class profile:
+            value = "single-static"
+
+    def fake_write_player_output(
+        player_dir,
+        jersey_number,
+        events,
+        possession_seconds,
+        distance_result,
+        takes_by_id,
+        video_path,
+        highlights_cfg,
+        goal_reason=None,
+        identity_status="Verified",
+    ):
+        player_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(me_mod, "build_run_profile", lambda *a, **k: _FakeProfile())
+    monkeypatch.setattr(me_mod, "run_track_stage", lambda *a, **k: {"n_takes": 1, "n_tracks": 1})
+    monkeypatch.setattr(
+        me_mod,
+        "load_models_parquet",
+        lambda path, model: {"takes.parquet": [take], "tracks.parquet": [track]}.get(path.name, []),
+    )
+    monkeypatch.setattr(me_mod, "probe", lambda path: {"width": 100, "height": 100, "fps": 30.0})
+    monkeypatch.setattr(
+        me_mod,
+        "associate_annotation_to_track",
+        lambda *a, **k: (
+            1,
+            5.0,
+            {"arrow_track_id": None, "arrow_distance_px": None, "agreement": "colour_only"},
+        ),
+    )
+    monkeypatch.setattr(me_mod, "render_full_annotated_video", lambda *a, **k: None)
+    monkeypatch.setattr(me_mod, "write_player_output", fake_write_player_output)
+
+    real_highlights = load_yaml("configs/highlights.yaml")
+    configs = {
+        "annotations": load_yaml("configs/annotations.yaml"),
+        "events": load_yaml("configs/events.yaml"),
+        "hardware": load_yaml("configs/hardware.yaml"),
+        "profile": {},
+        "shots": {},
+        "detect": {},
+        "track": {},
+        "team": {},
+        "highlights": real_highlights,
+    }
+
+    result = me_mod.run_manual_events_pipeline_for_video(
+        video_path,
+        configs,
+        sidecar,
+        target_jersey=None,  # Fix B's own trigger case -- identity comes from the sidecar alone
+        manual_touch_times="0:05",
+        work_root=tmp_path / "work",
+        output_root=tmp_path / "output",
+        use_nvdec=False,
+    )
+
+    assert result["jersey_numbers"] == [2]
+    assert result["manual_touch"]["n_parsed"] == 1
+    assert result["manual_touch"]["resolved_target_jersey"] == 2
+    assert result["manual_touch"]["target_jersey_resolution"] == "single_jersey_inferred"

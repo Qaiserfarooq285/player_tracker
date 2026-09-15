@@ -101,6 +101,16 @@ scoring:
   # contradictory hard signal, so these weights never even get evaluated against a candidate that
   # already failed a hard reject. ⚠️ EXAMPLE WEIGHTS, NOT YET MEASURED against real accept/reject
   # outcomes on this project's own footage -- plan Stage 10 validates/re-tunes these.
+  #
+  # 2026-09-15 fix: `src/track/target_verify.py::_score_candidate` used to fold a MISSING signal
+  # into this weighted average at a neutral 0.5 against a FIXED denominator -- which meant missing
+  # evidence actively dragged the score down rather than being neutral. With jersey unreadable
+  # (ADR-21: 0/801 crops on `clip1_43`), the best ANY candidate could ever score was
+  # 0.4*1.0 + 0.3*0.5 + 0.15*1.0 + 0.15*trajectory <= 0.85, below `strong_match`=0.90 -- ACCEPT was
+  # mathematically impossible on exactly the footage class this project is built for. Fixed: the
+  # score is now renormalised over signals that actually HAVE evidence (see `_score_candidate`'s
+  # own docstring for the exact rule). These WEIGHTS themselves are unchanged by that fix -- only
+  # what happens to a weight whose signal has no evidence (excluded, not scored at 0.5).
   weights:
     kit_colour: 0.40 # dominant soft signal -- mirrors the same "colour is the PRIMARY
     # teammate/opponent signal" choice already made for pass/assist attribution
@@ -123,6 +133,23 @@ uncertain_low: 0.75 # same caveat as `strong_match` immediately above -- an EXAM
 # owner's spec, not measured. A verdict scoring in [uncertain_low, strong_match) is UNCERTAIN,
 # which per plan §5/Stage 2 means the target STAYS LOST -- an UNCERTAIN verdict is never a weak
 # ACCEPT -- until Stage 10's real validation either confirms or replaces these two numbers.
+#
+# 2026-09-15 re-check (part of the same session that fixed `_score_candidate`'s renormalisation
+# bug above): these two NUMBERS are left UNCHANGED here -- this session had no real labeled
+# accept/reject footage to run against (pure/unit-test scope only, no GPU/pipeline run), so
+# claiming a measured re-tune would be exactly the "launder an unmeasured value into a
+# measured-sounding comment" this file already warns against. What WAS checked, on the existing
+# unit-test fixtures (`tests/test_target_verify.py`, real measured CIELAB from
+# `chelsea_burnley_target10`): (1) hard-rejects are untouched by the renormalisation fix and still
+# catch the one real measured failure this plan exists to prevent (blue #10 vs claret #21,
+# dE=24.5); (2) a candidate with literally NO evidence on any signal still cannot reach ACCEPT or
+# even UNCERTAIN (scored at the floor, 0.0); (3) a candidate with exactly ONE weak-but-real signal
+# (e.g. a height ratio of 0.80 and nothing else) still lands UNCERTAIN, not a weak ACCEPT, under
+# these unchanged 0.75/0.90 numbers. So 0.75/0.90 still behave sensibly on the cases this session
+# could check by construction -- but they remain the owner's worked-example values, still awaiting
+# Stage 10's real accept/reject data, now doubly so since the scoring formula underneath them just
+# changed shape (renormalised, not fixed-denominator) and has never been run against real footage
+# at all.
 
 trajectory:
   # Continuity scoring for the `trajectory` weight above. `verify_candidate` looks at the LAST
