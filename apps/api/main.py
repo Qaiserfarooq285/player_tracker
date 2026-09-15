@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 import traceback
 import uuid
@@ -111,6 +112,19 @@ app.add_middleware(
 
 # Global in-memory job store for background processing tasks
 JOBS: dict[str, dict[str, Any]] = {}
+
+# Which video slugs currently have a pipeline job in flight, and the lock guarding that set.
+#
+# Real corruption this prevents (owner-reported 2026-09-15, root-caused from the server log):
+# every run writes to the SAME `work/<slug>/` and `output/<slug>/` directories, and `extract_clip`
+# cuts each clip with `ffmpeg -y`. Two runs of one video therefore overwrite each other's files
+# mid-write. The observed failure was `moov atom not found` on
+# `output/clip5_77/clips/clip_000_sprint_*.mp4` ONE SECOND after that same run logged "cut 3
+# clip(s)" -- an MP4 writes its `moov` atom last, so the reel's concat read a file another run had
+# just truncated. The file was perfectly valid again afterwards, which is the signature of a
+# concurrent overwrite rather than a bad encode.
+_INFLIGHT_SLUGS: set[str] = set()
+_INFLIGHT_LOCK = threading.Lock()
 
 
 class TargetAnchor(BaseModel):
@@ -835,6 +849,11 @@ def _run_pipeline_job(
     verification itself resolves one per take, so it has no natural place to attach these; that
     branch does not accept this parameter (an honest scope limit, not an oversight).
     """
+    # Captured up front so the `finally` below can always release this video's in-flight slot,
+    # even if the run dies before `_resolve_video_path` would succeed. Falls back to the job's own
+    # recorded slug, which `process_video` computed with the same helper when it claimed the slot.
+    _job_slug_for_release = JOBS[job_id].get("canonical_slug") or ""
+
     job = JOBS[job_id]
     job["status"] = "processing"
     job["progress"] = 5
@@ -1132,11 +1151,33 @@ def _run_pipeline_job(
         job["status"] = "failed"
         job["error"] = message
         job["logs"].append(f"ERROR: {message}")
+    finally:
+        # Always release this video, success or failure -- a crashed run must never leave its slug
+        # permanently locked out (that would turn one bad run into "this video can never be
+        # processed again" until the server restarts).
+        with _INFLIGHT_LOCK:
+            _INFLIGHT_SLUGS.discard(_job_slug_for_release)
 
 
 @app.post("/api/process")
 def process_video(req: ProcessRequest, background_tasks: BackgroundTasks):
     """Trigger the football video tracking and analytics pipeline."""
+    # One run per video at a time -- see `_INFLIGHT_SLUGS` for the corruption this prevents.
+    # Refused here, before a job is even created, so the caller gets an immediate, actionable 409
+    # rather than a job that "starts" and then dies on a half-written clip file.
+    slug = _canonical_slug(_resolve_video_path(req.video_name))
+    with _INFLIGHT_LOCK:
+        if slug in _INFLIGHT_SLUGS:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"'{req.video_name}' is already being processed. Wait for that run to finish "
+                    "before starting another -- two runs of the same video overwrite each other's "
+                    "clip files and corrupt the output."
+                ),
+            )
+        _INFLIGHT_SLUGS.add(slug)
+
     job_id = str(uuid.uuid4())[:8]
     JOBS[job_id] = {
         "job_id": job_id,
@@ -1151,6 +1192,10 @@ def process_video(req: ProcessRequest, background_tasks: BackgroundTasks):
         .replace(".avi", "")
         .replace(".mov", "")
         .replace(" ", "_"),
+        # The EXACT slug `_INFLIGHT_SLUGS` was keyed on above -- the display "slug" beside it is a
+        # loose filename transform and must never be used to release the lock (they diverge on
+        # uppercase/punctuation, which would leak the slot forever).
+        "canonical_slug": slug,
     }
 
     background_tasks.add_task(

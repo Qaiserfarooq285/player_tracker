@@ -48,6 +48,46 @@ def select_for_export(clips_with_scores: list[tuple[Clip, float]], export_cfg: d
     return kept
 
 
+def _assert_readable_clip(clip_path: Path) -> None:
+    """Fail with a clear, actionable message if `clip_path` isn't a finalised, readable video.
+
+    Added 2026-09-15 after a real failure whose raw ffmpeg output ("moov atom not found",
+    "Impossible to open ...", "Invalid data found when processing input") said nothing about WHICH
+    clip was bad or why. An MP4 writes its `moov` atom LAST, so a file that exists and is megabytes
+    long can still be unreadable while another process is mid-write -- which is exactly what
+    happened: a second pipeline run for the same video truncated this clip via `extract_clip`'s
+    own `ffmpeg -y` one second after the first run had cut it. `apps/api/main.py` now refuses
+    concurrent runs of one video (the root-cause fix); this is the second line of defence, so any
+    future variant of "the input wasn't a finished video" is reported as such rather than as an
+    ffmpeg dump the user has to decode.
+    """
+    if not clip_path.exists():
+        raise RuntimeError(f"clip {clip_path} does not exist -- cannot build a reel from it")
+    if clip_path.stat().st_size == 0:
+        raise RuntimeError(f"clip {clip_path} is empty (0 bytes) -- the cut that wrote it failed")
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+            str(clip_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0 or not probe.stdout.strip():
+        raise RuntimeError(
+            f"clip {clip_path} is not a readable video ({clip_path.stat().st_size} bytes on disk, "
+            f"but ffprobe cannot parse it: {probe.stderr.strip()[:200]}). An MP4 is only readable "
+            "once its trailing 'moov' atom is written, so this usually means the file was still "
+            "being written -- most often by a second run of the same video overwriting it."
+        )
+
+
 def build_reel(clips: list[Clip], out_path: str | Path) -> Path:
     """Concatenate `clips` (in the order given — caller is responsible for best-first ordering)
     into `out_path` via ffmpeg's concat demuxer.
@@ -67,7 +107,9 @@ def build_reel(clips: list[Clip], out_path: str | Path) -> Path:
         for c in clips:
             if c.path is None:
                 raise ValueError(f"Clip for event {c.event_id} has no cut file path")
-            f.write(f"file '{Path(c.path).resolve()}'\n")
+            clip_path = Path(c.path).resolve()
+            _assert_readable_clip(clip_path)
+            f.write(f"file '{clip_path}'\n")
 
     def run_concat(extra_args: list[str]) -> subprocess.CompletedProcess:
         cmd = [

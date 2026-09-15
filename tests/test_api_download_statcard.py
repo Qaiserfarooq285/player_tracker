@@ -496,3 +496,48 @@ def test_media_serves_real_file_under_input_dir(_isolated_dirs):
 def test_media_rejects_traversal_out_of_input_and_output(_isolated_dirs):
     res = client.get("/media/..%2f..%2f..%2fetc%2fpasswd")
     assert res.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# concurrent-run guard (2026-09-15) -- see `_INFLIGHT_SLUGS` in apps/api/api_main.py
+# ---------------------------------------------------------------------------
+
+
+def test_process_refuses_a_second_concurrent_run_of_the_same_video(monkeypatch, tmp_path):
+    """Two runs of one video share `work/<slug>/` and `output/<slug>/` and overwrite each other's
+    clip files via `extract_clip`'s `ffmpeg -y`. That really corrupted a reel (`moov atom not
+    found` on a clip one second after it was cut, valid again afterwards), so the second run is
+    refused outright with a 409 rather than allowed to race."""
+    video = tmp_path / "dup.mp4"
+    video.write_bytes(b"x")
+    monkeypatch.setattr(api_main, "_resolve_video_path", lambda name: video)
+    monkeypatch.setattr(api_main, "_canonical_slug", lambda path: "dup")
+    # Never actually launch the pipeline for this test.
+    monkeypatch.setattr(api_main.BackgroundTasks, "add_task", lambda self, *a, **k: None)
+
+    api_main._INFLIGHT_SLUGS.clear()
+    client = TestClient(api_main.app)
+    first = client.post("/api/process", json={"video_name": "dup.mp4"})
+    assert first.status_code == 200
+
+    second = client.post("/api/process", json={"video_name": "dup.mp4"})
+    assert second.status_code == 409
+    assert "already being processed" in second.json()["detail"]
+
+    api_main._INFLIGHT_SLUGS.clear()
+
+
+def test_process_releases_the_slug_so_a_later_run_is_allowed(monkeypatch, tmp_path):
+    """A finished (or crashed) run must never leave its video permanently locked out."""
+    video = tmp_path / "dup2.mp4"
+    video.write_bytes(b"x")
+    monkeypatch.setattr(api_main, "_resolve_video_path", lambda name: video)
+    monkeypatch.setattr(api_main, "_canonical_slug", lambda path: "dup2")
+    monkeypatch.setattr(api_main.BackgroundTasks, "add_task", lambda self, *a, **k: None)
+
+    api_main._INFLIGHT_SLUGS.clear()
+    client = TestClient(api_main.app)
+    assert client.post("/api/process", json={"video_name": "dup2.mp4"}).status_code == 200
+    api_main._INFLIGHT_SLUGS.discard("dup2")  # what the job's own `finally` does
+    assert client.post("/api/process", json={"video_name": "dup2.mp4"}).status_code == 200
+    api_main._INFLIGHT_SLUGS.clear()
