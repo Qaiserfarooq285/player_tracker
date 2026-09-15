@@ -696,11 +696,43 @@ def _resolve_target_click(
         save_target_profile(new_profile, _canonical_work_dir(video_path) / "target.json")
         return new_profile
 
+    # Re-clicking the very track that ESTABLISHED this profile is never a rejection (Golden Rule
+    # 4, and parity with `src.highlights.selection._select_take_with_profile`, which already had
+    # this bypass -- this path did not, so a user who clicked their own anchor again could be told
+    # it "does not match" itself).
+    if candidate.id == profile.established_track_id and take_id == profile.established_take_id:
+        return profile
+
     target_cfg = {**configs["target"], "kit_colour": configs["events"]["kit_colour"]}
     kit_by_track = {candidate.id: kit_sample} if kit_sample is not None else {}
     jersey_by_track = {candidate.id: jersey_digits} if jersey_digits is not None else {}
     verdict = verify_candidate(profile, candidate, kit_by_track, jersey_by_track, target_cfg)
-    if verdict.decision != VerdictDecision.ACCEPT:
+    # A deliberate human click is governed by the HARD rejects, not by the soft-signal aggregate.
+    #
+    # Owner-reported failure, 2026-09-15: `CLICK REJECTED ... (match uncertain, score=0.85)`. Every
+    # hard check had PASSED -- the kit colour matched, no jersey read contradicted, the height was
+    # fine -- and the click was still refused because a blended score landed just under
+    # `strong_match`. What drags that blend down in exactly this situation is `trajectory`: the
+    # score rewards spatial/temporal continuity with where the target was last seen, and a
+    # reconnect click happens precisely BECAUSE the target vanished and reappeared somewhere else.
+    # Scoring the discontinuity that motivated the click is circular, and it made the owner's own
+    # stated workflow ("the player moves out of frame and appears again... it should be clickable")
+    # fail on correct clicks.
+    #
+    # So: a hard reject still refuses the click, with its specific reason -- that IS the owner's
+    # "if the user clicks another player, reject and keep the target lost" requirement, and those
+    # three signals (kit colour, printed number, height) are the reliable discriminators. An
+    # UNCERTAIN or merely-low score with nothing actually contradicting is NOT evidence of a
+    # different player, and CLAUDE.md Golden Rule 4 is explicit that a human-provided identity is
+    # the strongest evidence this pipeline has -- the person is looking at the footage. The score
+    # is kept in the profile's own link evidence either way, so a weak reconnect stays auditable.
+    #
+    # NOTE this deliberately differs from AUTOMATIC re-identification
+    # (`_select_take_with_profile`'s candidate scan), where UNCERTAIN must still mean "stay lost":
+    # there no human asserted anything, so the strict bar is the whole safeguard.
+    hard_reject_reasons = {"wrong_kit_colour", "wrong_jersey_number", "height_mismatch"}
+    rejected_reason = verdict.evidence.get("rejected_reason")
+    if verdict.decision == VerdictDecision.REJECT and rejected_reason in hard_reject_reasons:
         raise ClickRejected(_click_rejection_message(profile, verdict))
     return profile
 

@@ -279,10 +279,18 @@ def test_resolve_target_click_second_click_reject_keeps_target_lost(monkeypatch)
     save_mock.assert_not_called()
 
 
-def test_resolve_target_click_uncertain_is_treated_as_rejection(monkeypatch):
-    """`target_verify.py`'s own rule: UNCERTAIN must never be a weak ACCEPT. `_resolve_target_
-    click` must raise exactly like a REJECT (`ClickRejected`), with a score-based reason since
-    `rejected_reason` is deliberately absent from an UNCERTAIN verdict's evidence."""
+def test_resolve_target_click_uncertain_no_longer_rejects_a_human_click(monkeypatch):
+    """Owner-reported failure, 2026-09-15: a correct reconnect click was refused with
+    `CLICK REJECTED ... (match uncertain, score=0.85)` while EVERY hard check had passed.
+
+    A human click is now governed by the hard rejects (kit colour / jersey number / height), not by
+    the blended soft score. The blend's `trajectory` term rewards continuity with where the target
+    was last seen -- and a reconnect click happens precisely because the target vanished and
+    reappeared elsewhere, so scoring that discontinuity is circular. CLAUDE.md Golden Rule 4: a
+    human-provided identity is the strongest evidence this pipeline has.
+
+    (Automatic re-identification keeps the strict bar -- see
+    `src.highlights.selection._select_take_with_profile`; there no human asserted anything.)"""
     profile = _profile(kit=_kit(torso=BLUE_10), jersey_number=10)
     candidate = _track(9, [_box(5.0, 100)], team=0)
     monkeypatch.setattr(
@@ -290,8 +298,32 @@ def test_resolve_target_click_uncertain_is_treated_as_rejection(monkeypatch):
         "_click_evidence_for_candidate",
         lambda *a, **k: (candidate, _kit(torso=BLUE_10), "10"),
     )
+    fake_verdict = TargetVerdict(decision=VerdictDecision.UNCERTAIN, score=0.85, evidence={})
+    monkeypatch.setattr(
+        "src.track.target_verify.verify_candidate", MagicMock(return_value=fake_verdict)
+    )
 
-    fake_verdict = TargetVerdict(decision=VerdictDecision.UNCERTAIN, score=0.81, evidence={})
+    returned = main._resolve_target_click(Path("input/fake_video.mp4"), _cfg(), profile, 0, 9, None)
+    assert returned is profile  # reconnected, same persistent identity, nothing overwritten
+
+
+@pytest.mark.parametrize(
+    "reason_code", ["wrong_kit_colour", "wrong_jersey_number", "height_mismatch"]
+)
+def test_resolve_target_click_still_rejects_on_a_hard_signal(monkeypatch, reason_code):
+    """The owner's own requirement is unchanged: clicking a genuinely DIFFERENT player is refused
+    and the target stays lost. Those three hard signals are the reliable discriminators, and they
+    still veto a click outright -- only the soft-score veto was removed."""
+    profile = _profile(kit=_kit(torso=BLUE_10), jersey_number=10)
+    candidate = _track(9, [_box(5.0, 100)], team=0)
+    monkeypatch.setattr(
+        main,
+        "_click_evidence_for_candidate",
+        lambda *a, **k: (candidate, _kit(torso=BLUE_10), "10"),
+    )
+    fake_verdict = TargetVerdict(
+        decision=VerdictDecision.REJECT, score=0.0, evidence={"rejected_reason": reason_code}
+    )
     monkeypatch.setattr(
         "src.track.target_verify.verify_candidate", MagicMock(return_value=fake_verdict)
     )
@@ -300,12 +332,29 @@ def test_resolve_target_click_uncertain_is_treated_as_rejection(monkeypatch):
 
     with pytest.raises(main.ClickRejected) as excinfo:
         main._resolve_target_click(Path("input/fake_video.mp4"), _cfg(), profile, 0, 9, None)
+    assert "CLICK REJECTED" in str(excinfo.value)
+    save_mock.assert_not_called()  # a rejected click never touches the stored profile
 
-    message = str(excinfo.value)
-    assert "CLICK REJECTED" in message
-    assert "0.81" in message
-    assert "Target remains lost" in message
-    save_mock.assert_not_called()
+
+def test_resolve_target_click_never_rejects_the_establishing_anchor(monkeypatch):
+    """Re-clicking the exact track that ESTABLISHED this profile must never be told it "does not
+    match" itself. `src.highlights.selection._select_take_with_profile` already had this bypass;
+    this path did not, so the owner could be rejected by their own anchor."""
+    profile = _profile(kit=_kit(torso=BLUE_10), jersey_number=10)
+    profile.established_track_id = 9
+    profile.established_take_id = 0
+    candidate = _track(9, [_box(5.0, 100)], team=0)
+    monkeypatch.setattr(
+        main,
+        "_click_evidence_for_candidate",
+        lambda *a, **k: (candidate, _kit(torso=BLUE_10), "10"),
+    )
+    verify_mock = MagicMock()
+    monkeypatch.setattr("src.track.target_verify.verify_candidate", verify_mock)
+
+    returned = main._resolve_target_click(Path("input/fake_video.mp4"), _cfg(), profile, 0, 9, None)
+    assert returned is profile
+    verify_mock.assert_not_called()  # the anchor is the target by definition, not by score
 
 
 # ---------------------------------------------------------------------------
