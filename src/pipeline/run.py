@@ -230,6 +230,25 @@ def _track_active_windows(
     return windows
 
 
+def _player_dir_name(jersey_number: int | None, target_profile: TargetProfile | None) -> str:
+    """The `output/<slug>/players/<dir>` name for one target.
+
+    `player_<N>` whenever a jersey number is known -- unchanged for every pre-existing flow
+    (CLAUDE.md §13.5's documented layout, the filename-jersey clips, ADR-15, ADR-19). When the
+    number was never read, falls back to the persistent identity that DOES exist,
+    `TargetProfile.target_id` (e.g. `target_001`), rather than writing a literal `player_None`.
+    Reachable since 2026-09-15 -- see `src.pipeline.annotated_video.target_name` for why.
+
+    Last resort with neither a number nor a profile: `player_unknown`, an honest placeholder
+    (Golden Rule 5) rather than a fabricated number or a raw track id (ADR-18 (3)).
+    """
+    if jersey_number is not None:
+        return f"player_{jersey_number}"
+    if target_profile is not None and target_profile.target_id:
+        return target_profile.target_id.lower()
+    return "player_unknown"
+
+
 def _accepted_target_ids(sel: TakeSelection, target_profile_active: bool) -> list[int]:
     """The SAME accepted-fragment id set that gates the target's red/amber box (Stage A/C,
     `src.track.target_state.build_target_timeline`) and Stage D's own event attribution -- the
@@ -1191,7 +1210,18 @@ def run_pipeline_for_video(
 
     for take in takes:
         tir = identity_by_take.get(take.id)
-        if tir is None or tir.status != "verified" or tir.jersey_number is None:
+        # `jersey_number is None` is deliberately NOT a skip condition any more (2026-09-15).
+        # It used to be, harmlessly, because a target could only ever reach `status == "verified"`
+        # when OCR had actually read its number. Since the target-verifier scoring fix landed the
+        # same day, "the human clicked this player and the pipeline verified it, but the jersey was
+        # never legible" is a normal outcome -- and on the owner's own footage the COMMON one
+        # (ADR-21: `clip1_43` reads 0/801 crops). Keeping the old condition silently discarded
+        # EVERY event for such a target and wrote no `players/` folder at all, which is exactly the
+        # "stats not calculated correctly" the owner reported. What still gates a take is real:
+        # it must have a verified, located identity. The resulting `events_by_number[None]` key is
+        # handled end to end -- ordering (`key=` on the sort below), folder naming
+        # (`_player_dir_name`), the statcard/PDF headings, and the renderer's own labels.
+        if tir is None or tir.status != "verified":
             continue
         take_tracks = full_tracks_by_take.get(take.id, [])
         take_balls = full_balls_by_take.get(take.id, [])
@@ -1343,7 +1373,12 @@ def run_pipeline_for_video(
     manual_touch_suppressed = 0
 
     t0 = time.time()
-    for number in sorted(events_by_number.keys()):
+    # `key=`, not a bare `sorted(...)`: `events_by_number` is keyed by jersey number, and since
+    # 2026-09-15 that key can legitimately be `None` (a human-clicked target whose number was
+    # never legible -- see `src.pipeline.annotated_video.target_name`). A bare sort over a mix of
+    # `None` and ints raises `TypeError: '<' not supported between 'NoneType' and 'int'`; the
+    # unknown-number target sorts last so numbered players keep their existing order.
+    for number in sorted(events_by_number.keys(), key=lambda n: (n is None, n)):
         number_events = events_by_number.get(number, [])
         if manual_touch_evts and number == resolved_touch_jersey:
             # Owner's merge rule ("their times win, auto-detection fills the gaps"): applied ONCE,
@@ -1378,7 +1413,11 @@ def run_pipeline_for_video(
             "n_track_fragments": total_fragments,
             "n_speed_samples": total_samples,
         }
-        player_dir = output_dir / "players" / f"player_{number}"
+        # `player_None` would be a lie on disk. When no jersey number was ever read, name the
+        # folder after the identity we ACTUALLY have -- the persistent `TargetProfile.target_id`
+        # (e.g. `target_001`) -- never the raw track id, which ADR-18 (3) is explicit must never
+        # stand in for a jersey identity. Numbered players keep `player_<N>` byte-for-byte.
+        player_dir = output_dir / "players" / _player_dir_name(number, target_profile)
         write_player_output(
             player_dir,
             number,
@@ -1392,8 +1431,8 @@ def run_pipeline_for_video(
             identity_status="Verified (arrow/manual track selection)",
         )
         logger.info(
-            "player_%d: %d event(s) across %d take(s) -- statcard/highlights written",
-            number,
+            "%s: %d event(s) across %d take(s) -- statcard/highlights written",
+            _player_dir_name(number, target_profile),
             len(number_events),
             len(takes_used_by_number.get(number, [])),
         )

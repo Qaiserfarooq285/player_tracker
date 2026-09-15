@@ -98,8 +98,23 @@ def _goal_assist_text(count: int, goal_reason: str | None) -> str:
     return str(count) if count > 0 or goal_reason is None else goal_reason
 
 
+def _player_heading(jersey_number: int | None) -> str:
+    """`"Player #10"` when the number is known, an honest name when it never was.
+
+    Mirrors `src.pipeline.player_output.render_statcard_markdown`'s own heading rule so the PDF and
+    the markdown can't disagree about who the card is for -- and so neither ever prints the
+    literal `"Player #None"` (Golden Rule 5). See `src.pipeline.annotated_video.target_name` for
+    why an unknown number became reachable on 2026-09-15.
+    """
+    return (
+        f"Player #{jersey_number}"
+        if jersey_number is not None
+        else "Target player (jersey number not readable)"
+    )
+
+
 def render_statcard_pdf(
-    jersey_number: int,
+    jersey_number: int | None,
     counts: dict[str, int],
     possession_seconds: float | None,
     distance_result: dict | None,
@@ -172,7 +187,7 @@ def render_statcard_pdf(
 
     story: list = [
         Paragraph("Player Statistics", title_style),
-        Paragraph(f"Player #{jersey_number}", subtitle_style),
+        Paragraph(_player_heading(jersey_number), subtitle_style),
         # Deliberately plain text, no inline <b>/<font> markup: a bold/normal run switch mid-line
         # makes reportlab emit the label and the value as SEPARATE Tj operators in the content
         # stream, which would break a byte-level substring check like "Goals: not available (...)"
@@ -277,7 +292,7 @@ def render_statcard_pdf(
         topMargin=PAGE_MARGIN_IN * inch,
         bottomMargin=PAGE_MARGIN_IN * inch,
         pageCompression=PAGE_COMPRESSION,
-        title=f"Player #{jersey_number} Statistics",
+        title=f"{_player_heading(jersey_number)} Statistics",
     )
     doc.build(story)
     logger.info("wrote statcard PDF: %s", output_path)

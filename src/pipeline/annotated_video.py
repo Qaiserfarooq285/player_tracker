@@ -489,6 +489,40 @@ def _draw_box_with_label(
     )
 
 
+def target_box_label(identity: TakeIdentityResult, track_id: int, suffix: str = "TARGET") -> str:
+    """The red/amber box's own label. `"#10 | TARGET | ID: 5"` when a jersey number is known for
+    THIS track (per-track first, so a take naming an assist/goal pair labels each correctly, then
+    the take-level number), `"TARGET | ID: 5"` when none was ever read -- never the literal
+    `"#None"`.
+
+    ADR-18 (3) still holds in both forms: the track id is always shown as `ID: n`, never as a bare
+    `#n`, so a tracker artifact can never be misread as a jersey identity. See `target_name` above
+    for why the no-number case became reachable on 2026-09-15.
+    """
+    number = identity.jersey_by_track_id.get(track_id, identity.jersey_number)
+    prefix = f"#{number} | " if number is not None else ""
+    return f"{prefix}{suffix} | ID: {track_id}"
+
+
+def target_name(identity: TakeIdentityResult) -> str:
+    """How to NAME the target on screen: `"TARGET #10"` when this take's jersey number is known,
+    plain `"TARGET"` when it is not.
+
+    Reachable for the first time as of 2026-09-15. Until the target-verifier scoring fix landed
+    the same day, a target could only ever be ACCEPTed when OCR had actually read its number, so
+    `jersey_number` was always an int here. That fix (scoring only over signals that HAVE evidence)
+    makes "human clicked this player, jersey never legible" a normal, expected outcome -- and on
+    the owner's own footage it is the COMMON one (ADR-21 measured `clip1_43` at 0/801 crops
+    clearing the legibility gate). Before this helper those call sites rendered the literal string
+    `"TARGET #None"`, and `progress_by_number[None]` raised `KeyError: None` mid-render.
+
+    Golden Rule 5: never print a number we never read. The identity we genuinely have in that case
+    is the persistent `TargetProfile.target_id`, not a jersey number -- so the on-screen name drops
+    the `#N` claim entirely rather than inventing, blanking, or guessing one.
+    """
+    return f"TARGET #{identity.jersey_number}" if identity.jersey_number is not None else "TARGET"
+
+
 def _target_panel_header(
     identity: TakeIdentityResult, frame_status: TargetFrameStatus | None = None
 ) -> str:
@@ -512,20 +546,20 @@ def _target_panel_header(
     """
     if frame_status is not None:
         if frame_status.bbox is None:
-            return f"TARGET #{identity.jersey_number} -- {frame_status.state.value.upper()}"
+            return f"{target_name(identity)} -- {frame_status.state.value.upper()}"
         if frame_status.state == TargetFrameState.RECONNECTED:
-            return f"TARGET #{identity.jersey_number} -- RECONNECTED"
+            return f"{target_name(identity)} -- RECONNECTED"
     if render_tier(identity) == "amber":
         # Plan Stage 5's own amber-tier panel text (owner decision, this session): a no-profile
         # arrow/heuristic pick is real location evidence, never a visually-confirmed jersey read
         # -- CLAUDE.md §14's existing filename-jersey auto flow is exactly this case.
         return (
-            f"TARGET #{identity.jersey_number} -- UNVERIFIED PICK "
+            f"{target_name(identity)} -- UNVERIFIED PICK "
             "(number from filename, not visually confirmed)"
         )
     if identity.association_confirmed_by_jersey:
-        return f"TARGET #{identity.jersey_number} -- VERIFIED"
-    return f"TARGET #{identity.jersey_number} -- COLOUR MATCH (jersey unconfirmed)"
+        return f"{target_name(identity)} -- VERIFIED"
+    return f"{target_name(identity)} -- COLOUR MATCH (jersey unconfirmed)"
 
 
 def _draw_live_panel(
@@ -558,7 +592,7 @@ def _draw_live_panel(
         # `src/ apps/` previously found nothing). No box is drawn on anyone this take (Golden Rule
         # 5: never guess a substitute player), and the panel says so honestly instead of silently
         # showing nothing while implying the target is still tracked.
-        lines.append((f"TARGET #{identity.jersey_number} -- LOST", _PANEL_HEADER_COLOR))
+        lines.append((f"{target_name(identity)} -- LOST", _PANEL_HEADER_COLOR))
         lines.append(("SEARCHING FOR ORIGINAL PLAYER...", _PANEL_TEXT_COLOR))
     else:
         lines.append(("IDENTITY: unverified in this segment", _PANEL_HEADER_COLOR))
@@ -1113,8 +1147,7 @@ def render_full_annotated_video(
                         y2,
                         # per-track number where the take names more than one target player
                         # (assist/goal pair) -- falls back to the take-level number otherwise.
-                        f"#{identity.jersey_by_track_id.get(tr.id, identity.jersey_number)}"
-                        f" | TARGET | ID: {tr.id}",
+                        target_box_label(identity, tr.id),
                         _RED,
                         _px(_RED_THICKNESS, overlay_scale),
                         _LABEL_FONT_SCALE_TARGET * overlay_scale,
@@ -1130,8 +1163,7 @@ def render_full_annotated_video(
                         y1,
                         x2,
                         y2,
-                        f"#{identity.jersey_by_track_id.get(tr.id, identity.jersey_number)}"
-                        f" | LIKELY TARGET (unverified pick) | ID: {tr.id}",
+                        target_box_label(identity, tr.id, "LIKELY TARGET (unverified pick)"),
                         _AMBER,
                         _px(_AMBER_THICKNESS, overlay_scale),
                         _LABEL_FONT_SCALE_TARGET * overlay_scale,
@@ -1173,16 +1205,13 @@ def render_full_annotated_video(
                     if frame_status.state == TargetFrameState.VISIBLE
                     else f" | {frame_status.state.value.upper()}"
                 )
-                jersey_label = identity.jersey_by_track_id.get(
-                    target_drawn_track_id, identity.jersey_number
-                )
                 _draw_box_with_label(
                     frame,
                     tx1,
                     ty1,
                     tx2,
                     ty2,
-                    f"#{jersey_label} | TARGET{state_suffix} | ID: {target_drawn_track_id}",
+                    target_box_label(identity, target_drawn_track_id, f"TARGET{state_suffix}"),
                     color,
                     _px(thickness, overlay_scale),
                     _LABEL_FONT_SCALE_TARGET * overlay_scale,
@@ -1203,7 +1232,16 @@ def render_full_annotated_video(
 
             counts = None
             if identity is not None and identity.status == "verified":
-                counts = progress_by_number[identity.jersey_number].advance_to(t)
+                # `.get`, not `[...]` -- the crash this replaces was a real `KeyError: None`
+                # (2026-09-15) the moment a verified target with NO readable jersey number became
+                # reachable: `progress_by_number` is keyed by whatever key `events_by_number` used,
+                # and a take can legitimately be verified while carrying no number at all now (see
+                # `target_name`'s own docstring). A take with no accumulated events under its key
+                # simply has no running counts to show -- the panel already renders `counts=None`
+                # honestly, so this degrades to "no counts yet", never a crash and never a
+                # fabricated zero for a player whose events genuinely weren't attributed.
+                progress = progress_by_number.get(identity.jersey_number)
+                counts = progress.advance_to(t) if progress is not None else None
             _draw_live_panel(frame, take_id, identity, counts, frame_status)
 
             if take is not None and t < take.t_start + _BANNER_SECONDS:

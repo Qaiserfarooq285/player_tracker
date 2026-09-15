@@ -116,7 +116,7 @@ def build_event_timeline_rows(events: list[Event]) -> list[dict]:
 
 
 def render_statcard_markdown(
-    jersey_number: int,
+    jersey_number: int | None,
     counts: dict[str, int],
     possession_seconds: float | None,
     distance_result: dict | None,
@@ -173,7 +173,15 @@ def render_statcard_markdown(
     lines = [
         "# Player Statistics",
         "",
-        f"## Player #{jersey_number}",
+        # `## Player #10` whenever a number is known (CLAUDE.md §13.2's exact template,
+        # unchanged). A target the human clicked whose number was never legible is named for what
+        # it IS rather than printed as `#None` -- Golden Rule 5, reachable since 2026-09-15 (see
+        # `src.pipeline.annotated_video.target_name`).
+        (
+            f"## Player #{jersey_number}"
+            if jersey_number is not None
+            else "## Target player (jersey number not readable)"
+        ),
         "",
         f"**Identity Status:** {identity_status}",
         "",
@@ -250,7 +258,7 @@ def _cut_category_reel(
 
 def write_player_output(
     player_dir: Path,
-    jersey_number: int,
+    jersey_number: int | None,
     events: list[Event],
     possession_seconds: float | None,
     distance_result: dict | None,
@@ -325,7 +333,11 @@ def write_player_output(
             exc_info=True,
         )
 
-    drops = DropCounter(f"player_{jersey_number}_highlights")
+    # Label the counter by whatever identity this target actually has -- `player_None_highlights`
+    # in a log line is just noise (see `_player_dir_name` in `src.pipeline.run` for the same rule
+    # applied to the on-disk folder).
+    label = f"player_{jersey_number}" if jersey_number is not None else "target"
+    drops = DropCounter(f"{label}_highlights")
     events_by_type: dict[EventType, list[Event]] = {}
     for ev in events:
         events_by_type.setdefault(ev.type, []).append(ev)
@@ -338,4 +350,4 @@ def write_player_output(
 
     dropped = drops.report()
     if dropped:
-        logger.info("player_%d highlight cutting drops: %s", jersey_number, dropped)
+        logger.info("player_%s highlight cutting drops: %s", jersey_number, dropped)
