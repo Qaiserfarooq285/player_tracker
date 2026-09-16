@@ -396,31 +396,38 @@ def test_compute_distance_covered_unknown_track_id_contributes_nothing():
 
 
 def test_detect_passes_debounces_rapid_repeats_for_the_same_passer():
-    """Player 1 passes to 2 at t=0.2 (passer=1), then immediately regains the ball and 'passes'
-    again to 3 at t=0.4 (would-be passer=1 again, gap=0.1s -- well under pass_min_gap_s=1.0). Real
+    """Player 1 passes to 2 at t=0.6 (passer=1), then quickly regains the ball and 'passes'
+    again to 3 at t=1.2 (would-be passer=1 again, 0.3s after the first -- well under
+    pass_min_gap_s=1.0). Real
     bug this closes, measured 2026-09-02 on clip1_43: exactly this pattern fired 9 PASS events in
-    an 11s clip. Only the FIRST pass by player 1 may count."""
+    an 11s clip. Only the FIRST pass by player 1 may count.
+
+    Timings scaled x3 on 2026-09-16 when `pass.pass_min_flight_s` (0.25s) landed: the original
+    0.1-0.2s ball-flight gaps were never physically plausible (a kicked ball is out of everyone's
+    possession for longer than a frame or two) and are exactly the flicker that floor now
+    rejects. Every debounce relationship is preserved; only the flights are now real.
+    """
     cfg = _events_config()
     p1 = _player(
         1,
         take_id=0,
-        boxes=[_box(0.0, 100.0, 100.0), _box(0.3, 100.0, 100.0)],
+        boxes=[_box(0, 100.0, 100.0), _box(0.9, 100.0, 100.0)],
         team=0,
         team_confidence=0.9,
     )
-    p2 = _player(2, take_id=0, boxes=[_box(0.2, 200.0, 100.0)], team=0, team_confidence=0.9)
-    p3 = _player(3, take_id=0, boxes=[_box(0.4, 300.0, 100.0)], team=0, team_confidence=0.9)
+    p2 = _player(2, take_id=0, boxes=[_box(0.6, 200.0, 100.0)], team=0, team_confidence=0.9)
+    p3 = _player(3, take_id=0, boxes=[_box(1.2, 300.0, 100.0)], team=0, team_confidence=0.9)
     balls = [
-        _ball(0.0, 100.0, 100.0),
-        _ball(0.2, 200.0, 100.0),
-        _ball(0.3, 100.0, 100.0),
-        _ball(0.4, 300.0, 100.0),
+        _ball(0, 100.0, 100.0),
+        _ball(0.6, 200.0, 100.0),
+        _ball(0.9, 100.0, 100.0),
+        _ball(1.2, 300.0, 100.0),
     ]
     runs = possession.possession_runs_for_take(balls, [p1, p2, p3], cfg)
     events = possession.detect_passes(runs, [p1, p2, p3], take_id=0, events_cfg=cfg)
     passes_by_1 = [e for e in events if e.type == EventType.PASS and e.player_track_id == 1]
     assert len(passes_by_1) == 1, "the second rapid-fire pass by the same player must be debounced"
-    assert passes_by_1[0].t_end == pytest.approx(0.2)
+    assert passes_by_1[0].t_end == pytest.approx(0.6)
 
 
 def test_detect_passes_allows_a_second_pass_after_the_debounce_window():
@@ -430,17 +437,17 @@ def test_detect_passes_allows_a_second_pass_after_the_debounce_window():
     p1 = _player(
         1,
         take_id=0,
-        boxes=[_box(0.0, 100.0, 100.0), _box(5.0, 100.0, 100.0)],
+        boxes=[_box(0, 100.0, 100.0), _box(15, 100.0, 100.0)],
         team=0,
         team_confidence=0.9,
     )
-    p2 = _player(2, take_id=0, boxes=[_box(0.2, 200.0, 100.0)], team=0, team_confidence=0.9)
-    p3 = _player(3, take_id=0, boxes=[_box(5.2, 300.0, 100.0)], team=0, team_confidence=0.9)
+    p2 = _player(2, take_id=0, boxes=[_box(0.6, 200.0, 100.0)], team=0, team_confidence=0.9)
+    p3 = _player(3, take_id=0, boxes=[_box(15.6, 300.0, 100.0)], team=0, team_confidence=0.9)
     balls = [
-        _ball(0.0, 100.0, 100.0),
-        _ball(0.2, 200.0, 100.0),
-        _ball(5.0, 100.0, 100.0),
-        _ball(5.2, 300.0, 100.0),
+        _ball(0, 100.0, 100.0),
+        _ball(0.6, 200.0, 100.0),
+        _ball(15, 100.0, 100.0),
+        _ball(15.6, 300.0, 100.0),
     ]
     runs = possession.possession_runs_for_take(balls, [p1, p2, p3], cfg)
     events = possession.detect_passes(runs, [p1, p2, p3], take_id=0, events_cfg=cfg)
@@ -455,26 +462,26 @@ def test_detect_passes_debounce_is_per_passer_not_global():
     p1 = _player(
         1,
         take_id=0,
-        boxes=[_box(0.0, 100.0, 100.0), _box(0.3, 100.0, 100.0)],
+        boxes=[_box(0, 100.0, 100.0), _box(0.9, 100.0, 100.0)],
         team=0,
         team_confidence=0.9,
     )
-    p2 = _player(2, take_id=0, boxes=[_box(0.2, 200.0, 100.0)], team=0, team_confidence=0.9)
-    p3 = _player(3, take_id=0, boxes=[_box(0.4, 300.0, 100.0)], team=0, team_confidence=0.9)
+    p2 = _player(2, take_id=0, boxes=[_box(0.6, 200.0, 100.0)], team=0, team_confidence=0.9)
+    p3 = _player(3, take_id=0, boxes=[_box(1.2, 300.0, 100.0)], team=0, team_confidence=0.9)
     # A second, entirely independent passer/receiver pair, well OUTSIDE the first sequence's own
     # time range -- detect_passes pairs run ADJACENCY across the take's full merged timeline
     # (unaffected by this fix), so an overlapping-time pair would interleave with player 1's own
     # runs rather than forming its own independent adjacent pair; separating them in time isolates
     # exactly the property under test (debounce state is keyed per identity, never shared).
-    p4 = _player(4, take_id=0, boxes=[_box(10.0, 900.0, 900.0)], team=0, team_confidence=0.9)
-    p5 = _player(5, take_id=0, boxes=[_box(10.2, 1000.0, 900.0)], team=0, team_confidence=0.9)
+    p4 = _player(4, take_id=0, boxes=[_box(30, 900.0, 900.0)], team=0, team_confidence=0.9)
+    p5 = _player(5, take_id=0, boxes=[_box(30.6, 1000.0, 900.0)], team=0, team_confidence=0.9)
     balls = [
-        _ball(0.0, 100.0, 100.0),
-        _ball(0.2, 200.0, 100.0),
-        _ball(0.3, 100.0, 100.0),
-        _ball(0.4, 300.0, 100.0),
-        _ball(10.0, 900.0, 900.0),
-        _ball(10.2, 1000.0, 900.0),
+        _ball(0, 100.0, 100.0),
+        _ball(0.6, 200.0, 100.0),
+        _ball(0.9, 100.0, 100.0),
+        _ball(1.2, 300.0, 100.0),
+        _ball(30, 900.0, 900.0),
+        _ball(30.6, 1000.0, 900.0),
     ]
     runs = possession.possession_runs_for_take(balls, [p1, p2, p3, p4, p5], cfg)
     events = possession.detect_passes(runs, [p1, p2, p3, p4, p5], take_id=0, events_cfg=cfg)
@@ -543,3 +550,49 @@ def test_teammates_test_none_kit_lab_dict_is_exactly_the_old_cluster_only_behavi
     assert (
         result is None
     )  # low team_confidence, no colour data supplied -> can't tell, same as before
+
+
+def test_detect_passes_rejects_a_single_frame_flight_as_flicker():
+    """Owner-reported 2026-09-16 ("for 1 pass it counts 5"). Measured on clip5_77: every false
+    positive had the ball "in flight" for 1-6 frames -- possession flickering between adjacent
+    players. A kicked ball is out of everyone's possession for the whole time it travels, so a
+    one-frame gap is physically only possible if the players are touching. Must be dropped and
+    LOGGED (never a silent filter)."""
+    from src.common.logging import DropCounter
+
+    cfg = _events_config()
+    p1 = _player(1, take_id=0, boxes=[_box(0.0, 100.0, 100.0)], team=0, team_confidence=0.9)
+    p2 = _player(2, take_id=0, boxes=[_box(0.033, 300.0, 100.0)], team=0, team_confidence=0.9)
+    balls = [_ball(0.0, 100.0, 100.0), _ball(0.033, 300.0, 100.0)]  # one frame at 30fps
+    runs = possession.possession_runs_for_take(balls, [p1, p2], cfg)
+    drops = DropCounter("t")
+    events = possession.detect_passes(runs, [p1, p2], take_id=0, events_cfg=cfg, drops=drops)
+    assert not [e for e in events if e.type == EventType.PASS]
+    assert drops.as_dict().get("pass_flight_too_short", 0) >= 1
+
+
+def test_detect_passes_rejects_ball_that_did_not_travel():
+    """Companion floor: a ball that 'moved' a few dozen px (measured 38px on clip5_77 at
+    t=10.87) is detection jitter, not a pass -- even with a plausible flight time."""
+    from src.common.logging import DropCounter
+
+    cfg = _events_config()
+    p1 = _player(1, take_id=0, boxes=[_box(0.0, 100.0, 100.0)], team=0, team_confidence=0.9)
+    p2 = _player(2, take_id=0, boxes=[_box(0.5, 130.0, 100.0)], team=0, team_confidence=0.9)
+    balls = [_ball(0.0, 100.0, 100.0), _ball(0.5, 130.0, 100.0)]  # 30px, 0.5s
+    runs = possession.possession_runs_for_take(balls, [p1, p2], cfg)
+    drops = DropCounter("t")
+    events = possession.detect_passes(runs, [p1, p2], take_id=0, events_cfg=cfg, drops=drops)
+    assert not [e for e in events if e.type == EventType.PASS]
+    assert drops.as_dict().get("pass_ball_travel_too_short", 0) >= 1
+
+
+def test_detect_passes_still_counts_a_real_pass_with_plausible_flight_and_travel():
+    """The floors must not eat a genuine pass: 0.5s in flight, 200px of travel, teammate."""
+    cfg = _events_config()
+    p1 = _player(1, take_id=0, boxes=[_box(0.0, 100.0, 100.0)], team=0, team_confidence=0.9)
+    p2 = _player(2, take_id=0, boxes=[_box(0.5, 300.0, 100.0)], team=0, team_confidence=0.9)
+    balls = [_ball(0.0, 100.0, 100.0), _ball(0.5, 300.0, 100.0)]
+    runs = possession.possession_runs_for_take(balls, [p1, p2], cfg)
+    events = possession.detect_passes(runs, [p1, p2], take_id=0, events_cfg=cfg)
+    assert len([e for e in events if e.type == EventType.PASS]) == 1

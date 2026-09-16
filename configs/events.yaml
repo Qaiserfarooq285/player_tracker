@@ -416,6 +416,29 @@ pass:
   # deliberately strict floor -- the shortest plausible real gap between two GENUINELY separate
   # passes by the same player (ball leaves, reaches a teammate, comes back around) -- per the
   # owner's own stated preference for pass counting ("strict -- fewer, high-confidence").
+  pass_min_flight_s: 0.25 # Owner-reported 2026-09-16: "for 1 pass it counts 5". ⚠️ MEASURED
+  # root cause on clip5_77 (14s take): the detector emitted 25 PASS events across ALL players
+  # -- nearly two per second -- and every one of the 5 attributed to the target had the ball "in
+  # flight" (passer's run END -> receiver's run START) for only 0.03-0.10s, i.e. ONE TO THREE FRAMES
+  # at 30fps; across all 25 the median gap was exactly 0.033s (one frame) and the MAX was 0.20s.
+  # A kicked ball is out of anyone's possession for the whole time it travels; a gap of one frame
+  # is physically possible only if the two players are touching -- it is the possession heuristic
+  # flickering between adjacent players, not a pass. The pre-existing gate only capped the gap
+  # from ABOVE (`pass_max_gap_s`); it had no floor, so single-frame handoffs passed straight
+  # through. This floor sits above every false positive measured (all <= 0.20s) while permitting
+  # a genuinely short lay-off (~7-8 frames; a ball at even 5 m/s covers ~1.25m in this time, so it
+  # cannot exclude a real pass between two players who are not physically touching). Compared in
+  # real seconds against run timestamps -- FPS-independent, same as `pass_min_gap_s` below.
+  # ⚠️ REASONED against the measured false-positive distribution, NOT validated against
+  # hand-labeled real pass sequences -- consistent with the owner's stated preference for pass
+  # counting ("strict -- fewer, high-confidence") and Golden Rule 5 (unknown beats false).
+  pass_min_travel_px: 60 # ⚠️ REASONED -- same px unit and coordinate space as `pass_max_dist`
+  # above (kept in px, not bbox-heights, purely so the two bounds on ONE quantity share a unit).
+  # Companion floor to `pass_min_flight_s`: one measured false positive on clip5_77 (t=10.87)
+  # moved the ball only 38px in a single frame -- ball-detection jitter, not travel. 60px is well
+  # under any player's own width at this stage's ~1920px-wide coordinate space (`pass_max_dist`'s
+  # own measured p75 player spacing is 662-769px), so a real pass to a teammate standing even
+  # arm's-length away clears it comfortably; only a ball that did not actually go anywhere fails.
   pass_max_gap_s: 2.0 # generous enough for the ball to travel `pass_max_dist` in flight without
   # anyone else registering as "in possession" in between, informally calibrated the same way
   # `shot.ball_speed_threshold` is (no direct ball-flight-time measurement on this footage,

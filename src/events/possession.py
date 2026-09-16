@@ -408,6 +408,15 @@ def detect_passes(
             if drops is not None:
                 drops.drop("pass_gap_too_large")
             continue
+        # The ball must actually be IN FLIGHT between the two possessions. Owner-reported
+        # 2026-09-16 ("for 1 pass it counts 5"): every false positive measured on clip5_77 had a
+        # gap of 1-6 frames -- possession flickering between adjacent players, not a kicked ball,
+        # which is out of anyone's possession for the whole time it travels. See
+        # `configs/events.yaml: pass.pass_min_flight_s` for the measurement. Logged, never silent.
+        if gap < pass_cfg["pass_min_flight_s"]:
+            if drops is not None:
+                drops.drop("pass_flight_too_short")
+            continue
 
         last_t = last_pass_t.get(run_a.identity)
         if last_t is not None and (run_a.t_end - last_t) < pass_cfg["pass_min_gap_s"]:
@@ -419,6 +428,12 @@ def detect_passes(
         if travel > pass_cfg["pass_max_dist"]:
             if drops is not None:
                 drops.drop("pass_ball_travel_too_far")
+            continue
+        # ...and it must actually have gone somewhere: a ball that "moved" a few dozen px in one
+        # frame is detection jitter (measured: 38px at t=10.87 on clip5_77), not a pass.
+        if travel < pass_cfg["pass_min_travel_px"]:
+            if drops is not None:
+                drops.drop("pass_ball_travel_too_short")
             continue
 
         raw_a = run_a.samples[-1][1]
