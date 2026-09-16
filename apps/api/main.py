@@ -24,6 +24,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from apps.api.access import DEFAULT_ACCESS_PASSWORD, resolve_access_password
+from apps.api.idle_stop import watchdog_from_env
 from src.common.logging import get_logger
 
 # `src.pipeline.statcard_pdf` (unlike e.g. `src.track.target`/`src.identity.jersey_models`
@@ -114,16 +116,24 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------------------------
-# Access gate (hosted deployment, docs/DEPLOY.md). When `PV_ACCESS_PASSWORD` is set in the
-# environment, every request except the static UI, `/api/health`, and the login endpoints must
-# carry a valid session cookie -- otherwise anyone who finds the public URL can upload videos
-# and burn GPU credit. Unset (the local-dev default) ⇒ the gate is off and nothing changes.
+# Access gate (hosted deployment, docs/DEPLOY.md). ON BY DEFAULT (owner, 2026-09-16): every
+# request except the static UI, `/api/health`, and the login endpoints must carry a valid session
+# cookie -- otherwise anyone who finds the public URL can upload videos and burn GPU credit.
+# `PV_ACCESS_PASSWORD` unset ⇒ the built-in default password (`access.DEFAULT_ACCESS_PASSWORD`,
+# change it once the pod is up); the literal `off` disables the gate entirely (local editing only).
 #
 # The cookie value is an HMAC of the password under a per-process random key, so it can't be
 # forged without the password and a server restart invalidates old sessions (an acceptable
 # "log in again after a redeploy" cost -- no session store to persist or leak).
 # ---------------------------------------------------------------------------------------------
-ACCESS_PASSWORD = os.environ.get("PV_ACCESS_PASSWORD", "").strip()
+ACCESS_PASSWORD, ACCESS_PASSWORD_IS_DEFAULT = resolve_access_password(
+    os.environ.get("PV_ACCESS_PASSWORD")
+)
+if ACCESS_PASSWORD_IS_DEFAULT:
+    logger.warning(
+        "using the default access password (%s) -- set PV_ACCESS_PASSWORD to change it",
+        DEFAULT_ACCESS_PASSWORD,
+    )
 _SESSION_COOKIE = "pv_session"
 _SESSION_KEY = secrets.token_bytes(32)
 _SESSION_MAX_AGE_S = 30 * 24 * 3600
@@ -153,9 +163,12 @@ def _has_valid_session(request: Request) -> bool:
 
 @app.middleware("http")
 async def access_gate(request: Request, call_next):
-    if ACCESS_PASSWORD and not _is_public_path(request.url.path):
-        if not _has_valid_session(request):
+    if not _is_public_path(request.url.path):
+        if ACCESS_PASSWORD and not _has_valid_session(request):
             return JSONResponse(status_code=401, content={"detail": "login required"})
+        # Real, authenticated (or gate-disabled) API traffic counts as activity for the idle
+        # auto-stop watchdog -- a bare 401 probe against a public path never reaches here.
+        IDLE_WATCHDOG.touch()
     return await call_next(request)
 
 
@@ -214,6 +227,16 @@ JOBS: dict[str, dict[str, Any]] = {}
 # concurrent overwrite rather than a bad encode.
 _INFLIGHT_SLUGS: set[str] = set()
 _INFLIGHT_LOCK = threading.Lock()
+
+# Idle auto-stop (docs/DEPLOY.md "Idle auto-stop"): disabled unless RUNPOD_API_KEY/RUNPOD_POD_ID
+# are both set (docker/runpod.env.example). `_INFLIGHT_SLUGS` above is the exact "is a job
+# running" signal it needs, so it's read live via a closure rather than duplicated.
+IDLE_WATCHDOG = watchdog_from_env(lambda: len(_INFLIGHT_SLUGS))
+
+
+@app.on_event("startup")
+def _start_idle_watchdog() -> None:
+    IDLE_WATCHDOG.start()
 
 
 class TargetAnchor(BaseModel):
@@ -284,6 +307,7 @@ def get_health():
         "gpu_name": gpu_name,
         "input_dir": str(INPUT_DIR),
         "output_dir": str(OUTPUT_DIR),
+        "idle_stop": IDLE_WATCHDOG.status(),
     }
 
 

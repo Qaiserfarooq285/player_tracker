@@ -9,7 +9,13 @@
 # takes ~10 min (deps + weights); every boot after that skips straight to starting the server.
 #
 # Environment (set on the RunPod template):
-#   PV_ACCESS_PASSWORD       password for the web UI -- REQUIRED for anything public
+#   PV_ACCESS_PASSWORD       password for the web UI. ON BY DEFAULT even if unset (the built-in
+#                            `admin1122`, apps/api/access.py) -- change it once the pod is public;
+#                            `off` disables the gate (local editing only, never on a hosted pod).
+#   RUNPOD_API_KEY           (optional) enables idle auto-stop -- RunPod -> Settings -> API Keys ->
+#                            Restricted, pods read/write. RUNPOD_POD_ID is injected automatically.
+#   PV_IDLE_STOP_MINUTES     (optional) minutes of no requests + no job before the pod self-stops,
+#                            default 30. Only takes effect when RUNPOD_API_KEY is set.
 #   CLOUDFLARE_TUNNEL_TOKEN  (optional) token from Cloudflare Zero Trust -> your own domain
 #   GEMINI_API_KEY           (optional) same meaning as in .env.example
 #   PORT                     listen port, default 8000 (expose the same port as HTTP on the pod)
@@ -93,7 +99,7 @@ if [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
 fi
 
 if [ -z "${PV_ACCESS_PASSWORD:-}" ]; then
-  log "WARNING: PV_ACCESS_PASSWORD is not set -- anyone with the URL can use this GPU"
+  log "using the default access password -- set PV_ACCESS_PASSWORD on the template to change it"
 fi
 
 log "starting server on port $PORT"

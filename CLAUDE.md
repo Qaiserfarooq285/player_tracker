@@ -357,10 +357,12 @@ make test      # unit tests (contracts, ANNOTATION PARSER (ADR-19), colour pass/
                #             ranking, dedupe, speed calc)
 make lint      # ruff + black
 make models    # fetch + checksum-verify the three model checkpoints into models/ (idempotent)
-make serve     # web UI + API on :8000 (PV_DEV=1 = auto-reload for local editing only;
-               #  PV_ACCESS_PASSWORD=... = login gate). HOSTING: docs/DEPLOY.md -- RunPod pod +
-               #  network volume bootstrapped by docker/runpod_bootstrap.sh, Hostinger domain via
-               #  Cloudflare Tunnel. Uploads are chunked (Cloudflare's 100 MB/request cap).
+make serve     # web UI + API on :8000 (PV_DEV=1 = auto-reload for local editing only; login gate
+               #  is ON BY DEFAULT -- default password `admin1122`, PV_ACCESS_PASSWORD=... to
+               #  change it, PV_ACCESS_PASSWORD=off to disable). HOSTING: docs/DEPLOY.md -- RunPod
+               #  pod + network volume bootstrapped by docker/runpod_bootstrap.sh, Hostinger domain
+               #  via Cloudflare Tunnel, idle auto-stop via RUNPOD_API_KEY. Uploads are chunked
+               #  (Cloudflare's 100 MB/request cap).
 scripts/download_soccernet.py   # --list (no password) or pulls one broadcast clip into input/
                                  # (needs SOCCERNET_PASSWORD in .env, from the NDA form at soccer-net.org)
                                  # -- kept as the GOOD-QUALITY control input (§3.4); "high-quality when needed"

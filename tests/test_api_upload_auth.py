@@ -1,7 +1,9 @@
 """Hosted-deployment API behaviours (docs/DEPLOY.md, 2026-09-16): the chunked upload endpoint the
-web UI now uses (Cloudflare caps one request body at 100 MB, a 4K clip is bigger) and the optional
-`PV_ACCESS_PASSWORD` session gate. Same isolation pattern as `test_api_download_statcard.py`:
-`INPUT_DIR` is monkeypatched to `tmp_path`, so nothing here touches the real `input/`."""
+web UI now uses (Cloudflare caps one request body at 100 MB, a 4K clip is bigger) and the
+`PV_ACCESS_PASSWORD` session gate, which is ON BY DEFAULT (built-in `admin1122`,
+`apps/api/access.py`) unless explicitly turned `off`. Same isolation pattern as
+`test_api_download_statcard.py`: `INPUT_DIR` is monkeypatched to `tmp_path`, so nothing here
+touches the real `input/`."""
 
 from __future__ import annotations
 
@@ -9,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import apps.api.main as api_main
+from apps.api.access import DEFAULT_ACCESS_PASSWORD, resolve_access_password
 
 
 @pytest.fixture
@@ -78,10 +81,41 @@ def test_bad_upload_id_is_rejected(client):
 # ---------------------------------------------------------------- access gate
 
 
-def test_gate_is_off_when_no_password_configured(client, monkeypatch):
+def test_gate_is_off_when_access_password_is_empty(client, monkeypatch):
+    # What `PV_ACCESS_PASSWORD=off` resolves to (apps.api.access.resolve_access_password) -- the
+    # gate itself only ever looks at `ACCESS_PASSWORD`, so patching it directly here is equivalent
+    # and keeps this test decoupled from env-var parsing (covered separately below).
     monkeypatch.setattr(api_main, "ACCESS_PASSWORD", "")
     assert client.get("/api/auth/status").json() == {"required": False, "authenticated": True}
     assert client.get("/api/videos").status_code == 200
+
+
+def test_gate_is_on_by_default_with_admin1122(client, monkeypatch):
+    # Simulates a deployment where PV_ACCESS_PASSWORD was never set: main.py's own module-level
+    # resolution already does this at import time (via resolve_access_password), so this exercises
+    # the same default value the real gate falls back to.
+    monkeypatch.setattr(api_main, "ACCESS_PASSWORD", api_main.DEFAULT_ACCESS_PASSWORD)
+    assert client.get("/api/auth/status").json() == {"required": True, "authenticated": False}
+    assert client.get("/api/videos").status_code == 401
+    monkeypatch.setattr(api_main, "_LOGIN_FAIL_DELAY_S", 0.0)
+    r = client.post("/api/login", json={"password": "admin1122"})
+    assert r.status_code == 200
+    assert api_main._SESSION_COOKIE in r.cookies
+    assert client.get("/api/videos").status_code == 200
+
+
+@pytest.mark.parametrize(
+    "raw, expected_password, expected_is_default",
+    [
+        (None, DEFAULT_ACCESS_PASSWORD, True),
+        ("custom", "custom", False),
+        ("off", "", False),
+        ("OFF", "", False),
+        ("  ", DEFAULT_ACCESS_PASSWORD, True),
+    ],
+)
+def test_resolve_access_password(raw, expected_password, expected_is_default):
+    assert resolve_access_password(raw) == (expected_password, expected_is_default)
 
 
 def test_gate_blocks_api_until_login_then_allows(client, monkeypatch):

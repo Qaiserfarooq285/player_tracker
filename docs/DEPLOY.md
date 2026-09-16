@@ -64,7 +64,7 @@ RunPod → **Templates** → **New Template**:
 | Expose HTTP ports | `8000` |
 | Expose TCP ports | `22` (optional, for SSH debugging) |
 | **Container start command** | `bash -c "curl -fsSL https://raw.githubusercontent.com/Qaiserfarooq285/payertracker/master/docker/runpod_bootstrap.sh \| bash"` — copy it from the top of [`docker/runpod_bootstrap.sh`](../docker/runpod_bootstrap.sh) without the `\|` escaping |
-| Environment variables | see [`docker/runpod.env.example`](../docker/runpod.env.example): **`PV_ACCESS_PASSWORD`** (required), `CLOUDFLARE_TUNNEL_TOKEN` (after step 4), `GEMINI_API_KEY` (optional) |
+| Environment variables | see [`docker/runpod.env.example`](../docker/runpod.env.example): **`PV_ACCESS_PASSWORD`** (optional — defaults to `admin1122` if left unset, change it), `RUNPOD_API_KEY` (optional, enables idle auto-stop — §"Idle auto-stop" below), `CLOUDFLARE_TUNNEL_TOKEN` (after step 4), `GEMINI_API_KEY` (optional) |
 
 Save the template.
 
@@ -82,6 +82,15 @@ Save the template.
    Enter your access password. Upload a clip, run it — this is the full app on the GPU.
 
 Every later boot skips the install and starts in ~30 s.
+
+### Login
+
+The web UI is gated by a single shared password — the whole point is "after deployment it
+should be used by us only", not a per-user account system. **The gate is ON out of the box**:
+leave `PV_ACCESS_PASSWORD` unset and the pod accepts the built-in default, **`admin1122`**. Set
+`PV_ACCESS_PASSWORD` on the template to your own password to change it (Restart to apply).
+`PV_ACCESS_PASSWORD=off` disables the gate entirely — only ever do that for local editing on
+your own machine, never on a hosted pod.
 
 ## 4. Your Hostinger domain → the pod (Cloudflare Tunnel, 15 min + DNS wait)
 
@@ -124,10 +133,28 @@ bypasses Cloudflare, which is why the in-app password still matters.)
 | Watch logs | Pod → Logs; tunnel log at `/workspace/cloudflared.log`; RunPod's own services at `/workspace/runpod-start.log`. |
 | Health | `https://app.yourdomain.com/api/health` (public, no login) shows the GPU the server sees. |
 
+### Idle auto-stop (recommended — saves credit)
+
+Forgetting to press Stop is the single most expensive mistake with a metered pod. Set it up once
+and the pod stops itself:
+
+1. RunPod → **Settings → API Keys → Create API Key** → type *Restricted* → give it the **pods**
+   permission, read/write → Create → copy the key.
+2. Paste it into the template's `RUNPOD_API_KEY` env var → Restart the pod. `RUNPOD_POD_ID` needs
+   no setup — RunPod injects it into every pod automatically.
+3. That's it. The pod now stops itself after `PV_IDLE_STOP_MINUTES` (default 30) with **no HTTP
+   requests and no pipeline job running** — checked every minute in the background
+   (`apps/api/idle_stop.py`). Nothing is lost: the network volume (checkout, `input/`, `work/`,
+   `output/`) persists across a stop exactly like a manual Stop. **Start** it again from the
+   RunPod console when you're back.
+4. `https://app.yourdomain.com/api/health` → `idle_stop.enabled` confirms it's armed (`false`
+   until `RUNPOD_API_KEY` is filled in — off by default, matching the blank env template).
+
 ## Troubleshooting
 
 - **Login overlay never accepts the password** → the pod's `PV_ACCESS_PASSWORD` has trailing
-  spaces or you edited it without restarting. Check the pod log's startup banner: `Access gate: ON`.
+  spaces or you edited it without restarting. Check the pod log's startup banner: `Access gate: ON`
+  (or `ON (default password...)` if you left it unset — the gate is on either way).
 - **`/api/health` says `gpu_available: false`** → the pod was deployed without a GPU or the
   driver is older than the CUDA 12.4 wheels; redeploy on a different host.
 - **Upload dies at ~100 MB** → you're hitting Cloudflare's per-request cap with the old
@@ -144,7 +171,8 @@ bypasses Cloudflare, which is why the in-app password still matters.)
 
 ## Costs, honestly (check current RunPod prices — they move)
 
-- GPU pod: roughly **$0.20–0.70 / hour while running**, by card. Stop it when idle.
+- GPU pod: roughly **$0.20–0.70 / hour while running**, by card. Stop it when idle, or set up
+  **idle auto-stop** above so a forgotten tab doesn't run the meter overnight.
 - Network volume: **~$0.07 / GB-month** → 60 GB ≈ $4 / month.
 - Cloudflare (domain proxy, tunnel, Access ≤ 50 users): **$0**.
 - Hostinger: whatever the domain renewal already costs; no hosting plan is needed for this.
