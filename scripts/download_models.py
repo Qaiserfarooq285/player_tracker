@@ -67,28 +67,30 @@ def _check(path: Path, expected: str | None, label: str) -> None:
 
 
 def fetch_rfdetr() -> None:
-    from huggingface_hub import hf_hub_download
-
     RFDETR_DIR.mkdir(parents=True, exist_ok=True)
     for name, sha in RFDETR_FILES.items():
         dest = RFDETR_DIR / name
         if _ok(dest, sha):
             print(f"  have {dest.relative_to(ROOT)}")
             continue
+        # Imported only when a download is actually needed: the `detect` extra brings it in, but
+        # a machine that already has the weights must not need it just to pass this check.
+        from huggingface_hub import hf_hub_download
+
         print(f"  downloading {RFDETR_REPO}/{name} ...")
         hf_hub_download(RFDETR_REPO, name, local_dir=str(RFDETR_DIR))
         _check(dest, sha, name)
 
 
 def fetch_jersey() -> None:
-    import gdown
-
     JERSEY_DIR.mkdir(parents=True, exist_ok=True)
     for name, (gdrive_id, sha) in JERSEY_FILES.items():
         dest = JERSEY_DIR / name
         if _ok(dest, sha):
             print(f"  have {dest.relative_to(ROOT)}")
             continue
+        import gdown  # same reason as above (`jersey_parseq` extra)
+
         print(f"  downloading Google Drive id={gdrive_id} -> {name} ...")
         gdown.download(id=gdrive_id, output=str(dest), quiet=False)
         _check(dest, sha, name)
