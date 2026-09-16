@@ -7,11 +7,64 @@ let pollingTimer = null;
 let currentResults = null;
 let pitchMode = 'trajectory';
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+  initLoginGate();
+  await ensureAuthenticated();
   initApp();
   initUploadZone();
   initCanvasPitch();
 });
+
+// ---- Access gate (hosted deployment, docs/DEPLOY.md) ----
+// The server only enforces a password when PV_ACCESS_PASSWORD is set; locally the overlay never
+// appears. Any later 401 (session expired after a redeploy) re-opens it via `fetch` below.
+let _loginResolvers = [];
+function showLoginOverlay() {
+  document.getElementById('login-overlay')?.classList.remove('hidden');
+  document.getElementById('login-password')?.focus();
+  return new Promise(resolve => _loginResolvers.push(resolve));
+}
+function initLoginGate() {
+  const form = document.getElementById('login-form');
+  if (!form) return;
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const pw = document.getElementById('login-password').value;
+    const err = document.getElementById('login-error');
+    err.classList.add('hidden');
+    const res = await _rawFetch('/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pw }),
+    });
+    if (res.ok) {
+      document.getElementById('login-overlay').classList.add('hidden');
+      document.getElementById('login-password').value = '';
+      _loginResolvers.splice(0).forEach(r => r());
+    } else {
+      err.textContent = res.status === 401 ? 'Wrong password.' : `Login failed (${res.status}).`;
+      err.classList.remove('hidden');
+    }
+  });
+}
+async function ensureAuthenticated() {
+  try {
+    const res = await _rawFetch('/api/auth/status');
+    const data = await res.json();
+    if (data.required && !data.authenticated) await showLoginOverlay();
+  } catch (err) {
+    console.warn('auth status check failed:', err);
+  }
+}
+// Every API call goes through window.fetch; a 401 means "log in, then retry the same request".
+const _rawFetch = window.fetch.bind(window);
+window.fetch = async function (input, init) {
+  const res = await _rawFetch(input, init);
+  if (res.status !== 401) return res;
+  const url = typeof input === 'string' ? input : (input && input.url) || '';
+  if (url.includes('/api/login') || url.includes('/api/auth/status')) return res;
+  await showLoginOverlay();
+  return _rawFetch(input, init);
+};
 
 // "streamed-gathering-treehouse" plan Fix D, 2026-09-15: the player currently shown in the
 // results dashboard -- starts as whatever `primary_player` the backend resolved (the run's real
@@ -365,17 +418,40 @@ function initUploadZone() {
   });
 }
 
+// Chunk size for uploads. Hosted deployments sit behind Cloudflare, whose free plan rejects any
+// single request body over 100 MB -- a 4K clip is routinely several hundred MB -- so the browser
+// slices the file and the server (`/api/upload/chunk`) reassembles it. Well under the cap on
+// purpose: form-data framing adds a little, and a smaller slice retries cheaper on a flaky link.
+const UPLOAD_CHUNK_BYTES = 24 * 1024 * 1024;
+
+async function uploadInChunks(file) {
+  const uploadId = (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`)
+    .replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64);
+  const total = Math.max(1, Math.ceil(file.size / UPLOAD_CHUNK_BYTES));
+  let data = null;
+  for (let index = 0; index < total; index++) {
+    const start = index * UPLOAD_CHUNK_BYTES;
+    const formData = new FormData();
+    formData.append('upload_id', uploadId);
+    formData.append('index', String(index));
+    formData.append('total', String(total));
+    formData.append('filename', file.name);
+    formData.append('chunk', file.slice(start, start + UPLOAD_CHUNK_BYTES), file.name);
+    const res = await fetch('/api/upload/chunk', { method: 'POST', body: formData });
+    data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `chunk ${index + 1}/${total} failed (${res.status})`);
+    if (total > 1 && (index + 1) % 4 === 0 && index + 1 < total) {
+      logTerminal(`Uploading... ${Math.round(((index + 1) / total) * 100)}%`, 'info');
+    }
+  }
+  return data;
+}
+
 async function handleFileUpload(file) {
   logTerminal(`Uploading file '${file.name}' (${(file.size / 1024 / 1024).toFixed(2)} MB)...`, 'info');
-  const formData = new FormData();
-  formData.append('file', file);
 
   try {
-    const res = await fetch('/api/upload', {
-      method: 'POST',
-      body: formData,
-    });
-    const data = await res.json();
+    const data = await uploadInChunks(file);
     if (data.status === 'success') {
       logTerminal(`File uploaded successfully: ${data.filename}`, 'success');
       await loadVideos();

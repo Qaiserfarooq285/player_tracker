@@ -325,6 +325,7 @@ compute; QA vs ground truth; optional provider-data adapter; active-learning loo
 | `requests` (ADR-15 Gemini HTTP) | Apache-2.0 | ✅ |
 | `reportlab` (Plan Stage 3, 2026-09-14, `statcard.pdf` export, `api` extra) | BSD-3-Clause | ✅ |
 | **manual-annotation parser (ADR-19)** | stdlib `re` + PyYAML (BSD/MIT) | ✅ **no new dependency** |
+| `cloudflared` (host binary on the RunPod pod only, docs/DEPLOY.md; not a Python dep, not shipped in the product) | Apache-2.0 | ✅ |
 | `SoccerNet` (pip package, `scripts/download_soccernet.py`) | MIT | ✅ package code only — the video *data* it downloads is the separate, NDA-gated row below |
 | SigLIP weights (via `transformers`/`timm`) | Apache-2.0 | ✅ (verify weight card) |
 | TransNetV2 | MIT | ✅ |
@@ -355,6 +356,11 @@ make eval      # detection mAP + tracking HOTA (+ action mAP@1 later) on data/ev
 make test      # unit tests (contracts, ANNOTATION PARSER (ADR-19), colour pass/turnover (ADR-20),
                #             ranking, dedupe, speed calc)
 make lint      # ruff + black
+make models    # fetch + checksum-verify the three model checkpoints into models/ (idempotent)
+make serve     # web UI + API on :8000 (PV_DEV=1 = auto-reload for local editing only;
+               #  PV_ACCESS_PASSWORD=... = login gate). HOSTING: docs/DEPLOY.md -- RunPod pod +
+               #  network volume bootstrapped by docker/runpod_bootstrap.sh, Hostinger domain via
+               #  Cloudflare Tunnel. Uploads are chunked (Cloudflare's 100 MB/request cap).
 scripts/download_soccernet.py   # --list (no password) or pulls one broadcast clip into input/
                                  # (needs SOCCERNET_PASSWORD in .env, from the NDA form at soccer-net.org)
                                  # -- kept as the GOOD-QUALITY control input (§3.4); "high-quality when needed"

@@ -120,7 +120,14 @@ const documentStub = {
   createElement: () => makeElement(),
 };
 
-const sandbox = { document: documentStub, console, event: null };
+// `fetch`: every browser has it, and app.js wraps `window.fetch` at load time for the hosted
+// deployment's login gate (docs/DEPLOY.md). Never actually called by the click paths under test.
+const sandbox = {
+  document: documentStub,
+  console,
+  event: null,
+  fetch: async () => ({ ok: true, status: 200, json: async () => ({}) }),
+};
 sandbox.window = sandbox;
 const context = vm.createContext(sandbox);
 

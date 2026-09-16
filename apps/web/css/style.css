@@ -1121,3 +1121,27 @@ tbody tr:hover { background: var(--primary-soft); }
   .upload-dropzone:hover { transform: none; }
   .progress-bar-fill::after { display: none; }
 }
+
+
+/* ---- Access gate overlay (hosted deployment) ---- */
+.login-overlay {
+  position: fixed; inset: 0; z-index: 10000;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(7, 5, 18, 0.92); backdrop-filter: blur(10px);
+}
+.login-overlay.hidden { display: none; }
+.login-card {
+  width: min(92vw, 380px); padding: 2rem 1.75rem; text-align: center;
+  background: var(--bg-card); border: 1px solid var(--border-glow); border-radius: 18px;
+  box-shadow: var(--shadow-glow); display: flex; flex-direction: column; gap: 0.9rem;
+}
+.login-card .brand-icon { margin: 0 auto; }
+.login-card h2 { margin: 0; font-family: 'Outfit', sans-serif; letter-spacing: 0.04em; }
+.login-card p { margin: 0; opacity: 0.75; font-size: 0.9rem; }
+.login-card input {
+  padding: 0.75rem 0.9rem; border-radius: 10px; border: 1px solid var(--border-glow);
+  background: var(--bg-elevated); color: inherit; font-size: 1rem; outline: none;
+}
+.login-card input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+.login-error { color: var(--accent-pink); font-size: 0.85rem; }
+.login-error.hidden { display: none; }

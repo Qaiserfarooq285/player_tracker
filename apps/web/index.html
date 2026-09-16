@@ -13,6 +13,19 @@
 </head>
 <body class="dark-theme">
 
+  <!-- Access gate (hosted deployment, docs/DEPLOY.md). Hidden unless the server reports that a
+       password is configured and this browser has no session yet. -->
+  <div id="login-overlay" class="login-overlay hidden">
+    <form class="login-card" id="login-form" autocomplete="off">
+      <div class="brand-icon"><i class="fa-solid fa-lock"></i></div>
+      <h2>PitchVision AI</h2>
+      <p>This instance is private. Enter the access password to continue.</p>
+      <input type="password" id="login-password" placeholder="Access password" autofocus required>
+      <button type="submit" class="btn-primary"><i class="fa-solid fa-right-to-bracket"></i> Sign in</button>
+      <div class="login-error hidden" id="login-error"></div>
+    </form>
+  </div>
+
   <!-- Main Navigation Header -->
   <header class="navbar">
     <div class="nav-container">
@@ -33,7 +46,7 @@
         </div>
         <div class="status-badge model-badge">
           <i class="fa-solid fa-brain"></i>
-          <span>YOLO • ByteTrack • PARSeq</span>
+          <span>RF-DETR • ByteTrack • PARSeq</span>
         </div>
       </div>
     </div>

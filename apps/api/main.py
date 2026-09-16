@@ -4,9 +4,12 @@ Provides REST endpoints and media streaming for video upload, player detection, 
 jersey OCR, event detection, movement analytics, and stat card visualization.
 """
 
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -15,9 +18,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -109,6 +112,92 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------------------------
+# Access gate (hosted deployment, docs/DEPLOY.md). When `PV_ACCESS_PASSWORD` is set in the
+# environment, every request except the static UI, `/api/health`, and the login endpoints must
+# carry a valid session cookie -- otherwise anyone who finds the public URL can upload videos
+# and burn GPU credit. Unset (the local-dev default) ⇒ the gate is off and nothing changes.
+#
+# The cookie value is an HMAC of the password under a per-process random key, so it can't be
+# forged without the password and a server restart invalidates old sessions (an acceptable
+# "log in again after a redeploy" cost -- no session store to persist or leak).
+# ---------------------------------------------------------------------------------------------
+ACCESS_PASSWORD = os.environ.get("PV_ACCESS_PASSWORD", "").strip()
+_SESSION_COOKIE = "pv_session"
+_SESSION_KEY = secrets.token_bytes(32)
+_SESSION_MAX_AGE_S = 30 * 24 * 3600
+_LOGIN_FAIL_DELAY_S = 0.5  # crude brute-force brake; the password is a shared secret, not a user DB
+# Prefixes that never need a session: the UI shell itself (it renders the login overlay) and the
+# endpoints the overlay needs to work.
+_PUBLIC_PATH_PREFIXES = ("/api/health", "/api/login", "/api/auth/status")
+_PUBLIC_STATIC_PREFIXES = ("/css/", "/js/", "/favicon")
+
+
+def _session_token() -> str:
+    return hmac.new(_SESSION_KEY, ACCESS_PASSWORD.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _is_public_path(path: str) -> bool:
+    if path in ("/", "/index.html"):
+        return True
+    return path.startswith(_PUBLIC_PATH_PREFIXES) or path.startswith(_PUBLIC_STATIC_PREFIXES)
+
+
+def _has_valid_session(request: Request) -> bool:
+    if not ACCESS_PASSWORD:
+        return True
+    cookie = request.cookies.get(_SESSION_COOKIE, "")
+    return bool(cookie) and hmac.compare_digest(cookie, _session_token())
+
+
+@app.middleware("http")
+async def access_gate(request: Request, call_next):
+    if ACCESS_PASSWORD and not _is_public_path(request.url.path):
+        if not _has_valid_session(request):
+            return JSONResponse(status_code=401, content={"detail": "login required"})
+    return await call_next(request)
+
+
+class LoginRequest(BaseModel):
+    password: str
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request):
+    """Tells the UI whether a login is needed and whether this browser already has a session."""
+    return {"required": bool(ACCESS_PASSWORD), "authenticated": _has_valid_session(request)}
+
+
+@app.post("/api/login")
+def login(req: LoginRequest, request: Request):
+    if not ACCESS_PASSWORD:
+        return {"status": "ok", "required": False}
+    if not hmac.compare_digest(req.password.encode("utf-8"), ACCESS_PASSWORD.encode("utf-8")):
+        time.sleep(_LOGIN_FAIL_DELAY_S)
+        raise HTTPException(status_code=401, detail="wrong password")
+    # Behind Cloudflare Tunnel / RunPod's proxy the app itself only ever sees plain HTTP; the
+    # forwarded header is what tells us the browser is on HTTPS and the cookie may be Secure.
+    forwarded_proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    response = JSONResponse(content={"status": "ok", "required": True})
+    response.set_cookie(
+        _SESSION_COOKIE,
+        _session_token(),
+        max_age=_SESSION_MAX_AGE_S,
+        httponly=True,
+        samesite="lax",
+        secure=forwarded_proto == "https",
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/logout")
+def logout():
+    response = JSONResponse(content={"status": "ok"})
+    response.delete_cookie(_SESSION_COOKIE, path="/")
+    return response
+
 
 # Global in-memory job store for background processing tasks
 JOBS: dict[str, dict[str, Any]] = {}
@@ -246,23 +335,107 @@ def list_videos():
     }
 
 
+_ALLOWED_UPLOAD_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
+_UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+# Partial uploads live under INPUT_DIR so they end up on the same (persistent) volume as the final
+# file and the rename at the end is atomic; the leading dot keeps `/api/videos` from listing them.
+_UPLOAD_PART_DIRNAME = ".uploads"
+# In-memory progress per upload id -- the server runs as ONE uvicorn process (JOBS and the
+# in-flight guard already depend on that), so a dict is the right store here.
+_UPLOADS: dict[str, dict[str, Any]] = {}
+_UPLOADS_LOCK = threading.Lock()
+
+
+def _safe_upload_name(filename: str | None) -> str:
+    """Basename only, spaces -> underscores, and a video extension we can actually decode --
+    anything else is a 400, not a silently-accepted junk file in `input/`."""
+    name = Path(filename or f"upload_{int(time.time())}.mp4").name.replace(" ", "_")
+    if not name or name.startswith("."):
+        raise HTTPException(status_code=400, detail="invalid filename")
+    if Path(name).suffix.lower() not in _ALLOWED_UPLOAD_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported video type {Path(name).suffix!r}; "
+            f"use one of {sorted(_ALLOWED_UPLOAD_SUFFIXES)}",
+        )
+    return name
+
+
+def _upload_response(target_path: Path) -> dict[str, Any]:
+    return {
+        "status": "success",
+        "filename": target_path.name,
+        "size_mb": round(target_path.stat().st_size / (1024 * 1024), 2),
+        "path": str(target_path),
+    }
+
+
 @app.post("/api/upload")
 async def upload_video(file: UploadFile = File(...)):
-    """Upload a football video clip into the input directory."""
-    filename = file.filename or f"upload_{int(time.time())}.mp4"
-    # Clean filename
-    safe_name = Path(filename).name.replace(" ", "_")
+    """Upload a football video clip into the input directory in ONE request.
+
+    Kept for local use and scripts. The web UI uses `/api/upload/chunk` instead, because a hosted
+    deployment sits behind Cloudflare, which rejects any single request body over 100 MB -- and a
+    4K clip is routinely several hundred MB (docs/DEPLOY.md)."""
+    safe_name = _safe_upload_name(file.filename)
     target_path = INPUT_DIR / safe_name
 
     with open(target_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    return {
-        "status": "success",
-        "filename": safe_name,
-        "size_mb": round(target_path.stat().st_size / (1024 * 1024), 2),
-        "path": str(target_path),
-    }
+    return _upload_response(target_path)
+
+
+@app.post("/api/upload/chunk")
+async def upload_video_chunk(
+    upload_id: str = Form(...),
+    index: int = Form(...),
+    total: int = Form(...),
+    filename: str = Form(...),
+    chunk: UploadFile = File(...),
+):
+    """Upload one sequential slice of a video. The client picks `upload_id`, sends chunks
+    `0..total-1` in order, and the final chunk's response carries the same payload as
+    `/api/upload`. Out-of-order or unknown chunks are a 409/404, never silently appended."""
+    if not _UPLOAD_ID_RE.match(upload_id):
+        raise HTTPException(status_code=400, detail="invalid upload_id")
+    if total < 1 or not 0 <= index < total:
+        raise HTTPException(status_code=400, detail="index/total out of range")
+    safe_name = _safe_upload_name(filename)
+    part_dir = INPUT_DIR / _UPLOAD_PART_DIRNAME
+    part_dir.mkdir(parents=True, exist_ok=True)
+    part_path = part_dir / f"{upload_id}.part"
+
+    with _UPLOADS_LOCK:
+        state = _UPLOADS.get(upload_id)
+        if index == 0:
+            state = {"next": 0, "filename": safe_name, "total": total}
+            _UPLOADS[upload_id] = state
+        elif state is None:
+            raise HTTPException(status_code=404, detail="unknown upload_id (chunk 0 never arrived)")
+        if state["next"] != index:
+            raise HTTPException(
+                status_code=409,
+                detail=f"expected chunk {state['next']}, got {index}",
+            )
+        if state["total"] != total or state["filename"] != safe_name:
+            raise HTTPException(status_code=409, detail="upload metadata changed mid-stream")
+
+    with open(part_path, "wb" if index == 0 else "ab") as buffer:
+        shutil.copyfileobj(chunk.file, buffer)
+
+    with _UPLOADS_LOCK:
+        state["next"] = index + 1
+        complete = state["next"] == total
+        if complete:
+            _UPLOADS.pop(upload_id, None)
+
+    if not complete:
+        return {"status": "partial", "upload_id": upload_id, "received": index + 1, "total": total}
+
+    target_path = INPUT_DIR / safe_name
+    os.replace(part_path, target_path)
+    return _upload_response(target_path)
 
 
 def _read_jersey_hint(
@@ -1703,4 +1876,4 @@ if WEB_DIR.exists():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("apps.api.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("apps.api.main:app", host="0.0.0.0", port=8000, reload=False)

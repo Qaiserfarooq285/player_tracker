@@ -1,4 +1,4 @@
-.PHONY: setup install-gpu run eval test lint format clean-work profile
+.PHONY: setup install-gpu models serve run eval test lint format clean-work profile
 
 PYTHON := .venv/bin/python
 PIP    := .venv/bin/python -m pip
@@ -15,6 +15,16 @@ setup:
 install-gpu:
 	export PATH="$$HOME/.local/bin:$$PATH" && $(UV) pip install -e ".[detect,team,ocr,jersey_parseq]" \
 		--extra-index-url https://download.pytorch.org/whl/cu121
+
+# Fetch + checksum-verify the three model checkpoints into models/ (no-op once present).
+# Also what docker/runpod_bootstrap.sh runs on every pod boot (docs/DEPLOY.md).
+models:
+	$(PYTHON) scripts/download_models.py
+
+# Web UI + API on http://localhost:8000. PV_DEV=1 turns on uvicorn auto-reload for local editing
+# (never on a hosted pod: it kills in-flight jobs). PV_ACCESS_PASSWORD=... enables the login gate.
+serve:
+	$(PYTHON) start_app.py
 
 # Process the video(s) in input/ -> reel + stat card + report in output/ (resumable via work/).
 # CLAUDE.md §14: auto-branches per video (manual-annotation sidecar -> filename jersey -> ADR-15
