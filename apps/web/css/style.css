@@ -163,6 +163,12 @@ body.dark-theme {
   color: var(--primary);
 }
 
+/* GPU pod phases reported by the always-on gateway (apps/gateway/pod_manager.py). */
+.gpu-badge.pod-offline { border-color: rgba(148, 163, 184, 0.3); color: var(--text-muted); }
+.gpu-badge.pod-busy { border-color: rgba(34, 211, 238, 0.35); color: var(--accent-cyan); }
+.gpu-badge.pod-waiting { border-color: rgba(245, 158, 11, 0.45); color: #f59e0b; }
+.gpu-badge.pod-error { border-color: rgba(239, 68, 68, 0.45); color: #ef4444; }
+
 /* Layout Containers */
 .main-container {
   max-width: 1400px;
@@ -467,6 +473,7 @@ body.dark-theme {
 .log-info { color: var(--accent-cyan); }
 .log-success { color: var(--primary); }
 .log-error { color: #ef4444; }
+.log-warn { color: #f59e0b; }
 
 /* Progress Bar */
 .progress-wrapper {

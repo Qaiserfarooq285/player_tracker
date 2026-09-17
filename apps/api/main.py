@@ -26,6 +26,7 @@ from pydantic import BaseModel
 
 from apps.api.access import DEFAULT_ACCESS_PASSWORD, resolve_access_password
 from apps.api.idle_stop import watchdog_from_env
+from apps.api.uploads import ChunkedUploads, safe_upload_name, upload_response
 from src.common.logging import get_logger
 
 # `src.pipeline.statcard_pdf` (unlike e.g. `src.track.target`/`src.identity.jersey_models`
@@ -359,39 +360,10 @@ def list_videos():
     }
 
 
-_ALLOWED_UPLOAD_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
-_UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
-# Partial uploads live under INPUT_DIR so they end up on the same (persistent) volume as the final
-# file and the rename at the end is atomic; the leading dot keeps `/api/videos` from listing them.
-_UPLOAD_PART_DIRNAME = ".uploads"
-# In-memory progress per upload id -- the server runs as ONE uvicorn process (JOBS and the
-# in-flight guard already depend on that), so a dict is the right store here.
-_UPLOADS: dict[str, dict[str, Any]] = {}
-_UPLOADS_LOCK = threading.Lock()
-
-
-def _safe_upload_name(filename: str | None) -> str:
-    """Basename only, spaces -> underscores, and a video extension we can actually decode --
-    anything else is a 400, not a silently-accepted junk file in `input/`."""
-    name = Path(filename or f"upload_{int(time.time())}.mp4").name.replace(" ", "_")
-    if not name or name.startswith("."):
-        raise HTTPException(status_code=400, detail="invalid filename")
-    if Path(name).suffix.lower() not in _ALLOWED_UPLOAD_SUFFIXES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"unsupported video type {Path(name).suffix!r}; "
-            f"use one of {sorted(_ALLOWED_UPLOAD_SUFFIXES)}",
-        )
-    return name
-
-
-def _upload_response(target_path: Path) -> dict[str, Any]:
-    return {
-        "status": "success",
-        "filename": target_path.name,
-        "size_mb": round(target_path.stat().st_size / (1024 * 1024), 2),
-        "path": str(target_path),
-    }
+# Chunk reassembly, name sanitising and the response shape live in `apps/api/uploads.py`, shared
+# with the always-on VPS gateway (`apps/gateway/main.py`) so a file accepted there can be replayed
+# to this pod with the identical protocol.
+_UPLOADS = ChunkedUploads()
 
 
 @app.post("/api/upload")
@@ -401,13 +373,13 @@ async def upload_video(file: UploadFile = File(...)):
     Kept for local use and scripts. The web UI uses `/api/upload/chunk` instead, because a hosted
     deployment sits behind Cloudflare, which rejects any single request body over 100 MB -- and a
     4K clip is routinely several hundred MB (docs/DEPLOY.md)."""
-    safe_name = _safe_upload_name(file.filename)
+    safe_name = safe_upload_name(file.filename)
     target_path = INPUT_DIR / safe_name
 
     with open(target_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    return _upload_response(target_path)
+    return upload_response(target_path)
 
 
 @app.post("/api/upload/chunk")
@@ -421,45 +393,7 @@ async def upload_video_chunk(
     """Upload one sequential slice of a video. The client picks `upload_id`, sends chunks
     `0..total-1` in order, and the final chunk's response carries the same payload as
     `/api/upload`. Out-of-order or unknown chunks are a 409/404, never silently appended."""
-    if not _UPLOAD_ID_RE.match(upload_id):
-        raise HTTPException(status_code=400, detail="invalid upload_id")
-    if total < 1 or not 0 <= index < total:
-        raise HTTPException(status_code=400, detail="index/total out of range")
-    safe_name = _safe_upload_name(filename)
-    part_dir = INPUT_DIR / _UPLOAD_PART_DIRNAME
-    part_dir.mkdir(parents=True, exist_ok=True)
-    part_path = part_dir / f"{upload_id}.part"
-
-    with _UPLOADS_LOCK:
-        state = _UPLOADS.get(upload_id)
-        if index == 0:
-            state = {"next": 0, "filename": safe_name, "total": total}
-            _UPLOADS[upload_id] = state
-        elif state is None:
-            raise HTTPException(status_code=404, detail="unknown upload_id (chunk 0 never arrived)")
-        if state["next"] != index:
-            raise HTTPException(
-                status_code=409,
-                detail=f"expected chunk {state['next']}, got {index}",
-            )
-        if state["total"] != total or state["filename"] != safe_name:
-            raise HTTPException(status_code=409, detail="upload metadata changed mid-stream")
-
-    with open(part_path, "wb" if index == 0 else "ab") as buffer:
-        shutil.copyfileobj(chunk.file, buffer)
-
-    with _UPLOADS_LOCK:
-        state["next"] = index + 1
-        complete = state["next"] == total
-        if complete:
-            _UPLOADS.pop(upload_id, None)
-
-    if not complete:
-        return {"status": "partial", "upload_id": upload_id, "received": index + 1, "total": total}
-
-    target_path = INPUT_DIR / safe_name
-    os.replace(part_path, target_path)
-    return _upload_response(target_path)
+    return _UPLOADS.receive(INPUT_DIR, upload_id, index, total, filename, chunk.file)
 
 
 def _read_jersey_hint(

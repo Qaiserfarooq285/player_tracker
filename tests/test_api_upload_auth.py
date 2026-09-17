@@ -12,13 +12,14 @@ from fastapi.testclient import TestClient
 
 import apps.api.main as api_main
 from apps.api.access import DEFAULT_ACCESS_PASSWORD, resolve_access_password
+from apps.api.uploads import ChunkedUploads
 
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(api_main, "INPUT_DIR", tmp_path / "input")
     (tmp_path / "input").mkdir()
-    monkeypatch.setattr(api_main, "_UPLOADS", {})
+    monkeypatch.setattr(api_main, "_UPLOADS", ChunkedUploads())
     return TestClient(api_main.app)
 
 
@@ -48,7 +49,7 @@ def test_chunks_reassemble_in_order_into_input_dir(client, tmp_path):
     assert (tmp_path / "input" / "my_clip.mp4").read_bytes() == b"".join(parts)
     # the partial file is gone and no bookkeeping leaks
     assert not list((tmp_path / "input" / ".uploads").glob("*.part"))
-    assert uid not in api_main._UPLOADS
+    assert uid not in api_main._UPLOADS._state
 
 
 def test_out_of_order_chunk_is_rejected_not_appended(client, tmp_path):

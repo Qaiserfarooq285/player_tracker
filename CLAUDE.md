@@ -360,9 +360,11 @@ make models    # fetch + checksum-verify the three model checkpoints into models
 make serve     # web UI + API on :8000 (PV_DEV=1 = auto-reload for local editing only; login gate
                #  is ON BY DEFAULT -- default password `admin1122`, PV_ACCESS_PASSWORD=... to
                #  change it, PV_ACCESS_PASSWORD=off to disable). HOSTING: docs/DEPLOY.md -- RunPod
-               #  pod + network volume bootstrapped by docker/runpod_bootstrap.sh, Hostinger domain
-               #  via Cloudflare Tunnel, idle auto-stop via RUNPOD_API_KEY. Uploads are chunked
-               #  (Cloudflare's 100 MB/request cap).
+               #  pod + network volume bootstrapped by docker/runpod_bootstrap.sh; an ALWAYS-ON
+               #  GATEWAY on the Hostinger VPS (apps/gateway, `bash docker/deploy_vps.sh`) serves
+               #  the frontend + uploads with no pod, starts/recreates the pod on Run, and waits
+               #  (telling the user) when RunPod has no GPU; idle auto-stop via RUNPOD_API_KEY.
+               #  Uploads are chunked (apps/api/uploads.py, shared by pod + gateway).
 scripts/download_soccernet.py   # --list (no password) or pulls one broadcast clip into input/
                                  # (needs SOCCERNET_PASSWORD in .env, from the NDA form at soccer-net.org)
                                  # -- kept as the GOOD-QUALITY control input (§3.4); "high-quality when needed"

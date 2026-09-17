@@ -1,0 +1,7 @@
+# The VPS gateway's whole dependency list (docker/vps/setup_vps.sh installs exactly this into
+# /opt/pitchvision/.venv-gateway). Deliberately NOT the project's pyproject extras: the gateway
+# never imports the pipeline, so no torch / opencv / models on the VPS.
+fastapi
+uvicorn[standard]
+python-multipart
+requests

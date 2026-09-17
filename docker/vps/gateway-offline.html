@@ -1,7 +1,7 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>PitchVision is asleep</title>
+<html lang="en"><head><meta charset="utf-8"><title>PitchVision is restarting</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="30">
+<meta http-equiv="refresh" content="10">
 <style>
   :root{--bg:#0f1115;--fg:#e8eaed;--muted:#9aa0a6;--accent:#4ade80}
   body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--fg);
@@ -15,11 +15,9 @@
   @keyframes pulse{0%,100%{opacity:.3}50%{opacity:1}}
 </style></head>
 <body><main>
-  <h1><span class="dot"></span>The GPU pod is stopped</h1>
-  <p>PitchVision runs on a RunPod GPU that stops itself when idle so it doesn't bill while nobody is
-     using it. Nothing is lost &mdash; uploads, results and models live on a persistent volume.</p>
-  <p>To wake it: open the RunPod console &rarr; <strong>Pods</strong> &rarr; <strong>Start</strong>. It's back
-     in about 30&nbsp;seconds; this page refreshes itself every 30&nbsp;s.</p>
-  <p>Still here after a minute? The pod may be on its first boot (installing dependencies takes ~10 min)
-     &mdash; check the pod's <em>Logs</em> for <code>[pitchvision] starting server</code>.</p>
+  <h1><span class="dot"></span>PitchVision is restarting</h1>
+  <p>The site's gateway service is coming back up (this happens for a few seconds after an update).
+     This page refreshes itself every 10&nbsp;s.</p>
+  <p>Still here after a minute? On the VPS: <code>systemctl status pitchvision-gateway</code> and
+     <code>journalctl -u pitchvision-gateway -n 50</code>.</p>
 </main></body></html>

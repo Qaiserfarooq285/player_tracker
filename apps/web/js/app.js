@@ -4,6 +4,7 @@
 
 let activeJobId = null;
 let pollingTimer = null;
+let lastLoggedLine = null;
 let currentResults = null;
 let pitchMode = 'trajectory';
 
@@ -86,7 +87,11 @@ let targetAnchors = []; // [{ take_id, raw_track_id, chain_id, t }, ...]
 
 function initApp() {
   checkHealth();
+  // The always-on gateway (apps/gateway) reports the GPU pod's phase -- keep the badge honest
+  // while a pod starts or while RunPod has no GPU (docs/DEPLOY.md "Always-on gateway").
+  setInterval(checkHealth, HEALTH_POLL_MS);
   loadVideos();
+  resumeActiveJob();
 
   document.getElementById('btn-process').addEventListener('click', startPipelineProcessing);
   document.getElementById('video-select').addEventListener('change', updatePreviewVideo);
@@ -348,17 +353,56 @@ function removeAnchor(index) {
     : `<i class="fa-solid fa-info-circle"></i> Pause the video at any frame and click directly on the target player to pin the tracking target -- shown at full size for precise clicking.`;
 }
 
+const HEALTH_POLL_MS = 10000;
+// Pod phases as reported by apps/gateway/pod_manager.py -> badge text. A plain (non-gateway)
+// server has no `pod` field and falls through to the old CUDA/CPU labels.
+const POD_PHASE_LABELS = {
+  online: { icon: 'fa-microchip', text: (p) => `${p.gpu_name || 'GPU'} (CUDA)`, cls: 'pod-online' },
+  offline: { icon: 'fa-moon', text: () => 'GPU pod asleep -- starts when you press Run', cls: 'pod-offline' },
+  starting: { icon: 'fa-spinner fa-spin', text: () => 'GPU pod starting...', cls: 'pod-busy' },
+  booting: { icon: 'fa-spinner fa-spin', text: () => 'GPU pod booting...', cls: 'pod-busy' },
+  waiting_for_gpu: { icon: 'fa-hourglass-half', text: () => 'No GPU available right now -- waiting for one', cls: 'pod-waiting' },
+  error: { icon: 'fa-triangle-exclamation', text: (p) => `GPU pod error: ${p.message}`, cls: 'pod-error' },
+  unknown: { icon: 'fa-question', text: () => 'Checking GPU pod...', cls: 'pod-offline' },
+};
+
 async function checkHealth() {
+  const badge = document.getElementById('gpu-status');
   try {
     const res = await fetch('/api/health');
     const data = await res.json();
-    if (data.gpu_available) {
-      document.getElementById('gpu-status').innerHTML = `<i class="fa-solid fa-microchip"></i> ${data.gpu_name} (CUDA)`;
+    if (data.pod) {
+      const spec = POD_PHASE_LABELS[data.pod.phase] || POD_PHASE_LABELS.unknown;
+      badge.innerHTML = `<i class="fa-solid ${spec.icon}"></i> ${spec.text(data.pod)}`;
+      badge.title = data.pod.message || '';
+      badge.className = `status-badge gpu-badge ${spec.cls}`;
+    } else if (data.gpu_available) {
+      badge.innerHTML = `<i class="fa-solid fa-microchip"></i> ${data.gpu_name} (CUDA)`;
     } else {
-      document.getElementById('gpu-status').innerHTML = `<i class="fa-solid fa-cpu"></i> CPU Mode`;
+      badge.innerHTML = `<i class="fa-solid fa-cpu"></i> CPU Mode`;
     }
   } catch (err) {
     console.warn('Backend health check failed:', err);
+  }
+}
+
+// After a refresh (or a second device), pick the newest job the gateway still has in flight and
+// keep showing its progress -- the queue lives on the server, not in this tab.
+async function resumeActiveJob() {
+  try {
+    const res = await fetch('/api/jobs');
+    if (!res.ok) return; // a plain pod server has no queue endpoint
+    const data = await res.json();
+    const active = (data.active || []);
+    if (!active.length) return;
+    const job = active[active.length - 1];
+    logTerminal(`Resuming job ${job.job_id} for '${job.video_name}' (${job.status.replace(/_/g, ' ')}).`, 'info');
+    document.getElementById('btn-process').disabled = true;
+    document.getElementById('btn-process').innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Processing Video...`;
+    activeJobId = job.job_id;
+    startJobPolling(activeJobId);
+  } catch (err) {
+    console.warn('Could not check for active jobs:', err);
   }
 }
 
@@ -544,6 +588,10 @@ async function startPipelineProcessing() {
       body: JSON.stringify(payload),
     });
     const data = await res.json();
+    if (!res.ok || !data.job_id) {
+      throw new Error(data.detail || `HTTP ${res.status}`);
+    }
+    logTerminal(data.message || `Job ${data.job_id} queued.`, 'info');
     activeJobId = data.job_id;
     startJobPolling(activeJobId);
   } catch (err) {
@@ -563,14 +611,19 @@ async function checkJobStatus(jobId) {
     const job = await res.json();
 
     updateProgressBar(job.progress, job.stage);
-    document.getElementById('job-status-badge').textContent = job.status.toUpperCase();
+    document.getElementById('job-status-badge').textContent = job.status.replace(/_/g, ' ').toUpperCase();
 
     // Highlight flow diagram node based on stage
     highlightFlowStage(job.stage);
 
     if (job.logs && job.logs.length > 0) {
       const lastLog = job.logs[job.logs.length - 1];
-      logTerminal(lastLog, job.status === 'failed' ? 'error' : 'info');
+      // The gateway repeats the last line on every poll; only print it when it changes.
+      if (lastLog !== lastLoggedLine) {
+        lastLoggedLine = lastLog;
+        const kind = job.status === 'failed' ? 'error' : (job.status === 'waiting_gpu' ? 'warn' : 'info');
+        logTerminal(lastLog, kind);
+      }
     }
 
     if (job.status === 'completed') {
@@ -635,7 +688,8 @@ async function loadResults(slug) {
       if (res2.ok) {
         currentResults = await res2.json();
       } else {
-        throw new Error('Results endpoint returned 404');
+        const err = await res2.json().catch(() => ({}));
+        throw new Error(err.detail || `Results endpoint returned ${res2.status}`);
       }
     } else {
       currentResults = await res.json();
