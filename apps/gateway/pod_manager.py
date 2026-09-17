@@ -49,6 +49,9 @@ DEFAULT_POLL_S = 10.0  # while starting/booting
 DEFAULT_RETRY_S = 60.0  # while waiting for a GPU
 DEFAULT_BOOT_CAP_S = 30 * 60.0  # a first boot installs deps (~10 min); anything past this is stuck
 DEFAULT_TERMINATE_WAIT_S = 90.0
+# A replacement pod is created WITH a gpuTypeId, so it coming up GPU-less means something is
+# wrong at RunPod's end; don't burn credit recreating forever.
+MAX_NO_GPU_REPLACEMENTS = 3
 
 
 @dataclass
@@ -196,8 +199,14 @@ class PodManager:
         if not pod.is_running:
             self._set(OFFLINE, "GPU pod is stopped -- it starts automatically when you press Run.", pod)
             return self.state
+        if not pod.has_gpu:
+            self._set(OFFLINE, "Pod is running WITHOUT a GPU (RunPod resumed it on CPU) -- it is "
+                      "replaced automatically when you press Run.", pod)
+            return self.state
         health = rp.probe_health(rp.proxy_url(pod.id, self.cfg.port), self._health_session)
-        if health:
+        if health and not health.get("gpu_available", True):
+            self._set(OFFLINE, "Pod is up but sees no GPU -- it is replaced automatically when you press Run.", pod)
+        elif health:
             self._mark_online(pod, health)
         else:
             self._set(BOOTING, f"GPU pod is running, app still starting ({_fmt_minutes(pod.uptime_s)} up).", pod)
@@ -222,6 +231,7 @@ class PodManager:
         deadline = started + deadline_s if deadline_s is not None else None
         last_reported: tuple[str, str] | None = None
         boot_started: float | None = None
+        no_gpu_replacements = 0
 
         def report() -> None:
             nonlocal last_reported
@@ -301,9 +311,16 @@ class PodManager:
                     report()
                     self._terminate_and_wait(pod.id)
                     continue  # next loop: no pod -> create
-                if not pod.is_running:
-                    # RunPod returned 2xx but the pod is still not RUNNING -- treat like a refusal.
-                    self._set(STARTING, "Start did not take; replacing the pod.", pod)
+                if not pod.is_running or not pod.has_gpu:
+                    # 2xx, but either the pod is still not RUNNING or RunPod resumed it on CPU
+                    # only (its fallback when the card is gone) -- both are a refusal to us.
+                    self._set(
+                        STARTING,
+                        "RunPod could not give the stopped pod its GPU back -- replacing the pod "
+                        "(your uploads and results are on the persistent volume).",
+                        pod,
+                        error="resumed without a GPU" if pod.is_running else "start did not take",
+                    )
                     report()
                     self._terminate_and_wait(pod.id)
                     continue
@@ -313,8 +330,35 @@ class PodManager:
                 wait(self.cfg.poll_s)
                 continue
 
-            # --- pod running: is the app up? ----------------------------------------------
+            # --- pod running: does it have a GPU, and is the app up? -------------------------
+            if not pod.has_gpu:
+                no_gpu_replacements += 1
+                if no_gpu_replacements > MAX_NO_GPU_REPLACEMENTS:
+                    self._set(ERROR, "Every replacement pod comes up without a GPU -- check the "
+                              "RunPod console.", pod, error="repeated CPU-only pods")
+                    report()
+                    raise PodUnavailable(self.state.message)
+                self._set(STARTING, "The running pod has no GPU (RunPod resumed it on CPU) -- replacing it.",
+                          pod, error="running without a GPU")
+                report()
+                self._terminate_and_wait(pod.id)
+                boot_started = None
+                continue
             health = rp.probe_health(rp.proxy_url(pod.id, self.cfg.port), self._health_session)
+            if health and not health.get("gpu_available", True):
+                # The app itself is the last word: no CUDA device means no GPU, whatever RunPod says.
+                no_gpu_replacements += 1
+                if no_gpu_replacements > MAX_NO_GPU_REPLACEMENTS:
+                    self._set(ERROR, "Every replacement pod comes up without a GPU -- check the "
+                              "RunPod console.", pod, error="repeated CPU-only pods")
+                    report()
+                    raise PodUnavailable(self.state.message)
+                self._set(STARTING, "The pod booted without a usable GPU -- replacing it.", pod,
+                          error="app reports no CUDA device")
+                report()
+                self._terminate_and_wait(pod.id)
+                boot_started = None
+                continue
             if health:
                 self._mark_online(pod, health)
                 report()

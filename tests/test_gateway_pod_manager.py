@@ -17,9 +17,10 @@ class FakeRunPod:
     next create/start is refused (the "no GPU" cases); `healthy_after_polls` says how many health
     probes a running pod needs before its app answers."""
 
-    def __init__(self, pods=None, *, create_ok=True, start_ok=True, healthy_after_polls=1):
+    def __init__(self, pods=None, *, create_ok=True, start_ok=True, cpu_resume=False, healthy_after_polls=1):
         self.pods: dict[str, dict] = {p["id"]: p for p in (pods or [])}
         self.create_ok = create_ok
+        self.cpu_resume = cpu_resume
         self.start_ok = start_ok
         self.healthy_after_polls = healthy_after_polls
         self.calls: list[str] = []
@@ -44,6 +45,10 @@ class FakeRunPod:
         if not self.start_ok:
             raise RunPodError("POST /pods/x/start -> HTTP 500: not enough free GPUs on the host machine", 500)
         self.pods[pod_id]["desiredStatus"] = "RUNNING"
+        if self.cpu_resume:
+            # What RunPod actually did on 2026-09-17: 2xx, RUNNING, but no GPU attached.
+            self.pods[pod_id]["machine"] = {}
+            self.pods[pod_id]["gpuCount"] = None
         return PodInfo.from_api(self.pods[pod_id])
 
     def terminate_pod(self, pod_id):
@@ -56,7 +61,7 @@ class FakeRunPod:
             raise RunPodError("POST /pods -> HTTP 500: There are no longer any instances available", 500)
         pod_id = f"new{self._next_id}"
         self._next_id += 1
-        self.pods[pod_id] = {"id": pod_id, "name": body["name"], "desiredStatus": "RUNNING",
+        self.pods[pod_id] = {"id": pod_id, "name": body["name"], "desiredStatus": "RUNNING", "gpuCount": 1,
                              "machine": {"gpuTypeId": body["gpuTypeIds"][0]}, "runtime": {"uptimeInSeconds": 0}}
         return PodInfo.from_api(self.pods[pod_id])
 
@@ -74,7 +79,8 @@ class FakeRunPod:
             return None
         self.health_polls[pod_id] = self.health_polls.get(pod_id, 0) + 1
         if self.health_polls[pod_id] >= self.healthy_after_polls:
-            return {"status": "healthy", "gpu_available": True, "gpu_name": "NVIDIA GeForce RTX 4090"}
+            has_gpu = bool(p.get("gpuCount"))
+            return {"status": "healthy", "gpu_available": has_gpu, "gpu_name": "NVIDIA GeForce RTX 4090" if has_gpu else "CPU Only"}
         return None
 
 
@@ -91,7 +97,8 @@ class FakeClock:
         self.now += s
 
 
-STOPPED_POD = {"id": "old1", "name": "pitchvision", "desiredStatus": "EXITED", "machine": {"gpuTypeId": "NVIDIA GeForce RTX 4090"}}
+STOPPED_POD = {"id": "old1", "name": "pitchvision", "desiredStatus": "EXITED", "gpuCount": 1,
+               "machine": {"gpuTypeId": "NVIDIA GeForce RTX 4090"}}
 
 
 @pytest.fixture
@@ -127,6 +134,40 @@ def test_gpu_taken_terminates_and_recreates(make):
     assert st.pod_id == "new1"
     assert fake.calls.index("terminate:old1") < fake.calls.index("create")
     assert "old1" not in fake.pods
+
+
+def test_cpu_only_resume_is_treated_as_a_refusal(make):
+    """What RunPod really did on 2026-09-17: Start returned 2xx but resumed the pod on CPU only
+    ($0.37/h, app says "CPU Only"). The gateway must replace it, not call that online."""
+    fake = FakeRunPod([dict(STOPPED_POD)], cpu_resume=True)
+    mgr, clock = make(fake)
+    messages = []
+    st = mgr.ensure_online(lambda ph, msg: messages.append(msg))
+    assert st.phase == pm.ONLINE and st.pod_id == "new1"
+    assert st.gpu_name == "NVIDIA GeForce RTX 4090"
+    assert "terminate:old1" in fake.calls
+    assert any("could not give the stopped pod its GPU back" in m for m in messages)
+
+
+def test_running_cpu_only_pod_is_replaced_and_capped(make):
+    cpu_pod = {"id": "cpu1", "name": "pitchvision", "desiredStatus": "RUNNING", "gpuCount": None, "machine": {}}
+    fake = FakeRunPod([cpu_pod])
+    mgr, clock = make(fake)
+    assert mgr.refresh().phase == pm.OFFLINE and "WITHOUT a GPU" in mgr.state.message
+    st = mgr.ensure_online()
+    assert st.phase == pm.ONLINE and st.pod_id == "new1" and "terminate:cpu1" in fake.calls
+
+    class AlwaysCpu(FakeRunPod):
+        def create_pod(self, body):
+            pod = super().create_pod(body)
+            self.pods[pod.id]["gpuCount"] = None
+            self.pods[pod.id]["machine"] = {}
+            return PodInfo.from_api(self.pods[pod.id])
+
+    mgr2, _ = make(AlwaysCpu([dict(cpu_pod)]))
+    with pytest.raises(PodUnavailable):
+        mgr2.ensure_online()
+    assert mgr2.state.phase == pm.ERROR
 
 
 def test_no_gpu_anywhere_waits_and_retries_until_stock_appears(make):
@@ -170,7 +211,7 @@ def test_auth_error_is_not_retried(make):
 
 
 def test_running_pod_waits_for_app_to_boot(make):
-    running = {"id": "run1", "name": "pitchvision", "desiredStatus": "RUNNING",
+    running = {"id": "run1", "name": "pitchvision", "desiredStatus": "RUNNING", "gpuCount": 1,
                "machine": {"gpuTypeId": "NVIDIA L4"}, "runtime": {"uptimeInSeconds": 5}}
     fake = FakeRunPod([running], healthy_after_polls=3)
     mgr, clock = make(fake)
@@ -182,7 +223,7 @@ def test_running_pod_waits_for_app_to_boot(make):
 
 
 def test_boot_that_never_comes_up_is_replaced(make):
-    running = {"id": "stuck", "name": "pitchvision", "desiredStatus": "RUNNING",
+    running = {"id": "stuck", "name": "pitchvision", "desiredStatus": "RUNNING", "gpuCount": 1,
                "machine": {"gpuTypeId": "NVIDIA L4"}, "runtime": {"uptimeInSeconds": 0}}
     fake = FakeRunPod([running])
     mgr, clock = make(fake, boot_cap_s=120)

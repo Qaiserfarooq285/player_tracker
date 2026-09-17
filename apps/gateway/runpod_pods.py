@@ -127,12 +127,20 @@ class PodInfo:
     name: str
     desired_status: str  # "RUNNING" | "EXITED" | ... as RunPod reports it
     gpu_type: str
+    gpu_count: int
     uptime_s: int
     cost_per_hr: float
 
     @property
     def is_running(self) -> bool:
         return self.desired_status == "RUNNING"
+
+    @property
+    def has_gpu(self) -> bool:
+        """False for a pod RunPod resumed on CPU only -- its "Start Pod using CPUs" fallback when
+        the stopped pod's card is gone (observed 2026-09-17: `gpuCount` null, `machine` empty,
+        still billed $0.37/h). Useless to us: the app reports "CPU Only"."""
+        return self.gpu_count > 0 or bool(self.gpu_type)
 
     @classmethod
     def from_api(cls, raw: dict[str, Any]) -> PodInfo:
@@ -143,6 +151,7 @@ class PodInfo:
             name=str(raw.get("name", "")),
             desired_status=str(raw.get("desiredStatus", "")),
             gpu_type=str(machine.get("gpuTypeId") or raw.get("gpuTypeId") or ""),
+            gpu_count=int(raw.get("gpuCount") or 0),
             uptime_s=int(runtime.get("uptimeInSeconds") or 0),
             cost_per_hr=float(raw.get("costPerHr") or 0.0),
         )
