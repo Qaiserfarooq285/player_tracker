@@ -32,7 +32,7 @@ Why this shape:
 
 | You need | Where |
 |---|---|
-| The repo on GitHub, public | already: `github.com/Qaiserfarooq285/payertracker` (`master`) |
+| The repo on GitHub (**private**) + a read-only token for it | `github.com/Qaiserfarooq285/payertracker` (`master`). Token: GitHub → Settings → Developer settings → Personal access tokens → **Fine-grained** → Repository access: *only* payertracker → Permissions: **Contents: Read-only** → Generate. Goes into the pod's `GITHUB_TOKEN` env var; nothing else ever sees it. |
 | RunPod account with credit | runpod.io |
 | Cloudflare account (free) | dash.cloudflare.com — sign up |
 | Access to the Hostinger domain's DNS settings | hpanel.hostinger.com |
@@ -63,8 +63,8 @@ RunPod → **Templates** → **New Template**:
 | Volume mount path | `/workspace` |
 | Expose HTTP ports | `8000` |
 | Expose TCP ports | `22` (optional, for SSH debugging) |
-| **Container start command** | `bash -c "curl -fsSL https://raw.githubusercontent.com/Qaiserfarooq285/payertracker/master/docker/runpod_bootstrap.sh \| bash"` — copy it from the top of [`docker/runpod_bootstrap.sh`](../docker/runpod_bootstrap.sh) without the `\|` escaping |
-| Environment variables | see [`docker/runpod.env.example`](../docker/runpod.env.example): **`PV_ACCESS_PASSWORD`** (optional — defaults to `admin1122` if left unset, change it), `RUNPOD_API_KEY` (optional, enables idle auto-stop — §"Idle auto-stop" below), `CLOUDFLARE_TUNNEL_TOKEN` (after step 4), `GEMINI_API_KEY` (optional) |
+| **Container start command** | `bash -c "curl -fsSL -H \"Authorization: token $GITHUB_TOKEN\" https://raw.githubusercontent.com/Qaiserfarooq285/payertracker/master/docker/runpod_bootstrap.sh \| bash"` — copy it from the top of [`docker/runpod_bootstrap.sh`](../docker/runpod_bootstrap.sh) without the `\|` escaping. `$GITHUB_TOKEN` is expanded by the pod at boot, not by you. |
+| Environment variables | see [`docker/runpod.env.example`](../docker/runpod.env.example): **`GITHUB_TOKEN`** (required — private repo), **`PV_ACCESS_PASSWORD`** (optional — defaults to `admin1122` if left unset, change it), `RUNPOD_API_KEY` (optional, enables idle auto-stop — §"Idle auto-stop" below), `CLOUDFLARE_TUNNEL_TOKEN` (after step 4), `GEMINI_API_KEY` (optional) |
 
 Save the template.
 
@@ -127,8 +127,8 @@ id). When the pod is stopped, visitors see a "pod is stopped" page instead of a 
    `https://app.yourdomain.com/api/health` should show `gpu_available: true`.
 
 Provisioning the RunPod side from the command line instead of the console (§1–3):
-`RUNPOD_API_KEY=... python docker/runpod_provision.py --password '<site password>' --gpu 'NVIDIA
-RTX 2000 Ada Generation' --datacenter EUR-IS-1` creates the volume + pod and prints the `POD_ID`.
+`RUNPOD_API_KEY=... GITHUB_TOKEN=... python docker/runpod_provision.py --password '<site password>'
+--gpu 'NVIDIA L4' --datacenter EUR-IS-1` creates the volume + pod and prints the `POD_ID`.
 Network volumes only attach to **Secure Cloud** pods; pick a datacenter whose stock the script's
 error message doesn't reject.
 
@@ -203,6 +203,9 @@ and the pod stops itself:
   (Ctrl+Shift+R) to drop the cached old `app.js`.
 - **`Job failed` right after a restart** → any run in flight dies when the pod restarts. Don't
   restart mid-run; results already written to `output/` are kept.
+- **Boot dies immediately, log shows `curl: (22) ... 404`** → the repo is private and the pod has no
+  (or an expired/wrong) `GITHUB_TOKEN`. Fine-grained tokens expire — generate a new one, update the
+  pod env, Restart. Rotating it needs no code change: the token is never written to the volume.
 - **First boot stuck on `installing dependencies`** → normal for 5–10 min. If it exceeds 20 min,
   check the log for a pip error and restart; the install resumes from uv's cache.
 - **Tunnel shows "inactive"** → the token env var is missing/wrong on the pod, or the pod is

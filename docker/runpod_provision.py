@@ -84,20 +84,25 @@ def create_pod(key: str, args: argparse.Namespace, volume_id: str) -> dict:
         env["RUNPOD_API_KEY"] = key
     if args.gemini_key:
         env["GEMINI_API_KEY"] = args.gemini_key
+    if args.github_token:
+        env["GITHUB_TOKEN"] = args.github_token
     if args.ssh_public_key:
         # RunPod's own /start.sh (kept alive by the bootstrap) installs this for `ssh root@<ip> -p <port>`.
         env["PUBLIC_KEY"] = args.ssh_public_key
+    # The repo is private: raw.githubusercontent.com needs the token too. `$GITHUB_TOKEN` is left
+    # for the container's shell to expand at boot, so the token never appears in the command itself.
+    fetch = f'curl -fsSL -H "Authorization: token $GITHUB_TOKEN" {BOOTSTRAP_URL}'
     if args.debug:
         # Keep the container alive after a failed bootstrap and leave its output on the volume, so a
         # crash-looping pod can be inspected over SSH instead of guessed at from a blank log viewer.
         start_cmd = (
             "/start.sh >/workspace/runpod-start.log 2>&1 & export PV_SKIP_RUNPOD_SERVICES=1; "
-            f"curl -fsSL {BOOTSTRAP_URL} -o /workspace/bootstrap.sh && "
+            f"{fetch} -o /workspace/bootstrap.sh && "
             "bash /workspace/bootstrap.sh >/workspace/bootstrap.log 2>&1; "
             "echo EXIT=$? >>/workspace/bootstrap.log; sleep infinity"
         )
     else:
-        start_cmd = f"curl -fsSL {BOOTSTRAP_URL} | bash"
+        start_cmd = f"{fetch} | bash"
     body = {
         "name": args.name,
         "imageName": IMAGE,
@@ -129,6 +134,8 @@ def main() -> int:
     ap.add_argument("--idle-minutes", type=int, default=30)
     ap.add_argument("--no-idle-stop", dest="idle_stop", action="store_false")
     ap.add_argument("--gemini-key", default=os.environ.get("GEMINI_API_KEY", ""))
+    ap.add_argument("--github-token", default=os.environ.get("GITHUB_TOKEN", ""),
+                    help="fine-grained PAT, Contents: read-only, this repo only (the repo is private)")
     ap.add_argument("--ssh-public-key", default="", help="installed for root SSH on the exposed 22/tcp")
     ap.add_argument("--debug", action="store_true",
                     help="log the bootstrap to /workspace/bootstrap.log and keep the container alive on failure")
@@ -138,6 +145,9 @@ def main() -> int:
     key = os.environ.get("RUNPOD_API_KEY", "").strip()
     if not key:
         print("RUNPOD_API_KEY is not set", file=sys.stderr)
+        return 2
+    if not args.github_token:
+        print("--github-token / GITHUB_TOKEN is not set: the pod cannot clone the private repo", file=sys.stderr)
         return 2
 
     volume = ensure_volume(key, args.volume_name, args.volume_gb, args.datacenter)

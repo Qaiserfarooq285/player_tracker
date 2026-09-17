@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # PitchVision -- RunPod pod bootstrap (docs/DEPLOY.md).
 #
-# Set as the pod template's "Container Start Command":
-#   bash -c "curl -fsSL https://raw.githubusercontent.com/Qaiserfarooq285/payertracker/master/docker/runpod_bootstrap.sh | bash"
+# Set as the pod template's "Container Start Command" (docker/runpod_provision.py does this):
+#   bash -c "curl -fsSL -H \"Authorization: token $GITHUB_TOKEN\" https://raw.githubusercontent.com/Qaiserfarooq285/payertracker/master/docker/runpod_bootstrap.sh | bash"
+# The repo is PRIVATE: GITHUB_TOKEN (a fine-grained PAT, Contents: read-only, this repo only)
+# must be set on the pod for both that curl and the git clone/fetch below.
 #
 # Everything that must survive a pod stop/restart lives on the network volume mounted at
 # /workspace: the checkout, its .venv, models/ (1.9 GB), input/, work/ and output/. First boot
@@ -19,7 +21,8 @@
 #   CLOUDFLARE_TUNNEL_TOKEN  (optional) token from Cloudflare Zero Trust -> your own domain
 #   GEMINI_API_KEY           (optional) same meaning as in .env.example
 #   PORT                     listen port, default 8000 (expose the same port as HTTP on the pod)
-#   PV_BRANCH / PV_REPO_URL  which code to run, default master of the public repo
+#   GITHUB_TOKEN             read-only fine-grained PAT for the private repo (clone + fetch)
+#   PV_BRANCH / PV_REPO_URL  which code to run, default master of the repo
 #   PV_AUTO_UPDATE=0         keep whatever checkout is on the volume; default 1 = fast-forward
 #                            to origin/$PV_BRANCH on each boot
 set -euo pipefail
@@ -53,13 +56,21 @@ if [ "$need_apt" = "1" ]; then
 fi
 
 # --- code -----------------------------------------------------------------------------------
+# The token rides on a per-command header, never in the remote URL, so it is not written into
+# .git/config on the volume and rotating it is just a pod env change.
+GIT_AUTH=()
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+  GIT_AUTH=(-c "http.https://github.com/.extraheader=Authorization: Basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)")
+else
+  log "GITHUB_TOKEN is not set -- clone/fetch will only work while the repo is public"
+fi
 mkdir -p "$WS"
 if [ ! -d "$APP/.git" ]; then
   log "cloning $REPO_URL ($BRANCH) -> $APP"
-  git clone --quiet --branch "$BRANCH" "$REPO_URL" "$APP"
+  git "${GIT_AUTH[@]}" clone --quiet --branch "$BRANCH" "$REPO_URL" "$APP"
 elif [ "${PV_AUTO_UPDATE:-1}" = "1" ]; then
   log "updating checkout to origin/$BRANCH"
-  git -C "$APP" fetch --quiet origin "$BRANCH"
+  git "${GIT_AUTH[@]}" -C "$APP" fetch --quiet origin "$BRANCH"
   git -C "$APP" reset --hard --quiet "origin/$BRANCH"
 fi
 cd "$APP"
