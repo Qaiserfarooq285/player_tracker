@@ -85,7 +85,10 @@ class IdleWatchdog:
         url = f"{self.api_base}/pods/{self.pod_id}/stop"
         headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
-            resp = requests.post(url, headers=headers, timeout=_STOP_REQUEST_TIMEOUT_S)
+            # `json={}` is load-bearing: the endpoint answers HTTP 500 "unexpected end of JSON
+            # input" to a body-less POST (observed 2026-09-17), which would make every tick fail
+            # and the pod never stop -- the exact bill this watchdog exists to prevent.
+            resp = requests.post(url, headers=headers, json={}, timeout=_STOP_REQUEST_TIMEOUT_S)
         except requests.RequestException as exc:
             logger.warning(
                 "idle-stop: POST %s raised %s: %s -- will retry next tick",

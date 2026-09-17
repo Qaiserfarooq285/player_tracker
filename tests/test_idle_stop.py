@@ -51,9 +51,10 @@ def _watchdog(**overrides) -> IdleWatchdog:
 def test_stop_pod_posts_correct_url_and_bearer_header_and_returns_true_on_2xx(monkeypatch):
     captured = {}
 
-    def fake_post(url, headers=None, timeout=None):
+    def fake_post(url, headers=None, json=None, timeout=None):
         captured["url"] = url
         captured["headers"] = headers
+        captured["json"] = json
         captured["timeout"] = timeout
         return _FakeResponse(200)
 
@@ -62,6 +63,8 @@ def test_stop_pod_posts_correct_url_and_bearer_header_and_returns_true_on_2xx(mo
     assert wd.stop_pod() is True
     assert captured["url"] == "https://rest.runpod.io/v1/pods/pod123/stop"
     assert captured["headers"] == {"Authorization": "Bearer testkey"}
+    # RunPod 500s a body-less stop POST; an empty JSON object is the minimum it accepts.
+    assert captured["json"] == {}
     assert captured["timeout"] == idle_stop._STOP_REQUEST_TIMEOUT_S
 
 
