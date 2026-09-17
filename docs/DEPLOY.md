@@ -92,9 +92,50 @@ leave `PV_ACCESS_PASSWORD` unset and the pod accepts the built-in default, **`ad
 `PV_ACCESS_PASSWORD=off` disables the gate entirely — only ever do that for local editing on
 your own machine, never on a hosted pod.
 
-## 4. Your Hostinger domain → the pod (Cloudflare Tunnel, 15 min + DNS wait)
+## 4. Your Hostinger domain → the pod
 
-### 4a. Put the domain on Cloudflare
+Two ways to put the pod behind your own `https://app.yourdomain.com`. **4-VPS** is what the
+owner runs (a Hostinger KVM VPS is already paid for, so no Cloudflare account or nameserver move
+is needed); **4-CF** is the Cloudflare Tunnel alternative if you have no VPS.
+
+### 4-VPS. Hostinger KVM VPS as the HTTPS front door (10 min)
+
+```
+browser ──https──▶ KVM VPS: nginx + Let's Encrypt  ──https──▶ <POD_ID>-8000.proxy.runpod.net
+```
+
+nginx proxies to the pod's RunPod HTTP proxy hostname, which is stable across **Stop/Start**
+(the pod id only changes if you *terminate* and redeploy — then re-run the script with the new
+id). When the pod is stopped, visitors see a "pod is stopped" page instead of a raw 502.
+
+1. **DNS** — Hostinger hPanel → Domains → your domain → DNS records → add
+   `A  app  <VPS IPv4>  TTL 300`. (`app` = subdomain; use `@` for the bare domain.) Wait until
+   `dig +short app.yourdomain.com` returns the VPS IP (usually minutes).
+2. **SSH into the VPS** as root (hPanel → VPS → SSH access, or add your public key under
+   *Settings → SSH keys*) and run:
+
+   ```bash
+   git clone --depth 1 https://github.com/Qaiserfarooq285/payertracker.git /opt/pitchvision-deploy
+   DOMAIN=app.yourdomain.com POD_ID=<pod id> EMAIL=you@example.com \
+     bash /opt/pitchvision-deploy/docker/vps/setup_vps.sh
+   ```
+
+   `docker/vps/setup_vps.sh` installs nginx + certbot, writes the vhost from
+   `docker/vps/pitchvision.nginx.conf`, gets the certificate (HTTP challenge — so do step 1
+   first) and turns on the https redirect. Re-run it any time to point at a new `POD_ID`.
+3. Open **https://app.yourdomain.com** → the login overlay → your `PV_ACCESS_PASSWORD`.
+   `https://app.yourdomain.com/api/health` should show `gpu_available: true`.
+
+Provisioning the RunPod side from the command line instead of the console (§1–3):
+`RUNPOD_API_KEY=... python docker/runpod_provision.py --password '<site password>' --gpu 'NVIDIA
+RTX 2000 Ada Generation' --datacenter EUR-IS-1` creates the volume + pod and prints the `POD_ID`.
+Network volumes only attach to **Secure Cloud** pods; pick a datacenter whose stock the script's
+error message doesn't reject.
+
+### 4-CF. Cloudflare Tunnel (no VPS; 15 min + DNS wait)
+
+
+#### 4a. Put the domain on Cloudflare
 1. Cloudflare dashboard → **Add a site** → type your domain → **Free** plan → Continue.
    Cloudflare scans and imports existing DNS records; Continue.
 2. It shows **two nameservers** (like `ada.ns.cloudflare.com` / `rob.ns.cloudflare.com`).
@@ -103,7 +144,7 @@ your own machine, never on a hosted pod.
 4. Wait for Cloudflare's "site is active" email (usually under an hour, up to 24 h).
    Email/website you already host at Hostinger keeps working — the imported records carry over.
 
-### 4b. Create the tunnel
+#### 4b. Create the tunnel
 1. **one.dash.cloudflare.com** (Zero Trust) → **Networks → Tunnels → Create a tunnel** →
    *Cloudflared* → name `pitchvision` → Save.
 2. On the install page, ignore the OS buttons; in the command shown, copy the long string after
@@ -114,7 +155,7 @@ your own machine, never on a hosted pod.
    `CLOUDFLARE_TUNNEL_TOKEN=<the token>` → **Restart** the pod.
 5. Open **https://app.yourdomain.com**. Cloudflare provides the HTTPS certificate automatically.
 
-### 4c. Optional extra lock (recommended if others will use it)
+#### 4c. Optional extra lock (recommended if others will use it)
 Zero Trust → **Access → Applications → Add** → Self-hosted → domain `app.yourdomain.com` →
 policy *Allow* → include *Emails* = the addresses you permit. Visitors then get a one-time email
 code before they even reach the app's own password. Free up to 50 users. (The RunPod proxy URL
@@ -166,6 +207,11 @@ and the pod stops itself:
   check the log for a pip error and restart; the install resumes from uv's cache.
 - **Tunnel shows "inactive"** → the token env var is missing/wrong on the pod, or the pod is
   stopped. `cat /workspace/cloudflared.log`.
+- **Domain shows the "pod is stopped" page while the pod is running** → the VPS vhost points at
+  an old pod id (you terminated and redeployed). Re-run `docker/vps/setup_vps.sh` with the new
+  `POD_ID`; `nginx -T | grep proxy.runpod.net` shows what it currently targets.
+- **`certbot` fails on the VPS** → the `A` record hasn't propagated to the VPS yet
+  (`dig +short app.yourdomain.com` must print the VPS IP), or port 80 is firewalled.
 - **`409 another run is already in flight`** → the same video is being processed already; wait
   for it or process a different upload (one GPU, one job at a time by design).
 
