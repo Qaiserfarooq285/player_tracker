@@ -27,7 +27,7 @@ import numpy as np
 
 from src.common.logging import get_logger
 from src.common.types import BallDetection, BBox, Event, EventType, Take, Track
-from src.common.video import decode_frames, probe
+from src.common.video import decode_frames, nvenc_available, pipe_frames, probe
 from src.common.viz import draw_ball
 from src.goal.detect import GoalStructure, goal_bbox_at, take_motion_score
 from src.identity.verify import TakeIdentityResult
@@ -839,14 +839,9 @@ def _stream_encode(
     ]
     dst.parent.mkdir(parents=True, exist_ok=True)
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    n = 0
-    try:
-        for frame in frames_iter:
-            proc.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
-            n += 1
-    finally:
-        proc.stdin.close()
-        proc.wait()
+    # A dead ffmpeg surfaces below as returncode + stderr (a RuntimeError the caller's libx264
+    # fallback catches), never as a bare BrokenPipeError that would skip that fallback entirely.
+    n = pipe_frames(proc, frames_iter)
     if proc.returncode != 0:
         stderr = proc.stderr.read().decode(errors="replace")
         if encoder != "libx264":
@@ -1267,15 +1262,20 @@ def render_full_annotated_video(
 
             yield frame
 
+    # Probe NVENC once per process instead of paying for a whole decode+draw pass that dies on
+    # frame 0 where hardware encoding is not exposed (RunPod containers, 2026-09-17).
+    encoder = "h264_nvenc" if nvenc_available() else "libx264"
     try:
         _stream_encode(
             frame_generator(),
             video_only_path,
             native_fps,
             (native_w, native_h),
-            encoder="h264_nvenc",
+            encoder=encoder,
         )
     except RuntimeError:
+        if encoder == "libx264":
+            raise
         logger.warning("falling back to libx264 for the full annotated render (nvenc failed)")
         _stream_encode(
             frame_generator(), video_only_path, native_fps, (native_w, native_h), encoder="libx264"

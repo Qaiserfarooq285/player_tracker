@@ -8,6 +8,7 @@ fallback otherwise) rather than PyAV, matching the measured environment in CLAUD
 
 from __future__ import annotations
 
+import functools
 import json
 import subprocess
 from collections.abc import Iterable, Iterator
@@ -184,6 +185,8 @@ def extract_clip(
             str(dst),
         ]
 
+    if encoder == "h264_nvenc" and not nvenc_available():
+        encoder = "libx264"  # probed once per process; saves a doomed attempt per clip
     result = subprocess.run(build_cmd(encoder), capture_output=True, text=True)
     if result.returncode != 0:
         logger.warning(
@@ -196,6 +199,67 @@ def extract_clip(
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg failed to extract clip {dst}: {result.stderr}")
     return dst
+
+
+# A one-frame synthetic encode is the only honest NVENC test: `ffmpeg -encoders` lists
+# `h264_nvenc` wherever ffmpeg was BUILT with it, which says nothing about whether this GPU +
+# driver + container will actually open an encode session.
+_NVENC_PROBE_TIMEOUT_S = 30.0
+
+
+@functools.cache
+def nvenc_available() -> bool:
+    """Can `h264_nvenc` open an encode session on this machine? Cached per process.
+
+    Seen 2026-09-17 on a RunPod RTX 4090 pod: ffmpeg lists the encoder, `libnvidia-encode.so.1`
+    is present, and every NVENC encode still dies at start with `OpenEncodeSessionEx failed:
+    unsupported device` (NVENC is not exposed inside their containers). Rendering a 4K clip is
+    minutes of decode+draw, so a doomed hardware attempt must be ruled out BEFORE the pass starts,
+    not discovered on the first frame.
+    """
+    cmd = [
+        "ffmpeg", "-hide_banner", "-v", "error",
+        "-f", "lavfi", "-i", "testsrc=size=256x144:rate=30", "-frames:v", "1",
+        "-c:v", "h264_nvenc", "-f", "null", "-",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=_NVENC_PROBE_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("NVENC probe could not run (%s) -- using libx264", exc)
+        return False
+    if proc.returncode == 0:
+        logger.info("NVENC probe ok -- hardware encoding available")
+        return True
+    logger.warning(
+        "NVENC unavailable on this machine (%s) -- using libx264",
+        proc.stderr.decode(errors="replace").strip().splitlines()[-1:] or "no stderr",
+    )
+    return False
+
+
+def pipe_frames(proc: subprocess.Popen, frames: Iterable[np.ndarray]) -> int:
+    """Write BGR frames to `proc.stdin` until they run out OR ffmpeg goes away. Returns the number
+    of frames written.
+
+    A `BrokenPipeError` here means ffmpeg already exited (an encoder that failed to open, a full
+    disk); the caller's `returncode`/stderr check is what should explain it, so the pipe error
+    itself is swallowed rather than allowed to pre-empt that check with a bare
+    `[Errno 32] Broken pipe` (the exact, unhelpful message the owner saw on 2026-09-17).
+    """
+    n = 0
+    try:
+        for frame in frames:
+            proc.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+            n += 1
+    except BrokenPipeError:
+        logger.warning("ffmpeg closed its input after %d frame(s); reading its error", n)
+    finally:
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        proc.wait()
+    return n
 
 
 def write_video(
@@ -244,25 +308,13 @@ def write_video(
 
     def run(enc: str, frames: list[np.ndarray]) -> subprocess.Popen:
         proc = subprocess.Popen(build_cmd(enc), stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            for frame in frames:
-                proc.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
-        finally:
-            proc.stdin.close()
-            proc.wait()
+        pipe_frames(proc, frames)
         return proc
 
     if encoder == "libx264":
         # Fast path: stream frames straight through without buffering them all in memory.
         proc = subprocess.Popen(build_cmd(encoder), stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        n = 0
-        try:
-            for frame in frames_iter:
-                proc.stdin.write(np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
-                n += 1
-        finally:
-            proc.stdin.close()
-            proc.wait()
+        n = pipe_frames(proc, frames_iter)
         if proc.returncode != 0:
             stderr = proc.stderr.read().decode(errors="replace")
             raise RuntimeError(f"ffmpeg failed writing {dst}: {stderr}")
