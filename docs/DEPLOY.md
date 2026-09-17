@@ -191,6 +191,21 @@ and the pod stops itself:
 4. `https://app.yourdomain.com/api/health` → `idle_stop.enabled` confirms it's armed (`false`
    until `RUNPOD_API_KEY` is filled in — off by default, matching the blank env template).
 
+## Pod won't start after a stop ("not enough free GPUs on the host machine")
+
+A **stopped pod does not reserve its GPU**. After an idle auto-stop or a manual Stop, someone else
+may take the card, and Start fails with that message. Nothing is lost — the network volume is
+separate from the pod. Fix from the owner's Mac in one command:
+
+```bash
+bash docker/redeploy.sh
+```
+
+It tries Start once, otherwise terminates the dead pod, creates a fresh one on any host with a GPU
+from its preference list (L4 → A4500 → 4000 Ada → 4090), re-points the VPS at the new pod id, and
+waits for `/api/health`. Boot is ~90 s because deps and models are already on the volume. It reads
+the secrets saved under `~/.ssh/` at deployment time (see the header of the script).
+
 ## Troubleshooting
 
 - **Login overlay never accepts the password** → the pod's `PV_ACCESS_PASSWORD` has trailing
