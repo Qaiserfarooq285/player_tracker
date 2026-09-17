@@ -84,6 +84,20 @@ def create_pod(key: str, args: argparse.Namespace, volume_id: str) -> dict:
         env["RUNPOD_API_KEY"] = key
     if args.gemini_key:
         env["GEMINI_API_KEY"] = args.gemini_key
+    if args.ssh_public_key:
+        # RunPod's own /start.sh (kept alive by the bootstrap) installs this for `ssh root@<ip> -p <port>`.
+        env["PUBLIC_KEY"] = args.ssh_public_key
+    if args.debug:
+        # Keep the container alive after a failed bootstrap and leave its output on the volume, so a
+        # crash-looping pod can be inspected over SSH instead of guessed at from a blank log viewer.
+        start_cmd = (
+            "/start.sh >/workspace/runpod-start.log 2>&1 & export PV_SKIP_RUNPOD_SERVICES=1; "
+            f"curl -fsSL {BOOTSTRAP_URL} -o /workspace/bootstrap.sh && "
+            "bash /workspace/bootstrap.sh >/workspace/bootstrap.log 2>&1; "
+            "echo EXIT=$? >>/workspace/bootstrap.log; sleep infinity"
+        )
+    else:
+        start_cmd = f"curl -fsSL {BOOTSTRAP_URL} | bash"
     body = {
         "name": args.name,
         "imageName": IMAGE,
@@ -95,7 +109,7 @@ def create_pod(key: str, args: argparse.Namespace, volume_id: str) -> dict:
         "networkVolumeId": volume_id,
         "ports": [f"{args.port}/http", "22/tcp"],
         "env": env,
-        "dockerStartCmd": ["bash", "-c", f"curl -fsSL {BOOTSTRAP_URL} | bash"],
+        "dockerStartCmd": ["bash", "-c", start_cmd],
         "supportPublicIp": True,
     }
     print(f"[provision] creating pod {args.name!r}: {args.gpu} ({args.cloud}) with volume {volume_id}")
@@ -115,6 +129,9 @@ def main() -> int:
     ap.add_argument("--idle-minutes", type=int, default=30)
     ap.add_argument("--no-idle-stop", dest="idle_stop", action="store_false")
     ap.add_argument("--gemini-key", default=os.environ.get("GEMINI_API_KEY", ""))
+    ap.add_argument("--ssh-public-key", default="", help="installed for root SSH on the exposed 22/tcp")
+    ap.add_argument("--debug", action="store_true",
+                    help="log the bootstrap to /workspace/bootstrap.log and keep the container alive on failure")
     ap.add_argument("--wait", action="store_true", help="block until the pod reports RUNNING")
     args = ap.parse_args()
 

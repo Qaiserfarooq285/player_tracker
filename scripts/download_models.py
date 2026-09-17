@@ -24,13 +24,17 @@ MODELS = ROOT / "models"
 
 RFDETR_REPO = "julianzu9612/RFDETR-Soccernet"
 RFDETR_DIR = MODELS / "rfdetr-soccernet"
+# local filename -> (path inside the HF repo, sha256 or None). The repo moved the checkpoint under
+# weights/ (2026-09-17, observed as a 404 on every pod boot); the local layout the configs point at
+# (`models/rfdetr-soccernet/checkpoint_best_regular.pth`) stays the same.
 RFDETR_FILES = {
     "checkpoint_best_regular.pth": (
-        "b9ade4bcc2316259582674ebeebbd27bb2e956480428c54114ace567237eb5f9"
+        "weights/checkpoint_best_regular.pth",
+        "b9ade4bcc2316259582674ebeebbd27bb2e956480428c54114ace567237eb5f9",
     ),
-    "config.json": None,
-    "model_metadata.json": None,
-    "README.md": None,
+    "config.json": ("config.json", None),
+    "model_metadata.json": ("model_metadata.json", None),
+    "README.md": ("README.md", None),
 }
 
 JERSEY_DIR = MODELS / "jersey-parseq-soccernet"
@@ -68,7 +72,7 @@ def _check(path: Path, expected: str | None, label: str) -> None:
 
 def fetch_rfdetr() -> None:
     RFDETR_DIR.mkdir(parents=True, exist_ok=True)
-    for name, sha in RFDETR_FILES.items():
+    for name, (remote, sha) in RFDETR_FILES.items():
         dest = RFDETR_DIR / name
         if _ok(dest, sha):
             print(f"  have {dest.relative_to(ROOT)}")
@@ -77,8 +81,12 @@ def fetch_rfdetr() -> None:
         # a machine that already has the weights must not need it just to pass this check.
         from huggingface_hub import hf_hub_download
 
-        print(f"  downloading {RFDETR_REPO}/{name} ...")
-        hf_hub_download(RFDETR_REPO, name, local_dir=str(RFDETR_DIR))
+        print(f"  downloading {RFDETR_REPO}/{remote} ...")
+        got = Path(hf_hub_download(RFDETR_REPO, remote, local_dir=str(RFDETR_DIR)))
+        if got.resolve() != dest.resolve():
+            # local_dir mirrors the repo layout (weights/...), but the configs expect a flat folder.
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            got.replace(dest)
         _check(dest, sha, name)
 
 
