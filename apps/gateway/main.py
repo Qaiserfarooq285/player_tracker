@@ -158,7 +158,7 @@ _SESSION_KEY = secrets.token_bytes(32)
 _SESSION_MAX_AGE_S = 30 * 24 * 3600
 _LOGIN_FAIL_DELAY_S = 0.5
 _PUBLIC_PATH_PREFIXES = ("/api/health", "/api/login", "/api/auth/status")
-_PUBLIC_STATIC_PREFIXES = ("/css/", "/js/", "/favicon")
+_PUBLIC_STATIC_PREFIXES = ("/css/", "/js/", "/assets/", "/favicon")  # the login card needs the logo
 
 
 def _session_token() -> str:

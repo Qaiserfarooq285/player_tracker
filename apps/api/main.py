@@ -142,7 +142,7 @@ _LOGIN_FAIL_DELAY_S = 0.5  # crude brute-force brake; the password is a shared s
 # Prefixes that never need a session: the UI shell itself (it renders the login overlay) and the
 # endpoints the overlay needs to work.
 _PUBLIC_PATH_PREFIXES = ("/api/health", "/api/login", "/api/auth/status")
-_PUBLIC_STATIC_PREFIXES = ("/css/", "/js/", "/favicon")
+_PUBLIC_STATIC_PREFIXES = ("/css/", "/js/", "/assets/", "/favicon")  # the login card needs the logo
 
 
 def _session_token() -> str:
