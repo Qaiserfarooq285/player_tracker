@@ -20,6 +20,7 @@ models/
 *.jpg
 *.jpeg
 !docs/**/*.png
+!apps/web/assets/*.png
 
 # ---- python ----
 __pycache__/

@@ -1,20 +1,36 @@
 /**
- * AI Football Player Tracking & Analytics Engine - Frontend Logic
+ * The Reach Vision -- player tracking & analytics dashboard (frontend logic).
  */
 
 let activeJobId = null;
 let pollingTimer = null;
 let lastLoggedLine = null;
 let currentResults = null;
-let pitchMode = 'trajectory';
 
 document.addEventListener('DOMContentLoaded', async () => {
+  initTheme();
   initLoginGate();
   await ensureAuthenticated();
   initApp();
   initUploadZone();
-  initCanvasPitch();
 });
+
+// ---- Light / dark theme (light is the default; the choice is remembered per browser) ----
+const THEME_KEY = 'reach-theme';
+function initTheme() {
+  const btn = document.getElementById('theme-toggle');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    const dark = document.documentElement.dataset.theme !== 'dark';
+    if (dark) document.documentElement.dataset.theme = 'dark';
+    else delete document.documentElement.dataset.theme;
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', dark ? '#070907' : '#f4f7f5');
+    try { localStorage.setItem(THEME_KEY, dark ? 'dark' : 'light'); } catch (e) { /* private mode */ }
+  });
+  if (document.documentElement.dataset.theme === 'dark') {
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', '#070907');
+  }
+}
 
 // ---- Access gate (hosted deployment, docs/DEPLOY.md) ----
 // The server only enforces a password when PV_ACCESS_PASSWORD is set; locally the overlay never
@@ -91,6 +107,7 @@ function initApp() {
   // while a pod starts or while RunPod has no GPU (docs/DEPLOY.md "Always-on gateway").
   setInterval(checkHealth, HEALTH_POLL_MS);
   loadVideos();
+  loadGpuTiers();
   resumeActiveJob();
 
   document.getElementById('btn-process').addEventListener('click', startPipelineProcessing);
@@ -121,7 +138,7 @@ function updatePreviewVideo() {
 function setJersey(num) {
   document.getElementById('target-jersey-input').value = num;
   document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
-  if (event && event.target) event.target.classList.add('active');
+  if (typeof event !== 'undefined' && event && event.target) event.target.classList.add('active');
   document.getElementById('identity-target-badge').textContent = `Target Jersey #${num}`;
   const lbl = document.getElementById('click-marker-label');
   if (lbl) lbl.textContent = `#${num} | TARGET`;
@@ -192,7 +209,7 @@ function initClickToTrack() {
     }
 
     if (hint) {
-      hint.innerHTML = `<i class="fa-solid fa-crosshair" style="color:#ef4444;"></i> <strong style="color:#ef4444;">Candidate pinned @ ${t.toFixed(1)}s!</strong> The server verifies this click against the tracked target (and may reject it) before locking anything in. Click <em>"Run Player Tracking & Analytics"</em> below.`;
+      hint.innerHTML = `<i class="fa-solid fa-crosshair" style="color:var(--danger);"></i> <strong style="color:var(--danger);">Candidate pinned @ ${t.toFixed(1)}s!</strong> The server verifies this click against the tracked target (and may reject it) before locking anything in. Click <em>"Run Player Tracking & Analytics"</em> below.`;
     }
   });
 }
@@ -297,7 +314,7 @@ function renderFramePlayers(data, videoName) {
       document.getElementById('click-marker')?.classList.add('hidden');
       renderAnchorChips();
       document.getElementById('click-hint').innerHTML =
-        `<i class="fa-solid fa-crosshair" style="color:#10b981;"></i> <strong>Player (chain ID ${p.chain_id}) pinned @ t=${data.t.toFixed(1)}s!</strong> ${targetAnchors.length > 1 ? `${targetAnchors.length} anchors pinned so far -- click more (e.g. after the player re-enters frame) or ` : ''}Click <em>"Run Player Tracking & Analytics"</em> below.`;
+        `<i class="fa-solid fa-crosshair" style="color:var(--green-bright);"></i> <strong>Player (chain ID ${p.chain_id}) pinned @ t=${data.t.toFixed(1)}s!</strong> ${targetAnchors.length > 1 ? `${targetAnchors.length} anchors pinned so far -- click more (e.g. after the player re-enters frame) or ` : ''}Click <em>"Run Player Tracking & Analytics"</em> below.`;
     });
 
     boxesLayer.appendChild(box);
@@ -325,14 +342,13 @@ function renderAnchorChips() {
 
   targetAnchors.forEach((anchor, idx) => {
     const chip = document.createElement('span');
-    chip.style.cssText = 'display:inline-flex; align-items:center; gap:6px; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.4); border-radius:14px; padding:4px 6px 4px 12px; font-size:12px; font-weight:600; color:#10b981; font-family:"JetBrains Mono", monospace;';
+    chip.className = 'anchor-chip';
     const tLabel = typeof anchor.t === 'number' ? `${anchor.t.toFixed(1)}s` : '?';
     chip.innerHTML = `<span>take ${anchor.take_id} &middot; track ${anchor.track_id} &middot; ${tLabel}</span>`;
 
     const removeBtn = document.createElement('button');
     removeBtn.type = 'button';
     removeBtn.setAttribute('aria-label', `Remove anchor take ${anchor.take_id} track ${anchor.track_id}`);
-    removeBtn.style.cssText = 'background:none; border:none; color:inherit; cursor:pointer; font-weight:800; padding:0 2px; line-height:1;';
     removeBtn.textContent = '✕';
     removeBtn.addEventListener('click', () => removeAnchor(idx));
     chip.appendChild(removeBtn);
@@ -349,8 +365,82 @@ function removeAnchor(index) {
   targetAnchors.splice(index, 1);
   renderAnchorChips();
   document.getElementById('click-hint').innerHTML = targetAnchors.length
-    ? `<i class="fa-solid fa-crosshair" style="color:#10b981;"></i> <strong>${targetAnchors.length} anchor(s) pinned.</strong> Click <em>"Run Player Tracking & Analytics"</em> below.`
+    ? `<i class="fa-solid fa-crosshair" style="color:var(--green-bright);"></i> <strong>${targetAnchors.length} anchor(s) pinned.</strong> Click <em>"Run Player Tracking & Analytics"</em> below.`
     : `<i class="fa-solid fa-info-circle"></i> Pause the video at any frame and click directly on the target player to pin the tracking target -- shown at full size for precise clicking.`;
+}
+
+// ---- GPU tier picker (2026-09-19) ----
+// `selectedGpuTier` is what /api/process sends as `gpu_tier`; remembered per browser so a user
+// who always wants Budget does not re-pick it. The gateway validates it against its own tiers.
+const GPU_TIER_KEY = 'reach-gpu-tier';
+let selectedGpuTier = null;
+let gpuTierData = null;
+
+async function loadGpuTiers() {
+  const box = document.getElementById('gpu-tiers');
+  const note = document.getElementById('gpu-note');
+  if (!box) return;
+  try {
+    const res = await fetch('/api/gpus');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`); // a plain pod server has no /api/gpus
+    gpuTierData = await res.json();
+  } catch (err) {
+    box.innerHTML = '';
+    box.classList.add('hidden');
+    note.textContent = '';
+    console.warn('GPU tiers unavailable:', err);
+    return;
+  }
+  let remembered = null;
+  try { remembered = localStorage.getItem(GPU_TIER_KEY); } catch (e) { /* private mode */ }
+  const ids = gpuTierData.tiers.map(t => t.id);
+  selectedGpuTier = ids.includes(remembered) ? remembered : gpuTierData.default;
+  renderGpuTiers();
+}
+
+function renderGpuTiers() {
+  const box = document.getElementById('gpu-tiers');
+  const note = document.getElementById('gpu-note');
+  if (!box || !gpuTierData) return;
+  box.innerHTML = '';
+  gpuTierData.tiers.forEach(tier => {
+    const card = tier.primary;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'gpu-tier' + (tier.id === selectedGpuTier ? ' selected' : '') + (tier.in_stock ? '' : ' unavailable');
+    btn.setAttribute('aria-pressed', tier.id === selectedGpuTier ? 'true' : 'false');
+    const price = card.price_per_hr != null ? `$${card.price_per_hr.toFixed(2)}<small>/hour</small>` : '<small>price unavailable</small>';
+    const vram = card.memory_gb ? `${card.memory_gb} GB` : '';
+    const stockCls = (tier.is_current ? 'current' : (card.stock || 'none')).toLowerCase();
+    const stockTxt = tier.is_current ? 'pod is on this GPU' : (card.stock ? `${card.stock} stock` : 'no stock right now');
+    btn.innerHTML = `
+      <span class="gpu-tier-label">${tier.label}</span>
+      <span class="gpu-tier-card">${card.display_name}${vram ? ' · ' + vram : ''}</span>
+      <span class="gpu-tier-price">${price}</span>
+      <span class="gpu-tier-meta"><span class="stock-pill ${stockCls}">${stockTxt}</span></span>
+      <span class="gpu-tier-blurb">${tier.blurb}</span>`;
+    btn.addEventListener('click', () => {
+      selectedGpuTier = tier.id;
+      try { localStorage.setItem(GPU_TIER_KEY, tier.id); } catch (e) { /* private mode */ }
+      renderGpuTiers();
+    });
+    box.appendChild(btn);
+  });
+
+  const chosen = gpuTierData.tiers.find(t => t.id === selectedGpuTier);
+  const parts = [];
+  if (chosen && gpuTierData.current_gpu_type && !chosen.is_current) {
+    parts.push(`<i class="fa-solid fa-rotate"></i> The pod is currently on ${gpuTierData.current_gpu_type.replace('NVIDIA ', '')}; picking ${chosen.label} restarts it on the new GPU (a few minutes -- your uploads and results stay on the volume).`);
+  }
+  if (chosen && !chosen.in_stock) {
+    parts.push(`<i class="fa-solid fa-hourglass-half"></i> RunPod has no ${chosen.primary.display_name} in ${gpuTierData.datacenter} right now -- the run will wait for one, or pick another tier.`);
+  }
+  if (gpuTierData.prices_error) {
+    parts.push(`<i class="fa-solid fa-triangle-exclamation"></i> Live prices could not be fetched (${gpuTierData.prices_error}).`);
+  } else if (gpuTierData.prices_at) {
+    parts.push(`<i class="fa-solid fa-tag"></i> Prices are RunPod's live Secure Cloud rate in ${gpuTierData.datacenter} (checked ${new Date(gpuTierData.prices_at * 1000).toLocaleTimeString()}).`);
+  }
+  note.innerHTML = parts.join('<br>');
 }
 
 const HEALTH_POLL_MS = 10000;
@@ -376,6 +466,10 @@ async function checkHealth() {
       badge.innerHTML = `<i class="fa-solid ${spec.icon}"></i> ${spec.text(data.pod)}`;
       badge.title = data.pod.message || '';
       badge.className = `status-badge gpu-badge ${spec.cls}`;
+      if (gpuTierData && (data.pod.gpu_name || '') !== (checkHealth._lastGpu || '')) {
+        checkHealth._lastGpu = data.pod.gpu_name || '';
+        loadGpuTiers(); // the pod's card changed (started / swapped): refresh "pod is on this GPU"
+      }
     } else if (data.gpu_available) {
       badge.innerHTML = `<i class="fa-solid fa-microchip"></i> ${data.gpu_name} (CUDA)`;
     } else {
@@ -419,22 +513,19 @@ async function loadVideos() {
         opt.textContent = `${v.name} (${v.size_mb} MB)`;
         select.appendChild(opt);
       });
+      updatePreviewVideo();
+    } else {
+      select.innerHTML = '<option value="">No videos yet -- upload one below</option>';
     }
   } catch (err) {
     console.warn('Error loading video list:', err);
   }
 }
 
-function setJersey(num) {
-  document.getElementById('target-jersey-input').value = num;
-  document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
-  event.target.classList.add('active');
-  document.getElementById('identity-target-badge').textContent = `Target Jersey #${num}`;
-}
-
 function toggleCollapsible(id) {
   const elem = document.getElementById(id);
-  elem.classList.toggle('hidden');
+  const open = elem.classList.toggle('hidden') === false;
+  document.getElementById(`${id.replace('-collapse', '')}-toggle`)?.classList.toggle('open', open);
 }
 
 function initUploadZone() {
@@ -444,12 +535,12 @@ function initUploadZone() {
   zone.addEventListener('click', () => fileInput.click());
   zone.addEventListener('dragover', (e) => {
     e.preventDefault();
-    zone.style.borderColor = '#10b981';
+    zone.classList.add('dragover');
   });
-  zone.addEventListener('dragleave', () => zone.style.borderColor = '');
+  zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
   zone.addEventListener('drop', (e) => {
     e.preventDefault();
-    zone.style.borderColor = '';
+    zone.classList.remove('dragover');
     if (e.dataTransfer.files.length > 0) {
       handleFileUpload(e.dataTransfer.files[0]);
     }
@@ -560,6 +651,11 @@ async function startPipelineProcessing() {
       manual_annotations: manualAnnotations,
       touch_times: touchTimesRaw || null,
     };
+    if (selectedGpuTier) {
+      payload.gpu_tier = selectedGpuTier;
+      const tier = gpuTierData?.tiers.find(t => t.id === selectedGpuTier);
+      if (tier) logTerminal(`GPU: ${tier.label} (${tier.primary.display_name}${tier.primary.price_per_hr != null ? `, $${tier.primary.price_per_hr.toFixed(2)}/h` : ''}).`, 'info');
+    }
 
     // "streamed-gathering-treehouse" plan Stage 1: every accumulated picker-click anchor rides
     // along as its own structured `target_clicks` entry -- the AUTHORITATIVE multi-anchor channel
@@ -716,9 +812,6 @@ function renderDashboard(data) {
     videoPlayer.load();
   }
 
-  // Render 2D Tactical Pitch Canvas
-  drawTacticalPitch(data.pitch_trajectory || []);
-
   // Show Dashboard -- it starts `hidden` in index.html so a fresh page never shows a stale
   // annotated video + placeholder stat values as if they were a real result (Golden Rule 5:
   // nothing on screen should look like a finished analysis until one actually finished).
@@ -734,13 +827,16 @@ function renderDashboard(data) {
  * the (shared, not per-player) video/pitch canvas.
  */
 function renderPlayerStats(player) {
-  const jerseyNum = player.jersey_number || 11;
+  // A clicked target whose number was never legible is shown as "?" -- never a made-up number
+  // (Golden Rule 5; `src.pipeline.annotated_video.target_name` uses the same convention).
+  const hasNumber = player.jersey_number !== null && player.jersey_number !== undefined;
+  const jerseyNum = hasNumber ? player.jersey_number : '?';
 
   // Header Summary
   document.getElementById('dash-jersey-num').textContent = jerseyNum;
   document.getElementById('statcard-jersey-tag').textContent = `#${jerseyNum}`;
-  document.getElementById('dash-player-title').textContent = `TARGET PLAYER #${jerseyNum}`;
-  document.getElementById('dash-identity-status').innerHTML = `<i class="fa-solid fa-shield-check"></i> Identity: ${player.identity_status}`;
+  document.getElementById('dash-player-title').textContent = hasNumber ? `Player #${jerseyNum}` : 'Target player';
+  document.getElementById('dash-identity-status').innerHTML = `<i class="fa-solid fa-shield-halved"></i> Identity: ${player.identity_status}`;
 
   // Stat Card Metrics (#11: touches, passes, turnovers, sprints, goals, assists, shots, tackles, saves)
   document.getElementById('stat-goals').textContent = player.goals || 0;
@@ -752,11 +848,13 @@ function renderPlayerStats(player) {
   document.getElementById('stat-tackles').textContent = player.tackles || 0;
   document.getElementById('stat-saves').textContent = player.saves || 0;
   document.getElementById('stat-turnovers').textContent = player.turnovers || 0;
+  document.getElementById('stat-dribbles').textContent = player.dribbles || 0;
   document.getElementById('stat-possession').textContent = player.possession_time || 'uncertain';
   document.getElementById('stat-distance').textContent = player.distance_covered || 'uncertain';
 
-  // Render Timestamped Event Timeline
+  // Render Timestamped Event Timeline + the per-type breakdown derived from the same rows
   renderEventsTable(player.events || []);
+  renderEventBreakdown(player.events || []);
 }
 
 /**
@@ -805,7 +903,7 @@ function renderEventsTable(events) {
   document.getElementById('timeline-count-badge').textContent = `${events.length} Events`;
 
   if (events.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: #9ca3af;">No specific events detected in clip</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: var(--text-muted);">No events detected in this clip</td></tr>`;
     return;
   }
 
@@ -845,117 +943,35 @@ function seekVideo(timeStr) {
   player.play();
 }
 
-function initCanvasPitch() {
-  const canvas = document.getElementById('pitch-canvas');
-  if (!canvas) return;
-  drawSoccerPitchField(canvas);
-}
+/**
+ * Per-type event counts, drawn as plain CSS bars from the SAME timeline rows the table shows.
+ * Replaces the old "2D tactical pitch" canvas (2026-09-19): `/api/results` deliberately returns
+ * `pitch_trajectory: null` (no calibrated homography on this footage, ADR-6), so that card only
+ * ever drew an empty pitch that looked like missing tracking data. This chart shows only what was
+ * actually detected -- an empty state when nothing was (Golden Rule 5).
+ */
+function renderEventBreakdown(events) {
+  const container = document.getElementById('event-breakdown');
+  if (!container) return;
+  container.innerHTML = '';
 
-function togglePitchMode(mode) {
-  pitchMode = mode;
-  document.querySelectorAll('.pitch-btn').forEach(b => b.classList.remove('active'));
-  event.target.classList.add('active');
-  if (currentResults && currentResults.pitch_trajectory) {
-    drawTacticalPitch(currentResults.pitch_trajectory);
+  const counts = new Map();
+  events.forEach(ev => counts.set(ev.event, (counts.get(ev.event) || 0) + 1));
+  if (counts.size === 0) {
+    container.innerHTML = '<div class="breakdown-empty">No events detected in this clip</div>';
+    return;
   }
-}
-
-function drawSoccerPitchField(canvas) {
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width;
-  const h = canvas.height;
-
-  // Background Grass
-  ctx.fillStyle = '#04140b';
-  ctx.fillRect(0, 0, w, h);
-
-  // Pitch Lines Style
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
-  ctx.lineWidth = 2;
-
-  // Outer Boundary
-  ctx.strokeRect(20, 20, w - 40, h - 40);
-
-  // Center Line & Circle
-  ctx.beginPath();
-  ctx.moveTo(w / 2, 20);
-  ctx.lineTo(w / 2, h - 20);
-  ctx.stroke();
-
-  ctx.beginPath();
-  ctx.arc(w / 2, h / 2, 45, 0, Math.PI * 2);
-  ctx.stroke();
-
-  // Penalty Boxes (Left & Right)
-  ctx.strokeRect(20, (h - 140) / 2, 80, 140);
-  ctx.strokeRect(w - 100, (h - 140) / 2, 80, 140);
-
-  // Goal Mouth Boxes
-  ctx.strokeRect(20, (h - 60) / 2, 30, 60);
-  ctx.strokeRect(w - 50, (h - 60) / 2, 30, 60);
-}
-
-function drawTacticalPitch(points) {
-  const canvas = document.getElementById('pitch-canvas');
-  if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width;
-  const h = canvas.height;
-
-  drawSoccerPitchField(canvas);
-
-  if (!points || points.length === 0) return;
-
-  if (pitchMode === 'trajectory') {
-    // Draw continuous path trajectory line
-    ctx.beginPath();
-    ctx.lineWidth = 3;
-
-    points.forEach((pt, idx) => {
-      const px = 20 + (pt.x / 100) * (w - 40);
-      const py = 20 + (pt.y / 100) * (h - 40);
-
-      if (idx === 0) ctx.moveTo(px, py);
-      else ctx.lineTo(px, py);
-    });
-
-    ctx.strokeStyle = '#10b981';
-    ctx.stroke();
-
-    // Draw individual action points
-    points.forEach((pt, idx) => {
-      const px = 20 + (pt.x / 100) * (w - 40);
-      const py = 20 + (pt.y / 100) * (h - 40);
-
-      ctx.beginPath();
-      if (pt.action === 'Sprint') {
-        ctx.fillStyle = '#f59e0b';
-        ctx.arc(px, py, 5, 0, Math.PI * 2);
-      } else if (pt.action === 'Pass' || pt.action === 'Shot' || pt.action === 'Goal') {
-        ctx.fillStyle = '#06b6d4';
-        ctx.arc(px, py, 7, 0, Math.PI * 2);
-      } else {
-        ctx.fillStyle = '#10b981';
-        ctx.arc(px, py, 3, 0, Math.PI * 2);
-      }
-      ctx.fill();
-    });
-
-  } else {
-    // Heatmap mode
-    points.forEach(pt => {
-      const px = 20 + (pt.x / 100) * (w - 40);
-      const py = 20 + (pt.y / 100) * (h - 40);
-
-      const radGrd = ctx.createRadialGradient(px, py, 2, px, py, 35);
-      radGrd.addColorStop(0, 'rgba(16, 185, 129, 0.4)');
-      radGrd.addColorStop(0.6, 'rgba(245, 158, 11, 0.2)');
-      radGrd.addColorStop(1, 'rgba(0, 0, 0, 0)');
-
-      ctx.fillStyle = radGrd;
-      ctx.fillRect(px - 35, py - 35, 70, 70);
-    });
-  }
+  const rows = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const max = rows[0][1];
+  rows.forEach(([label, n]) => {
+    const row = document.createElement('div');
+    row.className = 'breakdown-row';
+    row.innerHTML = `
+      <span class="breakdown-label">${label}</span>
+      <span class="breakdown-bar"><span class="breakdown-fill" style="width:${(n / max) * 100}%"></span></span>
+      <span class="breakdown-count">${n}</span>`;
+    container.appendChild(row);
+  });
 }
 
 function playReel(category) {

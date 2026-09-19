@@ -1,4 +1,6 @@
-# AI Soccer Highlight Analyzer
+# The Reach Vision — AI Soccer Highlight Analyzer
+
+> Product name: **The Reach Vision** (College Soccer Reach). The web app lives in `apps/web/`; brand green `#24BB61`, black, white; light theme by default with a dark toggle.
 
 Give it **any clip and a target jersey number**, and it produces, fully automatically:
 

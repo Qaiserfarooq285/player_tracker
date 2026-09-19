@@ -1,4 +1,4 @@
-"""FastAPI Application Server for AI Football Player Tracking & Analytics System.
+"""FastAPI Application Server for The Reach Vision (player tracking & analytics).
 
 Provides REST endpoints and media streaming for video upload, player detection, ByteTrack tracking,
 jersey OCR, event detection, movement analytics, and stat card visualization.
@@ -102,7 +102,7 @@ def _canonical_slug(video_path: Path) -> str:
 
 
 app = FastAPI(
-    title="AI Football Player Tracking & Analytics API",
+    title="The Reach Vision API",
     description="YOLO/RF-DETR Detection + ByteTrack + Jersey OCR + Event & Movement Analytics",
     version="1.0.0",
 )

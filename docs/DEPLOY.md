@@ -1,4 +1,4 @@
-# Hosting PitchVision on RunPod with your own domain
+# Hosting The Reach Vision (PitchVision) on RunPod with your own domain
 
 This is the step-by-step for the owner's setup: **RunPod credit** for the GPU and a **Hostinger
 domain** for the address. Nothing here needs a Docker image build or a server you have to
@@ -250,7 +250,14 @@ Without the gateway: terminate the pod in the console and run `docker/runpod_pro
   check the log for a pip error and restart; the install resumes from uv's cache.
 - **Tunnel shows "inactive"** → the token env var is missing/wrong on the pod, or the pod is
   stopped. `cat /workspace/cloudflared.log`.
-- **Domain shows "PitchVision is restarting"** → the gateway service is down. On the VPS:
+- **Choosing the GPU.** The web app's *GPU for this run* picker offers three tiers
+  (`apps/gateway/runpod_pods.py: GPU_TIERS` — Budget RTX 4000 Ada, Standard RTX 4090, Pro A100 80 GB)
+  with RunPod's **live** Secure Cloud per-hour price and per-datacenter stock (`GET /api/gpus`, cached
+  5 min, `PV_GPU_PRICE_TTL_SECONDS`). A run on a tier whose card differs from the pod's current one
+  **replaces the pod** (terminate + create on the new card; the volume is untouched) — expect a
+  few minutes' boot. Blackwell cards (RTX 5090 / RTX PRO) are deliberately absent: the pod image is
+  CUDA 12.4.
+- **Domain shows "The Reach Vision is restarting"** → the gateway service is down. On the VPS:
   `systemctl status pitchvision-gateway`, `journalctl -u pitchvision-gateway -n 50`. It restarts
   itself; if it can't start, the log names the missing env var in `/etc/pitchvision/gateway.env`.
 - **Badge stuck on "No GPU available right now"** → RunPod genuinely has none of `PV_GPU_TYPES`

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified Launcher for AI Football Player Tracking & Analytics Web Server.
+"""Unified Launcher for The Reach Vision (player tracking & analytics) web server.
 
 Environment knobs (all optional; docs/DEPLOY.md):
   PORT     -- listen port (default 8000; RunPod's HTTP proxy expects the port you expose there)
@@ -35,7 +35,7 @@ if __name__ == "__main__":
     else:
         gate_label = "ON"
     print("=" * 70)
-    print("  PITCHVISION AI — Football Player Tracking & Analytics System")
+    print("  THE REACH VISION — Player Tracking & Analytics System")
     print(f"  Server starting at: http://localhost:{port}")
     print(f"  Auto-reload: {'ON (dev)' if reload else 'off'}")
     print(f"  Access gate: {gate_label}")
