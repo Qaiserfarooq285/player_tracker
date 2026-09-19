@@ -230,3 +230,71 @@ def test_attribute_shot_excluded_when_ball_far_from_target():
         attribution_cfg=ATTRIBUTION_CFG,
     )
     assert result == []
+
+
+# ---------------------------------------------------------------------------
+# attribute_events_to_target -- 2026-09-19, "not counting the passes correctly"
+# ---------------------------------------------------------------------------
+
+
+def _pass(passer_raw: int, receiver_raw: int, identity: int, t: float = 3.0) -> Event:
+    return Event(
+        id=f"pass-{t}",
+        type=EventType.PASS,
+        t_start=t,
+        t_end=t + 0.4,
+        player_track_id=identity,
+        take_id=0,
+        confidence=0.3,
+        source="test",
+        evidence={"passer_raw_track_id": passer_raw, "receiver_raw_track_id": receiver_raw},
+    )
+
+
+def test_attribute_pass_kept_when_target_split_across_two_identities():
+    """The target's verified fragments {10, 11, 25} were split by `build_take_identities` into
+    identity 500 (10, 11 -- the majority) and identity 25 (25 + a stranger 40). A pass the target
+    made while tracked as raw 25 used to be dropped by the majority vote; its evidence names raw
+    25, which IS a verified target fragment, so it belongs."""
+    identity_of = {10: 500, 11: 500, 25: 25, 40: 25}
+    ev = _pass(passer_raw=25, receiver_raw=7, identity=25)
+    result = attribute_events_to_target(
+        [ev], [], [], location_track_ids=[10, 11, 25], identity_of=identity_of,
+        attribution_cfg=ATTRIBUTION_CFG,
+    )
+    assert result == [ev]
+
+
+def test_attribute_pass_by_stranger_stitched_into_target_identity_is_excluded():
+    """The mirror case: the partition joined stranger raw 40 into the target's own majority chain
+    500. A pass raw 40 made carries identity 500 but its passer raw id is NOT a verified target
+    fragment -- the human-verified location set wins over the greedy stitch."""
+    identity_of = {10: 500, 11: 500, 40: 500}
+    ev = _pass(passer_raw=40, receiver_raw=7, identity=500)
+    result = attribute_events_to_target(
+        [ev], [], [], location_track_ids=[10, 11], identity_of=identity_of,
+        attribution_cfg=ATTRIBUTION_CFG,
+    )
+    assert result == []
+
+
+def test_attribute_pass_received_by_target_is_not_the_targets_pass():
+    identity_of = {10: 500, 7: 7}
+    ev = _pass(passer_raw=7, receiver_raw=10, identity=7)
+    result = attribute_events_to_target(
+        [ev], [], [], location_track_ids=[10], identity_of=identity_of,
+        attribution_cfg=ATTRIBUTION_CFG,
+    )
+    assert result == []
+
+
+def test_attribute_identity_only_event_belongs_via_any_mapped_identity_not_just_majority():
+    """An event with no raw-id evidence (the generic `_event` helper) whose identity is the
+    MINORITY chain of the target's own fragments still belongs."""
+    identity_of = {10: 500, 11: 500, 25: 25}
+    ev = _event(EventType.TOUCH, 1.0, player_track_id=25)
+    result = attribute_events_to_target(
+        [ev], [], [], location_track_ids=[10, 11, 25], identity_of=identity_of,
+        attribution_cfg=ATTRIBUTION_CFG,
+    )
+    assert result == [ev]

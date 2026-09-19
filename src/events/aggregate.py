@@ -106,6 +106,9 @@ def compute_take_all_events(
             identity_confidence,
             drops,
             kit_lab_by_track_id=kit_lab_by_track_id,
+            # 2026-09-19: the passer must have actually played the ball (kick evidence from the
+            # same series `detect_touches` uses) -- see `detect_passes`' own docstring.
+            ball_states=ball_states,
         )
     )
     events.extend(
@@ -198,6 +201,30 @@ def target_identity_id(location_track_ids: list[int], identity_of: dict[int, int
     return max(counts, key=lambda k: counts[k])
 
 
+def acting_raw_track_ids(ev: Event) -> set[int] | None:
+    """The RAW track id(s) of the player an event is credited to, read from the evidence every
+    identity-space event module already records (pass -> `passer_raw_track_id`, turnover ->
+    `losing_raw_track_id`, touch -> `raw_track_id`, tackle -> `tackler_raw_track_id`, possession/
+    dribble -> `raw_track_ids`). `None` when the event carries no such evidence (sprint/save use a
+    raw id AS `player_track_id`; shot has no player at all)."""
+    ev_evidence = ev.evidence or {}
+    if ev.type == EventType.PASS:
+        key = "passer_raw_track_id"
+    elif ev.type == EventType.TURNOVER:
+        key = "losing_raw_track_id"
+    elif ev.type == EventType.TOUCH:
+        key = "raw_track_id"
+    elif ev.type == EventType.TACKLE:
+        key = "tackler_raw_track_id"
+    elif ev.type in (EventType.POSSESSION, EventType.DRIBBLE):
+        ids = ev_evidence.get("raw_track_ids")
+        return set(ids) if ids else None
+    else:
+        return None
+    raw = ev_evidence.get(key)
+    return {raw} if raw is not None else None
+
+
 def attribute_events_to_target(
     events: list[Event],
     take_tracks: list[Track],
@@ -214,17 +241,34 @@ def attribute_events_to_target(
     raw `Track.id` (sprint; save's goalkeeper), a `build_take_identities` identity id (touch,
     possession, pass, dribble, tackle), or `None` (shot — spatial-proximity attributed, reusing
     `src.highlights.ranking.attribute_shot` exactly as the original Phase-1 Stage 6 flow does).
-    """
-    target_id = target_identity_id(location_track_ids, identity_of)
-    belongs_ids = set(location_track_ids)
-    if target_id is not None:
-        belongs_ids.add(target_id)
 
-    location_tracks = [tr for tr in take_tracks if tr.id in set(location_track_ids)]
+    2026-09-19 (owner: "not counting the passes correctly"), a real attribution hole: the
+    identity-space events used to be matched against ONE identity -- `target_identity_id`'s
+    majority vote. `build_take_identities` seeds its chains earliest-first (its own docstring), so
+    it regularly claims one of the target's later fragments into some other chain, or splits the
+    target across two chains; every pass/touch the target made while tracked under the minority
+    chain was then silently dropped from the stat card. Now:
+
+    * an event whose evidence names the acting RAW track id (`acting_raw_track_ids`) is judged on
+      that id alone -- `location_track_ids` is the human-verified, hard-signal-checked answer to
+      "which raw fragments are the target" (`src.track.target_verify`), which is strictly more
+      trustworthy than either partition's greedy stitching;
+    * an event with only an identity id belongs to the target if that identity is one that ANY
+      verified location fragment maps to (every such chain, not just the majority one).
+    """
+    location_set = set(location_track_ids)
+    belongs_ids = set(location_set)
+    belongs_ids.update(identity_of[rid] for rid in location_track_ids if rid in identity_of)
+
+    location_tracks = [tr for tr in take_tracks if tr.id in location_set]
     attributed: list[Event] = []
     for ev in events:
         if ev.player_track_id is not None:
-            if ev.player_track_id in belongs_ids:
+            raw_ids = acting_raw_track_ids(ev)
+            if raw_ids is not None:
+                if raw_ids & location_set:
+                    attributed.append(ev)
+            elif ev.player_track_id in belongs_ids:
                 attributed.append(ev)
             continue
         if ev.type == EventType.SHOT and attribute_shot(

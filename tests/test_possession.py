@@ -596,3 +596,117 @@ def test_detect_passes_still_counts_a_real_pass_with_plausible_flight_and_travel
     runs = possession.possession_runs_for_take(balls, [p1, p2], cfg)
     events = possession.detect_passes(runs, [p1, p2], take_id=0, events_cfg=cfg)
     assert len([e for e in events if e.type == EventType.PASS]) == 1
+
+
+# ---------------------------------------------------------------------------
+# detect_passes with ball kinematics -- 2026-09-19, "not counting the passes correctly"
+# ---------------------------------------------------------------------------
+
+
+def _ball_states_for(balls, cfg, ref_height=100.0):
+    from src.events.ball_track import build_ball_state_series
+
+    return build_ball_state_series(balls, cfg["ball"], ref_height)
+
+
+def _short_pass_fixture(cfg, kicked: bool):
+    """Two teammates 160px apart (their `possession_max_dist` zones nearly touch), so the ball
+    is out of BOTH zones for only a frame or so -- a real short pass has exactly this signature.
+    `kicked=True`: the ball sits at #1's feet for 0.5s, then is struck (stationary -> 25px/frame).
+    `kicked=False`: the ball drifts at one constant 4px/frame the whole time -- it still crosses
+    from #1's zone into #2's, but its trajectory never changes, i.e. nobody kicked it."""
+    frames = range(0, 60)
+    p1 = _player(1, take_id=0, boxes=[_box(t / 30, 100.0, 100.0) for t in frames],
+                 team=0, team_confidence=0.9)
+    p2 = _player(2, take_id=0, boxes=[_box(t / 30, 260.0, 100.0) for t in frames],
+                 team=0, team_confidence=0.9)
+    balls = []
+    if kicked:
+        for i in range(0, 16):
+            balls.append(_ball(i / 30, 100.0, 100.0))
+        for i in range(16, 30):
+            balls.append(_ball(i / 30, 100.0 + 25.0 * (i - 15), 100.0))
+    else:
+        for i in range(0, 50):
+            balls.append(_ball(i / 30, 100.0 + 4.0 * i, 100.0))
+    return p1, p2, balls
+
+
+def test_detect_passes_counts_a_short_pass_when_the_kick_is_verified():
+    from src.common.logging import DropCounter
+
+    cfg = _events_config()
+    p1, p2, balls = _short_pass_fixture(cfg, kicked=True)
+    runs = possession.possession_runs_for_take(balls, [p1, p2], cfg)
+    b_start = next(b.t_start for b in runs if b.identity == 2)
+    a_end = next(a.t_end for a in runs if a.identity == 1)
+    gap = b_start - a_end
+    assert gap < cfg["pass"]["pass_min_flight_s"], "fixture must be a SHORT flight"
+
+    drops = DropCounter("t")
+    # without kinematics the flight floor alone still (correctly, conservatively) says flicker
+    assert not possession.detect_passes(runs, [p1, p2], 0, cfg, drops=drops)
+    assert drops.as_dict().get("pass_flight_too_short", 0) >= 1
+
+    states = _ball_states_for(balls, cfg)
+    events = possession.detect_passes(runs, [p1, p2], 0, cfg, ball_states=states)
+    passes = [e for e in events if e.type == EventType.PASS]
+    assert len(passes) == 1
+    assert passes[0].player_track_id == 1
+    assert passes[0].evidence["kick_verified"] is True
+
+
+def test_detect_passes_short_flight_without_a_kick_is_still_flicker():
+    from src.common.logging import DropCounter
+
+    cfg = _events_config()
+    p1, p2, balls = _short_pass_fixture(cfg, kicked=False)
+    runs = possession.possession_runs_for_take(balls, [p1, p2], cfg)
+    assert [r.identity for r in runs] == [1, 2]
+    states = _ball_states_for(balls, cfg)
+    drops = DropCounter("t")
+    events = possession.detect_passes(runs, [p1, p2], 0, cfg, drops=drops, ball_states=states)
+    assert not [e for e in events if e.type == EventType.PASS]
+    assert drops.as_dict().get("pass_flight_too_short", 0) >= 1
+
+
+def test_detect_passes_drops_a_fly_by_past_a_third_player():
+    """#1 kicks to #2; the ball rolls straight past #3 (one sample inside #3's zone, trajectory
+    unchanged). #3 must NOT be credited with a 'pass' to #2 -- the pre-existing behaviour did
+    exactly that whenever the #3->#2 gap cleared `pass_min_flight_s`."""
+    from src.common.logging import DropCounter
+
+    cfg = _events_config()
+    frames = range(0, 90)
+    p1 = _player(1, 0, [_box(t / 30, 100.0, 100.0) for t in frames], team=0, team_confidence=0.9)
+    p3 = _player(3, 0, [_box(t / 30, 400.0, 100.0) for t in frames], team=0, team_confidence=0.9)
+    p2 = _player(2, 0, [_box(t / 30, 700.0, 100.0) for t in frames], team=0, team_confidence=0.9)
+    balls = [_ball(i / 30, 100.0 + i, 100.0) for i in range(0, 16)]  # at #1's feet, 0.5s
+    # kicked at 0.5s: 20px/frame straight through #3's zone (x 330-470, ~7 frames) on to #2
+    for i in range(16, 60):
+        balls.append(_ball(i / 30, 115.0 + 20.0 * (i - 15), 100.0))
+    runs = possession.possession_runs_for_take(balls, [p1, p2, p3], cfg)
+    assert [r.identity for r in runs] == [1, 3, 2], [r.identity for r in runs]
+    states = _ball_states_for(balls, cfg)
+    drops = DropCounter("t")
+    events = possession.detect_passes(runs, [p1, p2, p3], 0, cfg, drops=drops, ball_states=states)
+    passers = sorted(e.player_track_id for e in events if e.type == EventType.PASS)
+    assert 3 not in passers, "the fly-by player must never be credited"
+    assert drops.as_dict().get("pass_passer_never_played_ball", 0) >= 1
+
+
+def test_pass_confidence_does_not_veto_a_pass_inside_pass_max_dist():
+    """A 700px pass (inside the measured 750px `pass_max_dist`) with ordinary run quality used to
+    fall under `min_emit_confidence` purely through the closeness term reaching ~0."""
+    cfg = _events_config()
+    pass_cfg = cfg["pass"]
+    min_emit = cfg["confidence"]["min_emit_confidence"]
+    conf = possession.pass_confidence(0.7, 0.7, 700.0, pass_cfg)
+    assert conf >= min_emit
+    # ...and distance still lowers the (unclamped) closeness relative to a tap to a neighbour
+    assert possession.travel_closeness(700.0, pass_cfg) < possession.travel_closeness(
+        50.0, pass_cfg
+    )
+    floor = pass_cfg["distance_closeness_floor"]
+    assert possession.travel_closeness(pass_cfg["pass_max_dist"], pass_cfg) == pytest.approx(floor)
+    assert possession.travel_closeness(0.0, pass_cfg) == pytest.approx(1.0)

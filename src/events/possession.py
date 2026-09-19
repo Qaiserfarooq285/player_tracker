@@ -42,8 +42,14 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from src.common.types import BallDetection, DetectionClass, Event, EventType, Track, TrackBox
+from src.events.ball_track import BallState
 from src.events.sprints import track_speed_series
-from src.events.touches import POSSESSOR_CLASSES, nearest_box_in_time, nearest_player_edge_distance
+from src.events.touches import (
+    POSSESSOR_CLASSES,
+    has_contact_evidence,
+    nearest_box_in_time,
+    nearest_player_edge_distance,
+)
 
 # `configs/hardware.yaml: stages.ball.fps_sample` — the ball's own sampling rate, used as the
 # default "how many samples SHOULD exist over this duration" denominator for continuity scoring.
@@ -327,14 +333,33 @@ def _ball_travel(run_a: PossessionRun, run_b: PossessionRun) -> float:
     return ((bx_b - bx_a) ** 2 + (by_b - by_a) ** 2) ** 0.5
 
 
+def travel_closeness(travel: float, pass_cfg: dict) -> float:
+    """How plausible `travel` px of ball movement is for ONE pass, in `[floor, 1]`: linear from
+    1.0 at zero travel down to `pass.distance_closeness_floor` at `pass_max_dist`.
+
+    Owner-reported 2026-09-19 ("not counting the passes correctly"), traced in code: this used to
+    reach 0.0 at `pass_max_dist`, so `closeness * mean(quality)` fell under
+    `confidence.min_emit_confidence` (0.15) at roughly 550-590px for a typical run quality of
+    ~0.7 -- a SECOND, undocumented distance cap ~20-25% tighter than the measured `pass_max_dist`
+    (750px) that `detect_passes` already enforces explicitly. A pass inside the measured plausible
+    distance must not be dropped by the confidence formula alone; distance now only LOWERS the
+    confidence, it never vetoes (the explicit `pass_max_dist` gate still does).
+    """
+    max_d = pass_cfg["pass_max_dist"]
+    floor = pass_cfg.get("distance_closeness_floor", 0.0)
+    if max_d <= 0:
+        return 1.0
+    frac = min(1.0, travel / max_d)
+    return 1.0 - (1.0 - floor) * frac
+
+
 def pass_confidence(quality_a: float, quality_b: float, travel: float, pass_cfg: dict) -> float:
     """`closeness(travel) * mean(quality_a, quality_b)`, clamped to `pass`'s own ceiling. Combines
-    two UNCLAMPED possession qualities (see `possession_quality`) rather than two already-capped
+    the two runs' UNCLAMPED qualities rather than their already-ceiling-clamped possession
     confidences, so a real pass doesn't get squared-away below `min_emit_confidence` just because
-    each half of it was itself a low-ceiling possession event."""
-    max_d = pass_cfg["pass_max_dist"]
-    closeness = 1.0 - min(1.0, travel / max_d) if max_d > 0 else 1.0
-    raw = closeness * ((quality_a + quality_b) / 2.0)
+    both its constituent possessions are individually capped low. See `travel_closeness` for why
+    the distance term has a floor."""
+    raw = travel_closeness(travel, pass_cfg) * ((quality_a + quality_b) / 2.0)
     return min(pass_cfg["max_confidence"], max(pass_cfg["min_confidence"], raw))
 
 
@@ -342,13 +367,11 @@ def turnover_confidence(
     quality_a: float, quality_b: float, travel: float, pass_cfg: dict, turnover_cfg: dict
 ) -> float:
     """ADR-20: the SAME `closeness(travel) * mean(quality_a, quality_b)` shape as `pass_confidence`
-    (reuses `pass_cfg['pass_max_dist']` for the closeness term -- a turnover is measured against
-    the identical "is this ball travel plausible for one continuous possession change" scale a
-    pass is, it just landed on the WRONG colour), clamped to `turnover`'s own
-    `configs/events.yaml` ceiling instead of `pass`'s."""
-    max_d = pass_cfg["pass_max_dist"]
-    closeness = 1.0 - min(1.0, travel / max_d) if max_d > 0 else 1.0
-    raw = closeness * ((quality_a + quality_b) / 2.0)
+    (reuses `pass_cfg`'s own `travel_closeness` scale -- a turnover is measured against the
+    identical "is this ball travel plausible for one continuous possession change" scale a pass
+    is, it just landed on the WRONG colour), clamped to `turnover`'s own `configs/events.yaml`
+    ceiling instead of `pass`'s."""
+    raw = travel_closeness(travel, pass_cfg) * ((quality_a + quality_b) / 2.0)
     return min(turnover_cfg["max_confidence"], max(turnover_cfg["min_confidence"], raw))
 
 
@@ -361,10 +384,32 @@ def detect_passes(
     identity_confidence: dict[int, float] | None = None,
     drops=None,
     kit_lab_by_track_id: dict[int, np.ndarray] | None = None,
+    ball_states: list[BallState] | None = None,
 ) -> list[Event]:
     """`PASS` events between adjacent runs (in `runs`' own time order — i.e. no other identity's
     run sits between them, see `_merge_possession_runs`) by DIFFERENT, confidently-SAME-team
     identities, close enough in time (`pass_max_gap_s`) and ball-travel (`pass_max_dist`).
+
+    `ball_states` (`src.events.ball_track.build_ball_state_series`, the same per-take series
+    `detect_touches` consumes; 2026-09-19, owner-reported "not counting the passes correctly"):
+    when supplied, the passer must have actually PLAYED the ball -- `has_contact_evidence` at the
+    end of run A (the ball's own velocity vector changed, exactly the touch detector's measured
+    test) OR a run A long enough to be a real possession (`possession_min_duration_s`). Two
+    real defects this closes on the same footage:
+
+    * A SHORT pass (5-8 m, the most common pass there is) was uncountable: `pass_min_flight_s`
+      requires the ball to sit outside BOTH players' `possession_max_dist` zones, and for two
+      players that close those zones nearly touch, so the ball was "in flight" for 1-3 frames and
+      the pass was dropped as flicker. With a verified kick at run A's end, a short flight IS a
+      pass -- flicker (the ball barely moving between two adjacent players) shows no velocity
+      change and is still dropped.
+    * A FLY-BY over-counted: a ball passing within `possession_max_dist` of a third player on its
+      way to the receiver creates a one-sample run for that player, which then got credited with
+      a "pass" to the receiver. No contact evidence and no real possession -> dropped, logged.
+
+    `None` (the default, and every pre-existing caller/test) keeps the exact previous behaviour:
+    the `pass_min_flight_s` floor alone decides, since without ball kinematics there is no way to
+    tell a kick from flicker.
 
     `player_track_id` is the PASSER (run A's identity) — CLAUDE.md §13.2 lists "Passes" as a
     per-player stat, and the conventional football-stats reading credits the player who PLAYED the
@@ -388,6 +433,7 @@ def detect_passes(
     pass_cfg = events_cfg["pass"]
     possession_cfg = events_cfg["possession"]
     kit_colour_cfg = events_cfg["kit_colour"]
+    touch_cfg = events_cfg["touch"]
     min_emit = events_cfg["confidence"]["min_emit_confidence"]
     tracks_by_id = {tr.id: tr for tr in tracks}
     # Owner spec ("Implement event cooldown/state logic... FPS-aware") + measured real bug: on
@@ -408,12 +454,26 @@ def detect_passes(
             if drops is not None:
                 drops.drop("pass_gap_too_large")
             continue
+
+        # Did A actually play the ball? (only decidable with ball kinematics, see docstring)
+        kicked: bool | None = None
+        if ball_states is not None:
+            kicked, _debug = has_contact_evidence(ball_states, run_a.t_end, touch_cfg)
+            possessed = (run_a.t_end - run_a.t_start) >= possession_cfg["possession_min_duration_s"]
+            if not kicked and not possessed:
+                # a fly-by: one or two ball samples near A with the ball's trajectory unchanged
+                if drops is not None:
+                    drops.drop("pass_passer_never_played_ball")
+                continue
+
         # The ball must actually be IN FLIGHT between the two possessions. Owner-reported
         # 2026-09-16 ("for 1 pass it counts 5"): every false positive measured on clip5_77 had a
         # gap of 1-6 frames -- possession flickering between adjacent players, not a kicked ball,
         # which is out of anyone's possession for the whole time it travels. See
         # `configs/events.yaml: pass.pass_min_flight_s` for the measurement. Logged, never silent.
-        if gap < pass_cfg["pass_min_flight_s"]:
+        # A VERIFIED kick at A's end (`kicked`) is the physical evidence this floor was standing in
+        # for, so it is only applied when that evidence is unavailable or absent (2026-09-19).
+        if gap < pass_cfg["pass_min_flight_s"] and not kicked:
             if drops is not None:
                 drops.drop("pass_flight_too_short")
             continue
@@ -430,8 +490,12 @@ def detect_passes(
                 drops.drop("pass_ball_travel_too_far")
             continue
         # ...and it must actually have gone somewhere: a ball that "moved" a few dozen px in one
-        # frame is detection jitter (measured: 38px at t=10.87 on clip5_77), not a pass.
-        if travel < pass_cfg["pass_min_travel_px"]:
+        # frame is detection jitter (measured: 38px at t=10.87 on clip5_77), not a pass. `travel`
+        # is measured from the last sample inside A's zone to the first inside B's, so for a short
+        # pass between two players whose zones nearly touch it is only a few px even though the
+        # ball was clearly struck -- a verified kick (a real velocity change, which jitter never
+        # produces) therefore overrides this floor exactly as it overrides the flight floor.
+        if travel < pass_cfg["pass_min_travel_px"] and not kicked:
             if drops is not None:
                 drops.drop("pass_ball_travel_too_short")
             continue
@@ -486,6 +550,8 @@ def detect_passes(
                         "receiver_raw_track_id": raw_b,
                         "ball_travel_px": travel,
                         "gap_s": gap,
+                        # None = no ball kinematics supplied (flight floor alone decided)
+                        "kick_verified": kicked,
                         "calibrated": False,
                         "unit": "pixels_at_detect_stage_resolution",
                     },

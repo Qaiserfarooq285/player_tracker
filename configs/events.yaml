@@ -432,6 +432,17 @@ pass:
   # ⚠️ REASONED against the measured false-positive distribution, NOT validated against
   # hand-labeled real pass sequences -- consistent with the owner's stated preference for pass
   # counting ("strict -- fewer, high-confidence") and Golden Rule 5 (unknown beats false).
+  # 2026-09-19 (owner: "not counting the passes correctly"): the floor above is now only the
+  # FALLBACK evidence of a real pass. When the per-take ball-state series is available (always,
+  # in the real pipeline -- src/events/aggregate.py passes it in), src/events/possession.py::
+  # detect_passes first asks whether the passer actually PLAYED the ball: `touch.contact_window_s`
+  # / `touch.min_velocity_change` (the touch detector's own measured kick test) at the end of the
+  # passer's run, or a run at least `possession.possession_min_duration_s` long. A verified kick
+  # lets a SHORT pass through even when the ball was "in flight" for under `pass_min_flight_s` --
+  # two players 5-8 m apart have `possession_max_dist` zones that nearly touch, so a real short
+  # pass is out of both zones for only 1-3 frames and this floor alone made it uncountable. No
+  # kick AND no real possession = a fly-by (ball rolling past a third player on its way to the
+  # receiver) -> dropped as `pass_passer_never_played_ball`, never credited.
   pass_min_travel_px: 60 # ⚠️ REASONED -- same px unit and coordinate space as `pass_max_dist`
   # above (kept in px, not bbox-heights, purely so the two bounds on ONE quantity share a unit).
   # Companion floor to `pass_min_flight_s`: one measured false positive on clip5_77 (t=10.87)
@@ -444,6 +455,15 @@ pass:
   # `shot.ball_speed_threshold` is (no direct ball-flight-time measurement on this footage,
   # deliberately conservative) — short enough to exclude a slow, unrelated build-up that only
   # coincidentally ends at a teammate.
+  distance_closeness_floor: 0.5 # 2026-09-19 (owner: "not counting the passes correctly"). The
+  # confidence term `closeness(travel)` used to fall linearly to 0.0 at `pass_max_dist`, so
+  # `closeness * mean(run quality)` dropped under `confidence.min_emit_confidence` (0.15) at only
+  # ~550-590px for a typical run quality of ~0.7 -- an undocumented second distance cap 20-25%
+  # tighter than the measured `pass_max_dist` above. Distance now scales confidence between 1.0
+  # (no travel) and this floor (at `pass_max_dist`); the explicit `pass_max_dist` gate is the ONLY
+  # thing that vetoes on distance. 0.5 = a pass at the very edge of plausible distance is worth
+  # half the confidence of a tap to a neighbour. ⚠️ REASONED, not measured. Also shapes
+  # `turnover_confidence` (same formula, ADR-20).
   team_confidence_threshold: 0.5 # gates "is B a TEAMMATE of A" on BOTH possessors' own
   # `team_confidence` clearing this bar (ADR-12: team is a soft signal, ⚠️ see below) — same VALUE
   # as `configs/highlights.yaml: selection.team_match_confidence_threshold`, kept independently
