@@ -455,5 +455,16 @@ async def serve_media(request: Request, path: str):
     return await _proxy(request, "playing this video")
 
 
+@app.middleware("http")
+async def _no_cache_html(request: Request, call_next):
+    """The page itself must never be served stale: after a redeploy a browser holding a cached
+    index.html keeps the OLD design/markup while the (content-hashed) css/js it references is
+    new. Hashed assets stay cacheable; only HTML is revalidated on every load."""
+    response = await call_next(request)
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
+
 if WEB_DIR.exists():
     app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
