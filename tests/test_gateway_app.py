@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 import apps.gateway.jobs as jobs_mod
 import apps.gateway.pod_manager as pm
+import apps.gateway.runpod_pods as main_rp
 from apps.gateway.jobs import JobStore, JobWorker
 
 
@@ -153,7 +154,8 @@ class FakePods:
     def refresh(self):
         return self.state
 
-    def ensure_online(self, on_progress=lambda *a: None, deadline_s=None):
+    def ensure_online(self, on_progress=lambda *a: None, deadline_s=None, gpu_types=None):
+        self.gpu_types_asked = gpu_types
         for phase, msg in self.phases:
             self.state.phase = phase
             on_progress(phase, msg)
@@ -241,3 +243,96 @@ def test_worker_fails_job_when_pod_vanishes_mid_run(tmp_path):
     job = store.create("a.mp4", {"video_name": "a.mp4"})
     with pytest.raises(RuntimeError, match="stopped answering"):
         worker.run_job(job)
+
+
+# ---------------------------------------------------------------------------
+# GPU tiers with live prices (2026-09-19)
+# ---------------------------------------------------------------------------
+
+
+def test_gpus_endpoint_lists_tiers_with_live_prices_and_stock(gw, monkeypatch):
+    client, main = gw
+    def offer(name, gb, price, stock):
+        return {"display_name": name, "memory_gb": gb, "price_per_hr": price, "stock": stock}
+
+    offers = {
+        "NVIDIA GeForce RTX 4090": offer("RTX 4090", 24, 0.74, "High"),
+        "NVIDIA RTX 4000 Ada Generation": offer("RTX 4000 Ada", 20, 0.28, "Low"),
+        "NVIDIA A100-SXM4-80GB": offer("A100 SXM", 80, 1.59, None),
+    }
+    calls = []
+
+    def fake_fetch(api_key, datacenter, **kw):
+        calls.append((api_key, datacenter))
+        return offers
+
+    monkeypatch.setattr(main.rp, "fetch_gpu_offers", fake_fetch)
+    main._GPU_OFFERS.update(at=0.0, offers={}, error="")
+    main.PODS.state.gpu_type = "NVIDIA GeForce RTX 4090"
+
+    data = client.get("/api/gpus").json()
+    assert data["default"] == "standard"
+    assert calls == [("k", main.PODS.cfg.datacenter)]
+    by_id = {t["id"]: t for t in data["tiers"]}
+    assert list(by_id) == ["budget", "standard", "pro"]
+    assert by_id["standard"]["primary"]["price_per_hr"] == 0.74
+    assert by_id["standard"]["is_current"] is True and by_id["budget"]["is_current"] is False
+    assert by_id["budget"]["primary"]["display_name"] == "RTX 4000 Ada"
+    # the A100 is not stocked in this datacenter -> tier says so, still listed with its price
+    assert by_id["pro"]["in_stock"] is False and by_id["pro"]["primary"]["price_per_hr"] == 1.59
+    assert data["prices_error"] is None
+
+    # cached: a second call does not hit RunPod again
+    client.get("/api/gpus")
+    assert len(calls) == 1
+
+
+def test_gpus_endpoint_survives_a_failed_price_lookup(gw, monkeypatch):
+    client, main = gw
+
+    def broken(*a, **k):
+        raise main.rp.RunPodError("boom")
+
+    monkeypatch.setattr(main.rp, "fetch_gpu_offers", broken)
+    main._GPU_OFFERS.update(at=0.0, offers={}, error="")
+    data = client.get("/api/gpus").json()
+    assert data["prices_error"] == "boom"
+    assert [t["id"] for t in data["tiers"]] == ["budget", "standard", "pro"]
+    assert data["tiers"][1]["primary"]["price_per_hr"] is None  # unknown, never a made-up number
+
+
+def test_process_rejects_an_unknown_gpu_tier_and_keeps_a_known_one(gw):
+    client, main = gw
+    _upload(client, "g.mp4", b"xx")
+    bad = client.post("/api/process", json={"video_name": "g.mp4", "gpu_tier": "quantum"})
+    assert bad.status_code == 400
+    ok = client.post(
+        "/api/process", json={"video_name": "g.mp4", "gpu_tier": "budget", "target_jersey": 7}
+    )
+    assert ok.status_code == 200, ok.text
+    job = main.JOBS.get(ok.json()["job_id"])
+    assert job["gpu_tier"] == "budget"
+    assert "gpu_tier" not in job["payload"] and job["payload"]["target_jersey"] == 7
+
+
+DONE = {"status": "completed", "stage": "Finished", "progress": 100, "slug": "a", "logs": []}
+
+
+def test_worker_wakes_the_pod_on_the_picked_gpu_tier_and_forwards_a_clean_payload(tmp_path):
+    pod = FakePodClient([DONE], has_video=True)
+    pods = FakePods()
+    store, worker = _worker(tmp_path, pod, pods)
+    job = store.create("a.mp4", {"video_name": "a.mp4", "gpu_tier": "budget", "target_jersey": 9})
+    worker.run_job(job)
+    assert pods.gpu_types_asked == main_rp.gpu_tier("budget")["gpu_type_ids"]
+    assert pod.process_payloads[-1] == {"video_name": "a.mp4", "target_jersey": 9}
+    final = store.get(job["job_id"])
+    assert final["status"] == "completed" and final["gpu_tier"] == "budget"
+
+
+def test_worker_without_a_tier_asks_for_the_default(tmp_path):
+    pod = FakePodClient([DONE], has_video=True)
+    pods = FakePods()
+    store, worker = _worker(tmp_path, pod, pods)
+    worker.run_job(store.create("a.mp4", {"video_name": "a.mp4"}))
+    assert pods.gpu_types_asked is None

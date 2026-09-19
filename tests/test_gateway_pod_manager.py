@@ -24,6 +24,7 @@ class FakeRunPod:
         self.start_ok = start_ok
         self.healthy_after_polls = healthy_after_polls
         self.calls: list[str] = []
+        self.created_bodies: list[dict] = []
         self._next_id = 1
         self.health_polls: dict[str, int] = {}
 
@@ -59,6 +60,7 @@ class FakeRunPod:
         self.calls.append("create")
         if not self.create_ok:
             raise RunPodError("POST /pods -> HTTP 500: There are no longer any instances available", 500)
+        self.created_bodies.append(body)
         pod_id = f"new{self._next_id}"
         self._next_id += 1
         self.pods[pod_id] = {"id": pod_id, "name": body["name"], "desiredStatus": "RUNNING", "gpuCount": 1,
@@ -250,3 +252,48 @@ def test_refresh_reports_without_acting(make):
     assert st.pod_id == "old1"
     assert not any(c.startswith(("start", "create", "terminate")) for c in fake.calls)
     assert st.public() == {"phase": "offline", "message": st.message, "gpu_name": ""}
+
+
+# ---------------------------------------------------------------------------
+# GPU tier selection (2026-09-19)
+# ---------------------------------------------------------------------------
+
+BUDGET = ("NVIDIA RTX 4000 Ada Generation", "NVIDIA RTX A5000")
+
+
+def test_explicit_gpu_pick_replaces_a_pod_on_another_card(make):
+    """The user picked Budget; the stopped pod is a 4090. It must be terminated and a new pod
+    created with the Budget cards -- never silently started on the card they did not pick."""
+    fake = FakeRunPod([dict(STOPPED_POD)])
+    mgr, clock = make(fake)
+    st = mgr.ensure_online(gpu_types=BUDGET)
+    assert st.phase == pm.ONLINE
+    assert fake.calls.index("terminate:old1") < fake.calls.index("create")
+    assert "start:old1" not in fake.calls
+    assert tuple(fake.created_bodies[-1]["gpuTypeIds"]) == BUDGET
+
+
+def test_explicit_gpu_pick_keeps_a_pod_already_on_that_card(make):
+    fake = FakeRunPod([dict(STOPPED_POD)])
+    mgr, clock = make(fake)
+    st = mgr.ensure_online(gpu_types=("NVIDIA GeForce RTX 4090",))
+    assert st.phase == pm.ONLINE and st.pod_id == "old1"
+    assert "create" not in fake.calls
+
+
+def test_no_gpu_pick_never_swaps_an_existing_pod(make):
+    """A plain wake-up (no tier) keeps whatever card the pod has, even off the default list."""
+    l4 = dict(STOPPED_POD, machine={"gpuTypeId": "NVIDIA L4"})
+    fake = FakeRunPod([l4])
+    mgr, clock = make(fake)
+    st = mgr.ensure_online()
+    assert st.phase == pm.ONLINE and st.pod_id == "old1"
+    assert "create" not in fake.calls and "terminate:old1" not in fake.calls
+
+
+def test_gpu_pick_is_used_when_creating_from_nothing(make):
+    fake = FakeRunPod([])
+    mgr, clock = make(fake)
+    st = mgr.ensure_online(gpu_types=BUDGET)
+    assert st.phase == pm.ONLINE
+    assert tuple(fake.created_bodies[-1]["gpuTypeIds"]) == BUDGET

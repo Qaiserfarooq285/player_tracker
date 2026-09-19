@@ -34,6 +34,7 @@ from typing import Any
 
 import requests
 
+from apps.gateway import runpod_pods as rp
 from apps.gateway.pod_client import PodClient
 from apps.gateway.pod_manager import ONLINE, PodManager, PodUnavailable
 
@@ -93,10 +94,15 @@ class JobStore:
     def create(self, video_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             job_id = uuid.uuid4().hex[:8]
+            # `gpu_tier` (2026-09-19) is the gateway's own field -- the user's GPU pick, one of
+            # `rp.GPU_TIERS` -- so it is lifted out of the payload the pod receives.
+            payload = dict(payload)
+            gpu_tier = payload.pop("gpu_tier", None) or None
             job = {
                 "job_id": job_id,
                 "video_name": video_name,
                 "payload": payload,
+                "gpu_tier": gpu_tier,
                 "status": QUEUED,
                 "stage": "Queued",
                 "progress": 0,
@@ -207,12 +213,12 @@ class JobWorker:
 
         # A gateway restart mid-run: the pod may still be working on it -- re-attach, don't restart.
         if job["status"] == RUNNING and job.get("pod_job_id"):
-            self._ensure_pod(job_id)
+            self._ensure_pod(job_id)  # whatever card it is on: never swap a pod mid-run
             self._mirror_until_done(job_id, job["pod_job_id"])
             return
 
-        # 1. GPU pod
-        self._ensure_pod(job_id)
+        # 1. GPU pod -- on the card the user picked for this run, when they picked one.
+        self._ensure_pod(job_id, gpu_tier=job.get("gpu_tier"))
 
         # 2. The file. Uploaded to the VPS; the pod's volume may already have it from a past run.
         if local.exists():
@@ -246,7 +252,9 @@ class JobWorker:
         # 4. Mirror progress until it ends.
         self._mirror_until_done(job_id, pod_job_id)
 
-    def _ensure_pod(self, job_id: str) -> None:
+    def _ensure_pod(self, job_id: str, gpu_tier: str | None = None) -> None:
+        tier = rp.gpu_tier(gpu_tier)
+
         def on_progress(phase: str, message: str) -> None:
             status = WAITING_GPU if phase == "waiting_for_gpu" else STARTING_GPU
             stage = {
@@ -262,11 +270,20 @@ class JobWorker:
             self.pods.refresh()
         if self.pods.state.phase != ONLINE:
             on_progress(self.pods.state.phase or "starting", "Checking the GPU pod...")
+        if tier is not None:
+            self.store.update(job_id, log=f"GPU: {tier['label']} tier ({tier['gpu_type_ids'][0]}).")
         try:
-            self.pods.ensure_online(on_progress)
+            self.pods.ensure_online(on_progress, gpu_types=tier["gpu_type_ids"] if tier else None)
         except PodUnavailable as exc:
             raise RuntimeError(f"GPU pod unavailable: {exc}") from exc
-        self.store.update(job_id, pod_phase=ONLINE)
+        st = self.pods.state
+        self.store.update(
+            job_id,
+            pod_phase=ONLINE,
+            gpu_type=st.gpu_type,
+            cost_per_hr=st.cost_per_hr,
+            log=f"GPU pod online: {st.gpu_name or st.gpu_type} at ${st.cost_per_hr:.2f}/h.",
+        )
 
     def _mirror_until_done(self, job_id: str, pod_job_id: str) -> None:
         # The pod keeps the full pipeline log; mirror all of it after whatever the gateway logged

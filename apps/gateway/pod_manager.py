@@ -219,14 +219,37 @@ class PodManager:
 
     # ---------------------------------------------------------------- the state machine
 
-    def ensure_online(self, on_progress: ProgressFn = _no_progress, deadline_s: float | None = None) -> PodState:
+    def ensure_online(
+        self,
+        on_progress: ProgressFn = _no_progress,
+        deadline_s: float | None = None,
+        gpu_types: tuple[str, ...] | list[str] | None = None,
+    ) -> PodState:
         """Block until the pod's app answers `/api/health`, doing whatever RunPod needs along the
         way. Reports each phase change via `on_progress`. Raises `PodUnavailable` only for an
-        auth error or when `deadline_s` (seconds from now, `None` = wait forever) passes."""
-        with self._lock:
-            return self._ensure_online_locked(on_progress, deadline_s)
+        auth error or when `deadline_s` (seconds from now, `None` = wait forever) passes.
 
-    def _ensure_online_locked(self, on_progress: ProgressFn, deadline_s: float | None) -> PodState:
+        `gpu_types` (2026-09-19, the user's GPU pick in the web app -- `rp.GPU_TIERS`): the GPU
+        type ids acceptable for THIS request, in order of preference. A pod that exists on a card
+        outside that list is replaced (its volume -- uploads, results -- is untouched) so the run
+        really happens on what the user chose and is billed at. `None` = the configured default,
+        used only when a pod has to be CREATED -- an existing pod on any card is kept as before
+        (a plain wake-up must never throw a healthy pod away)."""
+        with self._lock:
+            return self._ensure_online_locked(
+                on_progress,
+                deadline_s,
+                tuple(gpu_types) if gpu_types else self.cfg.gpu_types,
+                strict_gpu=bool(gpu_types),
+            )
+
+    def _ensure_online_locked(
+        self,
+        on_progress: ProgressFn,
+        deadline_s: float | None,
+        wanted: tuple[str, ...],
+        strict_gpu: bool = False,
+    ) -> PodState:
         started = self._clock()
         deadline = started + deadline_s if deadline_s is not None else None
         last_reported: tuple[str, str] | None = None
@@ -258,10 +281,27 @@ class PodManager:
                 wait(self.cfg.poll_s)
                 continue
 
+            # --- pod on the wrong card for this request: replace it ------------------------
+            # Only when RunPod tells us the card (a stopped pod sometimes reports none); an
+            # unknown card is started as before rather than thrown away on a guess.
+            if strict_gpu and pod is not None and pod.gpu_type and pod.gpu_type not in wanted:
+                self._set(
+                    STARTING,
+                    f"Switching GPU: the pod is on {pod.gpu_type}, this run asked for "
+                    f"{wanted[0]} -- replacing the pod (your uploads and results are on the "
+                    "persistent volume).",
+                    pod,
+                    error="gpu type mismatch",
+                )
+                report()
+                self._terminate_and_wait(pod.id)
+                boot_started = None
+                continue
+
             # --- no pod: create one -------------------------------------------------------
             if pod is None:
                 try:
-                    pod = self._create_pod()
+                    pod = self._create_pod(wanted)
                 except RunPodError as exc:
                     if exc.is_auth_error:
                         self._set(ERROR, f"RunPod rejected the API key: {exc}", error=str(exc))
@@ -395,10 +435,10 @@ class PodManager:
         self._volume_id = str(vol["id"])
         return self._volume_id
 
-    def _create_pod(self) -> PodInfo:
+    def _create_pod(self, gpu_types: tuple[str, ...] | None = None) -> PodInfo:
         body = rp.pod_create_body(
             name=self.cfg.name,
-            gpu_type_ids=list(self.cfg.gpu_types),
+            gpu_type_ids=list(gpu_types or self.cfg.gpu_types),
             volume_id=self._volume(),
             env=self.cfg.pod_env,
             port=self.cfg.port,

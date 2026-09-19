@@ -62,7 +62,7 @@ INPUT_DIR = DATA_DIR / "input"
 JOBS_FILE = DATA_DIR / "jobs.json"
 STATE_REFRESH_S = float(os.environ.get("PV_POD_REFRESH_SECONDS", "30"))
 
-app = FastAPI(title="PitchVision gateway")
+app = FastAPI(title="The Reach Vision gateway")
 
 
 # ---------------------------------------------------------------- configuration
@@ -238,6 +238,66 @@ def get_pod():
     return {"pod": PODS.state.full(), "active_jobs": JOBS.active()}
 
 
+# GPU tiers with RunPod's live per-hour price and per-datacenter stock (2026-09-19). One GraphQL
+# call, cached: prices move rarely, and the app polls this on every page load.
+GPU_OFFERS_TTL_S = float(os.environ.get("PV_GPU_PRICE_TTL_SECONDS", "300"))
+_GPU_OFFERS: dict[str, Any] = {"at": 0.0, "offers": {}, "error": ""}
+_GPU_OFFERS_LOCK = threading.Lock()
+
+
+def _gpu_offers() -> tuple[dict[str, dict[str, Any]], str]:
+    with _GPU_OFFERS_LOCK:
+        if time.time() - _GPU_OFFERS["at"] < GPU_OFFERS_TTL_S:
+            return _GPU_OFFERS["offers"], _GPU_OFFERS["error"]
+        try:
+            offers = rp.fetch_gpu_offers(_env("RUNPOD_API_KEY"), PODS.cfg.datacenter)
+            _GPU_OFFERS.update(at=time.time(), offers=offers, error="")
+        except rp.RunPodError as exc:
+            # Keep whatever we had; say why it may be stale.
+            logger.warning("GPU price lookup failed: %s", exc)
+            _GPU_OFFERS.update(at=time.time(), error=str(exc))
+        return _GPU_OFFERS["offers"], _GPU_OFFERS["error"]
+
+
+@app.get("/api/gpus")
+def list_gpus():
+    """The selectable GPU tiers, each with the live price/stock of its cards in the volume's
+    datacenter, plus which card the pod is on right now (so the app can say "switching GPU
+    means a restart")."""
+    offers, error = _gpu_offers()
+    tiers = []
+    for tier in rp.GPU_TIERS:
+        cards = []
+        for gid in tier["gpu_type_ids"]:
+            offer = offers.get(gid, {})
+            cards.append({
+                "gpu_type_id": gid,
+                "display_name": offer.get("display_name") or gid.replace("NVIDIA ", ""),
+                "memory_gb": offer.get("memory_gb"),
+                "price_per_hr": offer.get("price_per_hr"),
+                "stock": offer.get("stock"),
+            })
+        # what the user will most likely get: the first card in stock, else the first card
+        primary = next((c for c in cards if c["stock"]), cards[0])
+        tiers.append({
+            "id": tier["id"],
+            "label": tier["label"],
+            "blurb": tier["blurb"],
+            "primary": primary,
+            "cards": cards,
+            "in_stock": any(c["stock"] for c in cards),
+            "is_current": PODS.state.gpu_type in tier["gpu_type_ids"],
+        })
+    return {
+        "tiers": tiers,
+        "default": rp.DEFAULT_GPU_TIER,
+        "datacenter": PODS.cfg.datacenter,
+        "current_gpu_type": PODS.state.gpu_type,
+        "prices_error": error or None,
+        "prices_at": _GPU_OFFERS["at"] or None,
+    }
+
+
 @app.post("/api/pod/wake")
 def wake_pod():
     request_wake()
@@ -316,6 +376,8 @@ async def process_video(request: Request):
     if not isinstance(payload, dict) or not payload.get("video_name"):
         raise HTTPException(status_code=400, detail="video_name is required")
     video_name = str(payload["video_name"])
+    if payload.get("gpu_tier") and rp.gpu_tier(payload["gpu_tier"]) is None:
+        raise HTTPException(status_code=400, detail=f"unknown gpu_tier {payload['gpu_tier']!r}")
     if JOBS.video_in_flight(video_name):
         raise HTTPException(status_code=409, detail=f"'{video_name}' is already queued or being processed.")
     if not (INPUT_DIR / video_name).exists() and not PODS.online:
