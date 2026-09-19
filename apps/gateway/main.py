@@ -265,6 +265,9 @@ def list_gpus():
     datacenter, plus which card the pod is on right now (so the app can say "switching GPU
     means a restart")."""
     offers, error = _gpu_offers()
+    # RunPod's pod record does not always carry the card id (seen live 2026-09-19: online pod,
+    # empty gpuTypeId); the name torch reports on the pod is the same string RunPod uses.
+    current = PODS.state.gpu_type or PODS.state.gpu_name
     tiers = []
     for tier in rp.GPU_TIERS:
         cards = []
@@ -286,13 +289,13 @@ def list_gpus():
             "primary": primary,
             "cards": cards,
             "in_stock": any(c["stock"] for c in cards),
-            "is_current": PODS.state.gpu_type in tier["gpu_type_ids"],
+            "is_current": bool(current) and current in tier["gpu_type_ids"],
         })
     return {
         "tiers": tiers,
         "default": rp.DEFAULT_GPU_TIER,
         "datacenter": PODS.cfg.datacenter,
-        "current_gpu_type": PODS.state.gpu_type,
+        "current_gpu_type": current,
         "prices_error": error or None,
         "prices_at": _GPU_OFFERS["at"] or None,
     }
