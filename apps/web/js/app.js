@@ -8,29 +8,11 @@ let lastLoggedLine = null;
 let currentResults = null;
 
 document.addEventListener('DOMContentLoaded', async () => {
-  initTheme();
   initLoginGate();
   await ensureAuthenticated();
   initApp();
   initUploadZone();
 });
-
-// ---- Light / dark theme (light is the default; the choice is remembered per browser) ----
-const THEME_KEY = 'reach-theme';
-function initTheme() {
-  const btn = document.getElementById('theme-toggle');
-  if (!btn) return;
-  btn.addEventListener('click', () => {
-    const dark = document.documentElement.dataset.theme !== 'dark';
-    if (dark) document.documentElement.dataset.theme = 'dark';
-    else delete document.documentElement.dataset.theme;
-    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', dark ? '#070907' : '#f4f7f5');
-    try { localStorage.setItem(THEME_KEY, dark ? 'dark' : 'light'); } catch (e) { /* private mode */ }
-  });
-  if (document.documentElement.dataset.theme === 'dark') {
-    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', '#070907');
-  }
-}
 
 // ---- Access gate (hosted deployment, docs/DEPLOY.md) ----
 // The server only enforces a password when PV_ACCESS_PASSWORD is set; locally the overlay never

@@ -14,12 +14,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
   <!-- cache-busted by content hash so a redeploy never leaves a browser on the old stylesheet -->
-  <link rel="stylesheet" href="css/style.css?v=928ec4fd">
-  <script>
-    // Apply the remembered theme before first paint so a dark-mode user never sees a white
-    // flash. Light is the default; nothing is read from prefers-color-scheme on purpose.
-    try { if (localStorage.getItem('reach-theme') === 'dark') document.documentElement.dataset.theme = 'dark'; } catch (e) {}
-  </script>
+  <link rel="stylesheet" href="css/style.css?v=8151a090">
 </head>
 <body>
 
@@ -58,10 +53,6 @@
           <i class="fa-solid fa-brain"></i>
           <span>RF-DETR • ByteTrack • PARSeq</span>
         </div>
-        <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Switch between light and dark mode" title="Light / dark mode">
-          <i class="fa-solid fa-moon"></i>
-          <i class="fa-solid fa-sun"></i>
-        </button>
       </div>
     </div>
   </header>
@@ -524,6 +515,6 @@
     <span>Green box = other players · Red box = target</span>
   </footer>
 
-  <script src="js/app.js?v=0ad0ca1b"></script>
+  <script src="js/app.js?v=0674d510"></script>
 </body>
 </html>

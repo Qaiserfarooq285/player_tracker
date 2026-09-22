@@ -11,71 +11,19 @@
    `--bp-tablet` (768px) and `--bp-desktop` (1100px). Touch targets are 44px.
    ========================================================================== */
 
-/* Light ("white") is the default; dark is opt-in via the header toggle, remembered per browser
-   (`data-theme` on <html>, see app.js `initTheme`). Every colour below is a token, so the two
-   themes are ONE stylesheet -- nothing further down names a raw white or black for chrome. */
+/* Dark only (the light theme was removed 2026-09-23 at the owner's request). Every colour below is
+   a token -- nothing further down names a raw white or black for chrome. */
 :root {
   --green: #24bb61;
-  --green-bright: #1ea956;   /* the "pop" green; darker in light mode so it stays readable on white */
+  --green-bright: #3ddc7c;   /* the "pop" green */
   --green-deep: #169b4d;
   --green-ink: #062d16;
-  --green-soft: rgba(36, 187, 97, 0.12);
-  --green-glow: rgba(36, 187, 97, 0.35);
-  --green-line: rgba(36, 187, 97, 0.4);
-
-  --black: #000000;
-  --white: #ffffff;
-  --bg: #f4f7f5;
-  --bg-2: #ffffff;
-  --card: #ffffff;
-  --card-2: #f6f9f7;
-  --card-hover: #f0f5f2;
-  --line: rgba(10, 20, 14, 0.09);
-  --line-strong: rgba(10, 20, 14, 0.18);
-  --fill-1: rgba(10, 20, 14, 0.04);
-  --fill-2: rgba(10, 20, 14, 0.07);
-  --fill-3: rgba(10, 20, 14, 0.12);
-
-  --ink: #0b100d;            /* strongest text (headings, numbers) */
-  --text: #1a221d;
-  --text-muted: #5b665f;
-  --text-dim: #8b958f;
-  --on-green: #061a0e;       /* text on a solid green surface */
-
-  --terminal-bg: #0b0f0c;
-  --terminal-text: #c9d3cc;
-  --thumb-a: rgba(36, 187, 97, 0.22);
-  --thumb-b: rgba(10, 20, 14, 0.10);
-  --nav-bg: rgba(255, 255, 255, 0.86);
-  --overlay-bg: rgba(244, 247, 245, 0.92);
-  --bg-glow-1: rgba(36, 187, 97, 0.14);
-  --bg-glow-2: rgba(36, 187, 97, 0.07);
-  --bg-top: #eef3ef;
-
-  --danger: #dc2626;
-  --warn: #b7791f;
-
-  --font-display: 'Barlow Condensed', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-  --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
-
-  --r-sm: 8px;
-  --r-md: 14px;
-  --r-lg: 20px;
-  --gutter: 16px;
-
-  --shadow: 0 10px 30px -14px rgba(10, 20, 14, 0.18);
-  --shadow-green: 0 0 0 1px var(--green-line), 0 14px 40px -14px var(--green-glow);
-  --ease: cubic-bezier(0.22, 1, 0.36, 1);
-  color-scheme: light;
-}
-
-:root[data-theme="dark"] {
-  --green-bright: #3ddc7c;
   --green-soft: rgba(36, 187, 97, 0.12);
   --green-glow: rgba(36, 187, 97, 0.45);
   --green-line: rgba(36, 187, 97, 0.35);
 
+  --black: #000000;
+  --white: #ffffff;
   --bg: #070907;
   --bg-2: #0d110e;
   --card: #111512;
@@ -83,15 +31,14 @@
   --card-hover: #1a201b;
   --line: rgba(255, 255, 255, 0.08);
   --line-strong: rgba(255, 255, 255, 0.16);
-  --fill-1: var(--fill-1);
-  --fill-2: var(--fill-2);
-  --fill-3: var(--fill-3);
+  /* --fill-1/2/3 are deliberately left undefined: the old dark block declared them as
+     `var(--fill-N)` (a cycle, i.e. unset), and the dark look the owner signed off on is that. */
 
-  --ink: #ffffff;
+  --ink: #ffffff;            /* strongest text (headings, numbers) */
   --text: #f2f5f3;
   --text-muted: #a3aca6;
   --text-dim: #6c756f;
-  --on-green: #000000;
+  --on-green: #000000;       /* text on a solid green surface */
 
   --terminal-bg: #000000;
   --terminal-text: #a3aca6;
@@ -106,7 +53,18 @@
   --danger: #ef4444;
   --warn: #f5b921;
 
+  --font-display: 'Barlow Condensed', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --r-sm: 8px;
+  --r-md: 14px;
+  --r-lg: 20px;
+  --gutter: 16px;
+
   --shadow: 0 10px 30px -12px rgba(0, 0, 0, 0.7);
+  --shadow-green: 0 0 0 1px var(--green-line), 0 14px 40px -14px var(--green-glow);
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
   color-scheme: dark;
 }
 
@@ -270,7 +228,7 @@ img, video, canvas { max-width: 100%; }
   height: 46px;
   flex: 0 0 auto;
   border-radius: 50%;
-  background: var(--green);
+  background: var(--black);
   display: grid;
   place-items: center;
   box-shadow: 0 0 0 3px rgba(36, 187, 97, 0.18), 0 6px 18px -6px var(--green-glow);
@@ -342,21 +300,6 @@ img, video, canvas { max-width: 100%; }
   .nav-container { padding: 12px 32px; }
   .model-badge { display: inline-flex; }
 }
-
-.theme-toggle {
-  width: 40px; height: 40px; flex: 0 0 auto;
-  border-radius: 50%;
-  border: 1px solid var(--line-strong);
-  background: var(--fill-1);
-  color: var(--text-muted);
-  display: grid; place-items: center;
-  font-size: 15px;
-  transition: color 0.2s, border-color 0.2s, background 0.2s, transform 0.3s var(--ease);
-}
-.theme-toggle:hover { color: var(--green-bright); border-color: var(--green); transform: rotate(-12deg); }
-.theme-toggle .fa-sun { display: none; }
-:root[data-theme="dark"] .theme-toggle .fa-sun { display: block; }
-:root[data-theme="dark"] .theme-toggle .fa-moon { display: none; }
 
 /* ---------- GPU tier selector ---------- */
 .gpu-tiers { display: grid; grid-template-columns: 1fr; gap: 10px; }
@@ -878,7 +821,6 @@ textarea.form-control { min-height: 72px; resize: vertical; line-height: 1.45; }
   .nav-container { padding: 8px var(--gutter) 6px; row-gap: 6px; }
   .brand { flex: 1 1 auto; }
   .brand-title { font-size: 1.15rem; }
-  .theme-toggle { width: 36px; height: 36px; font-size: 14px; order: 2; }
   .nav-stats { flex: 1 1 100%; order: 3; gap: 6px; }
   .status-badge { font-size: 10.5px; padding: 4px 9px; min-height: 26px; }
 
